@@ -3,7 +3,7 @@ import { alarmState, userShift } from "../services/roundService.js";
 import { pushToUser } from "../services/pushService.js";
 import { snapshotOccupancy } from "../services/bedService.js";
 import { emitUpdate } from "../websocket/io.js";
-import { COO_REMINDERS, hmToMin, minsNow, todayStr, WARDS } from "../config/domain.js";
+import { COO_REMINDERS, hmToMin, minsNow, todayStr, startOfDayIST, WARDS } from "../config/domain.js";
 
 const lastPush = new Map<string, number>();
 const REPUSH_MS = 5 * 60 * 1000;
@@ -49,8 +49,11 @@ function tick() {
     }
   }
 
-  // hourly occupancy snapshot
-  if (new Date().getMinutes() === 0) snapshotOccupancy();
+  // hourly occupancy snapshot — use IST minutes so Render (UTC) fires at the right time
+  const india = new Date(
+    new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" })
+  );
+  if (india.getMinutes() === 0) snapshotOccupancy();
 }
 
 export function startScheduler() {

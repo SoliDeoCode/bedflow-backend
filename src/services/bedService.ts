@@ -1,6 +1,7 @@
 import { db } from "../db/index.js";
 import { HttpError } from "../middleware/error.js";
 import { audit } from "./auditService.js";
+import { startOfDayIST } from "../config/domain.js";
 
 export interface WardView {
   id: number; ward: string; total: number;
@@ -95,9 +96,9 @@ export function orgOverview() {
       const last = db.prepare("SELECT submitted_at FROM pre_rounds WHERE pre_code=? ORDER BY submitted_at DESC LIMIT 1")
         .get<{ submitted_at: number }>(pre);
       // today's round count
-      const startOfDay = new Date(); startOfDay.setHours(0, 0, 0, 0);
+      // Use IST midnight so rounds-today count is correct on Render (UTC server).
       const roundsToday = db.prepare("SELECT COUNT(*) AS c FROM pre_rounds WHERE pre_code=? AND submitted_at>=?")
-        .get<{ c: number }>(pre, startOfDay.getTime())?.c ?? 0;
+        .get<{ c: number }>(pre, startOfDayIST())?.c ?? 0;
       return {
         pre, wards, summary: summarize(wards),
         floor: name, label: pre.replace("PRE-", "Premium "),

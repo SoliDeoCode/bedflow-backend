@@ -44,9 +44,28 @@ export const SEED_ACCOUNTS = (() => {
 
 // ---- time helpers ----
 export function hmToMin(s: string): number { const [h, m] = s.split(":").map(Number); return h * 60 + m; }
-export function minsNow(d = new Date()): number { return d.getHours() * 60 + d.getMinutes(); }
-export function todayStr(d = new Date()): string {
-  return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0");
+
+/** Returns a Date object whose getHours/getMinutes reflect Asia/Kolkata time,
+ *  regardless of the server's system timezone (Render runs UTC). */
+function indiaTime(): Date {
+  return new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
+}
+
+/** Current time expressed as minutes-since-midnight in IST. */
+export function minsNow(): number {
+  const india = indiaTime();
+  return india.getHours() * 60 + india.getMinutes();
+}
+
+/** Today's date string (YYYY-MM-DD) in IST. */
+export function todayStr(): string {
+  const india = indiaTime();
+  return india.getFullYear() + "-" + String(india.getMonth() + 1).padStart(2, "0") + "-" + String(india.getDate()).padStart(2, "0");
+}
+
+/** Unix-millisecond timestamp for IST midnight of today (safe for DB range queries). */
+export function startOfDayIST(): number {
+  return new Date(todayStr() + "T00:00:00+05:30").getTime();
 }
 export function inShift(shift: ShiftKey, mins: number): boolean {
   const s = SHIFTS[shift]; const st = hmToMin(s.start), en = hmToMin(s.end);
