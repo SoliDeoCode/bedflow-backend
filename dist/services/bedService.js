@@ -1,12 +1,15 @@
 import { db } from "../db/index.js";
 import { HttpError } from "../middleware/error.js";
 import { audit } from "./auditService.js";
-export function wardsForPre(preCode) {
+import { startOfDayIST } from "../config/domain.js";
+/** All wards for a block, joined with their current bed snapshot. */
+export function wardsForBlock(blockId) {
     return db.prepare(`SELECT w.id, w.name AS ward, w.total_beds AS total,
             b.vacant, b.reserved, b.occupied, b.updated_at AS updatedAt
      FROM wards w JOIN beds b ON b.ward_id = w.id
-     WHERE w.pre_code = ? ORDER BY w.name`).all(preCode);
+     WHERE w.block_id = ? ORDER BY w.name`).all(blockId);
 }
+/** Summarise an array of WardViews into v/o/r totals. */
 export function summarize(wards) {
     let v = 0, o = 0, r = 0, total = 0, wardsDone = 0;
     for (const w of wards) {
@@ -18,12 +21,12 @@ export function summarize(wards) {
             r += w.reserved || 0;
         }
     }
-    return { v, o, r, total, wards: wards.length, wardsDone, complete: wards.length > 0 && wardsDone === wards.length };
+    return { v, o, r, total, wards: wards.length, wardsDone,
+        complete: wards.length > 0 && wardsDone === wards.length };
 }
-// Auto-calculation rule: caller provides vacant + reserved; occupied is derived.
+/** Auto-calculation: caller provides vacant + reserved; occupied is derived. */
 export function updateWard(wardId, vacant, reserved, userId) {
-    const ward = db.prepare("SELECT id, name, total_beds AS total, pre_code FROM wards WHERE id = ?")
-        .get(wardId);
+    const ward = db.prepare("SELECT id, name, total_beds AS total, block_id FROM wards WHERE id = ?").get(wardId);
     if (!ward)
         throw new HttpError(404, "Ward not found");
     const v = Math.max(0, Math.floor(vacant));
@@ -33,92 +36,53 @@ export function updateWard(wardId, vacant, reserved, userId) {
     const occupied = ward.total - v - r;
     const now = Date.now();
     db.transaction(() => {
-        db.prepare("UPDATE beds SET vacant=?, reserved=?, occupied=?, updated_at=?, updated_by=? WHERE ward_id=?")
-            .run(v, r, occupied, now, userId, wardId);
-        db.prepare("INSERT INTO bed_status_updates (ward_id, vacant, reserved, occupied, updated_by, created_at) VALUES (?,?,?,?,?,?)")
-            .run(wardId, v, r, occupied, userId, now);
+        db.prepare("UPDATE beds SET vacant=?, reserved=?, occupied=?, updated_at=?, updated_by=? WHERE ward_id=?").run(v, r, occupied, now, userId, wardId);
+        db.prepare("INSERT INTO bed_status_updates (ward_id, vacant, reserved, occupied, updated_by, created_at) VALUES (?,?,?,?,?,?)").run(wardId, v, r, occupied, userId, now);
     });
-    audit(userId, "ward_update", ward.pre_code, { ward: ward.name, vacant: v, reserved: r, occupied });
+    // look up block name for audit
+    const blockName = db.prepare("SELECT name FROM blocks WHERE id = ?")
+        .get(ward.block_id)?.name ?? String(ward.block_id);
+    audit(userId, "ward_update", blockName, { ward: ward.name, vacant: v, reserved: r, occupied });
     return { ward: ward.name, vacant: v, reserved: r, occupied, total: ward.total };
 }
-// FIX: normalises floor names (TRIM+LOWER) so "1st Floor" / "1st floor " collapse
-// to one bucket. Each PRE is placed on exactly ONE floor (named floor beats Unassigned).
-export function floorStructure() {
-    const rows = db.prepare(`SELECT DISTINCT
-       w.pre_code                         AS pre,
-       TRIM(LOWER(COALESCE(f.name, '')))  AS floor_key,
-       TRIM(COALESCE(f.name, ''))         AS floor_disp
-     FROM wards w LEFT JOIN floors f ON f.id = w.floor_id`).all();
-    // For each PRE: one floor — named floor wins over empty/Unassigned
-    const preToFloor = new Map();
-    for (const row of rows) {
-        const cur = preToFloor.get(row.pre);
-        if (!cur || (cur.key === '' && row.floor_key !== '')) {
-            preToFloor.set(row.pre, { key: row.floor_key, disp: row.floor_disp });
-        }
-    }
-    // PREs with assignments but no wards → Unassigned
-    const assigned = db.prepare(`SELECT DISTINCT a.pre_code AS pre FROM pre_assignments a`).all();
-    for (const a of assigned) {
-        if (!preToFloor.has(a.pre))
-            preToFloor.set(a.pre, { key: '', disp: '' });
-    }
-    // Group by normalised key
-    const byFloor = new Map();
-    for (const [pre, { key, disp }] of preToFloor) {
-        const gKey = key || 'unassigned';
-        const gDisp = disp || 'Unassigned';
-        if (!byFloor.has(gKey))
-            byFloor.set(gKey, { disp: gDisp, pres: new Set() });
-        byFloor.get(gKey).pres.add(pre);
-    }
-    const order = (p) => parseInt(p.replace(/\D/g, '') || '999', 10);
-    return [...byFloor.values()]
-        .sort((a, b) => a.disp.localeCompare(b.disp))
-        .map(({ disp, pres }) => ({ name: disp, pres: [...pres].sort((a, b) => order(a) - order(b)) }));
-}
-// Hospital-wide view grouped by floor → PRE, for the COO dashboard.
 export function orgOverview() {
-    const floors = floorStructure().map(({ name, pres }) => ({
-        name,
-        pres: pres.map((pre) => {
-            const wards = wardsForPre(pre);
-            const last = db.prepare("SELECT submitted_at FROM pre_rounds WHERE pre_code=? ORDER BY submitted_at DESC LIMIT 1")
-                .get(pre);
-            // today's round count
-            const startOfDay = new Date();
-            startOfDay.setHours(0, 0, 0, 0);
-            const roundsToday = db.prepare("SELECT COUNT(*) AS c FROM pre_rounds WHERE pre_code=? AND submitted_at>=?")
-                .get(pre, startOfDay.getTime())?.c ?? 0;
-            return {
-                pre, wards, summary: summarize(wards),
-                floor: name, label: pre.replace("PRE-", "Premium "),
-                lastSubmittedAt: last?.submitted_at ?? null, roundsToday,
-            };
-        }),
-    }));
-    // FIX: deduplicate PREs so legacy data with a PRE in two floor buckets
-    // doesn't inflate the hospital-wide totals.
+    const blocks = db.prepare("SELECT id, name, label, sort_order FROM blocks ORDER BY sort_order, name").all();
+    const today = startOfDayIST();
+    const items = blocks.map(block => {
+        const wards = wardsForBlock(block.id);
+        const last = db.prepare("SELECT submitted_at FROM pre_rounds WHERE block_id=? ORDER BY submitted_at DESC LIMIT 1").get(block.id);
+        const roundsToday = db.prepare("SELECT COUNT(*) AS c FROM pre_rounds WHERE block_id=? AND submitted_at>=?").get(block.id, today)?.c ?? 0;
+        const assignedUser = db.prepare("SELECT id, name, shift FROM users WHERE block_id=? AND role='PRE' LIMIT 1").get(block.id) ?? null;
+        return {
+            block_id: block.id,
+            pre: block.name, // block name doubles as "pre" key in COO frontend
+            floor: block.name,
+            label: block.label || block.name,
+            wards,
+            summary: summarize(wards),
+            lastSubmittedAt: last?.submitted_at ?? null,
+            roundsToday,
+            assignedUser,
+        };
+    });
+    // Wrap each block in a { name, pres: [...] } shell so the COO frontend
+    // (which iterates floors → pres) keeps working without changes.
+    const floors = items.map(item => ({ name: item.pre, pres: [item] }));
     let v = 0, o = 0, r = 0, total = 0, presReporting = 0, presTotal = 0;
-    const counted = new Set();
-    for (const f of floors)
-        for (const p of f.pres) {
-            if (counted.has(p.pre)) continue;
-            counted.add(p.pre);
-            v += p.summary.v;
-            o += p.summary.o;
-            r += p.summary.r;
-            total += p.summary.total;
-            if (p.summary.wards > 0) {
-                presTotal++;
-                if (p.summary.wardsDone > 0)
-                    presReporting++;
-            }
+    for (const item of items) {
+        v += item.summary.v;
+        o += item.summary.o;
+        r += item.summary.r;
+        total += item.summary.total;
+        if (item.summary.wards > 0) {
+            presTotal++;
+            if (item.summary.wardsDone > 0)
+                presReporting++;
         }
+    }
     return { floors, totals: { v, o, r, total, presReporting, presTotal } };
 }
 export function snapshotOccupancy() {
     const { totals } = orgOverview();
-    db.prepare("INSERT INTO occupancy_snapshots (ts, total, vacant, reserved, occupied) VALUES (?,?,?,?,?)")
-        .run(Date.now(), totals.total, totals.v, totals.r, totals.o);
+    db.prepare("INSERT INTO occupancy_snapshots (ts, total, vacant, reserved, occupied) VALUES (?,?,?,?,?)").run(Date.now(), totals.total, totals.v, totals.r, totals.o);
 }

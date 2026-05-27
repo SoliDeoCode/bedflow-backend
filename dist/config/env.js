@@ -7,7 +7,7 @@ function required(name, fallback) {
 }
 export const env = {
     PORT: Number(process.env.PORT || 4000),
-    JWT_SECRET: required("JWT_SECRET", "dev-secret-change-me-in-production"),
+    JWT_SECRET: required("JWT_SECRET"),
     CORS_ORIGIN: process.env.CORS_ORIGIN || "*",
     VAPID_PUBLIC: process.env.VAPID_PUBLIC || "",
     VAPID_PRIVATE: process.env.VAPID_PRIVATE || "",

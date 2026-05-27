@@ -4,10 +4,10 @@ import { authRequired } from "../middleware/auth.js";
 import { asyncH } from "../middleware/error.js";
 import { saveSubscription } from "../services/pushService.js";
 import { pushEnabled, env } from "../config/env.js";
-import { FLOOR_MAP, WARDS, SHIFTS, COO_REMINDERS } from "../config/domain.js";
+import { SHIFTS, COO_REMINDERS } from "../config/domain.js";
 const router = Router();
 router.get("/meta", (_req, res) => {
-    res.json({ floorMap: FLOOR_MAP, wards: WARDS, shifts: SHIFTS, cooReminders: COO_REMINDERS,
+    res.json({ shifts: SHIFTS, cooReminders: COO_REMINDERS,
         pushEnabled, vapidPublic: env.VAPID_PUBLIC || null });
 });
 router.post("/push/subscribe", authRequired, asyncH(async (req, res) => {

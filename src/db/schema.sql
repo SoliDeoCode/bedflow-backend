@@ -13,23 +13,39 @@ CREATE TABLE IF NOT EXISTS users (
   updated_at    INTEGER NOT NULL
 );
 
+-- Kept for migration compatibility only — superseded by blocks below
 CREATE TABLE IF NOT EXISTS floors (
   id    INTEGER PRIMARY KEY AUTOINCREMENT,
   name  TEXT NOT NULL UNIQUE
 );
 
+-- ── NEW: blocks replace floors + pre_code ─────────────────────────────────────
+-- name      = canonical short code, e.g. "1A", "2B" (TRIM + UPPER enforced in app)
+-- name_key  = UPPER(TRIM(name)) — dedup/lookup key
+-- label     = optional long display name e.g. "Oncology Wing"
+-- sort_order= manager-controlled display sequence
+CREATE TABLE IF NOT EXISTS blocks (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  name        TEXT    NOT NULL,
+  name_key    TEXT    NOT NULL UNIQUE,
+  label       TEXT,
+  sort_order  INTEGER NOT NULL DEFAULT 0,
+  created_at  INTEGER NOT NULL,
+  updated_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_blocks_key ON blocks(name_key);
+
 CREATE TABLE IF NOT EXISTS wards (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
-  name        TEXT NOT NULL,
-  floor_id    INTEGER REFERENCES floors(id) ON DELETE SET NULL,
-  pre_code    TEXT NOT NULL,              -- logical PRE grouping e.g. 'PRE-1'
+  name        TEXT    NOT NULL,
+  -- block_id is the single source of truth (floor_id + pre_code are legacy)
+  -- NOTE: block_id is added via addColumnIfMissing on existing DBs (migrate.ts step 2)
   total_beds  INTEGER NOT NULL CHECK (total_beds >= 0),
   created_at  INTEGER NOT NULL,
-  updated_at  INTEGER NOT NULL,
-  UNIQUE (pre_code, name)
+  updated_at  INTEGER NOT NULL
+  -- block_id, floor_id, pre_code added via ALTER TABLE in migrate.ts
+  -- so indexes on those columns are also created in migrate.ts (not here)
 );
-CREATE INDEX IF NOT EXISTS idx_wards_pre ON wards(pre_code);
-CREATE INDEX IF NOT EXISTS idx_wards_floor ON wards(floor_id);
 
 -- live bed counts per ward (one row per ward; the current snapshot)
 CREATE TABLE IF NOT EXISTS beds (
@@ -42,7 +58,7 @@ CREATE TABLE IF NOT EXISTS beds (
   updated_by INTEGER REFERENCES users(id)
 );
 
--- which PRE user is responsible for which pre_code grouping
+-- Kept for migration compatibility — superseded by users.block_id
 CREATE TABLE IF NOT EXISTS pre_assignments (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,

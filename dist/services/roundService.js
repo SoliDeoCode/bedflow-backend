@@ -1,26 +1,35 @@
 import { db } from "../db/index.js";
 import { HttpError } from "../middleware/error.js";
 import { audit } from "./auditService.js";
-import { wardsForPre } from "./bedService.js";
-import { inShift, currentRound, roundKey, todayStr, minsNow, WARDS, } from "../config/domain.js";
+import { wardsForBlock } from "./bedService.js";
+import { inShift, currentRound, roundKey, todayStr, minsNow, } from "../config/domain.js";
 export function userShift(userId) {
-    const u = db.prepare("SELECT shift FROM users WHERE id = ?").get(userId);
+    const u = db.prepare("SELECT shift FROM users WHERE id=?").get(userId);
     return u?.shift || "morning";
 }
 export function setShift(userId, shift) {
-    db.prepare("UPDATE users SET shift=?, updated_at=? WHERE id=?").run(shift, Date.now(), userId);
+    db.prepare("UPDATE users SET shift=?,updated_at=? WHERE id=?").run(shift, Date.now(), userId);
 }
-export function alarmState(preCode, shift) {
+/** Alarm state for a block (looked up by block name). */
+export function alarmState(blockName, shift) {
     const mins = minsNow();
     const onDuty = inShift(shift, mins);
     const round = currentRound(shift, mins);
-    const hasWards = (WARDS[preCode] || []).length > 0;
-    const key = roundKey(preCode, shift, todayStr(), round.startMin);
-    const submitted = !!db.prepare("SELECT 1 FROM pre_rounds WHERE round_key = ?").get(key);
-    return { shift, onDuty, round, key, submitted, hasWards, alarmActive: onDuty && hasWards && !submitted };
+    // hasWards: query DB — no more static WARDS config
+    const block = db.prepare("SELECT id FROM blocks WHERE name_key = ?")
+        .get(blockName.toUpperCase().trim());
+    const hasWards = block
+        ? (db.prepare("SELECT COUNT(*) AS n FROM wards WHERE block_id=?")
+            .get(block.id)?.n ?? 0) > 0
+        : false;
+    const key = roundKey(blockName, shift, todayStr(), round.startMin);
+    const submitted = !!db.prepare("SELECT 1 FROM pre_rounds WHERE round_key=?").get(key);
+    return { shift, onDuty, round, key, submitted, hasWards,
+        alarmActive: onDuty && hasWards && !submitted };
 }
-export function submitRound(preCode, userId) {
-    const wards = wardsForPre(preCode);
+/** Submit a round for the block the user is assigned to. */
+export function submitRound(blockId, userId) {
+    const wards = wardsForBlock(blockId);
     if (wards.length === 0)
         throw new HttpError(400, "No wards to submit");
     for (const w of wards) {
@@ -29,13 +38,19 @@ export function submitRound(preCode, userId) {
         if ((w.vacant + (w.reserved || 0) + (w.occupied || 0)) !== w.total)
             throw new HttpError(400, `${w.ward}: counts must total ${w.total}`);
     }
+    const block = db.prepare("SELECT name FROM blocks WHERE id=?")
+        .get(blockId);
+    if (!block)
+        throw new HttpError(404, "Block not found");
     const shift = userShift(userId);
     const round = currentRound(shift, minsNow());
-    const key = roundKey(preCode, shift, todayStr(), round.startMin);
+    const key = roundKey(block.name, shift, todayStr(), round.startMin);
     try {
-        db.prepare("INSERT INTO pre_rounds (pre_code, user_id, shift, round_key, start_min, submitted_at, snapshot) VALUES (?,?,?,?,?,?,?)").run(preCode, userId, shift, key, round.startMin, Date.now(), JSON.stringify(wards));
+        db.prepare(`INSERT INTO pre_rounds
+         (pre_code, block_id, user_id, shift, round_key, start_min, submitted_at, snapshot)
+       VALUES (?,?,?,?,?,?,?,?)`).run(block.name, blockId, userId, shift, key, round.startMin, Date.now(), JSON.stringify(wards));
     }
-    catch { /* already submitted this round - idempotent */ }
-    audit(userId, "round_submit", preCode, { roundKey: key });
+    catch { /* duplicate round key — idempotent */ }
+    audit(userId, "round_submit", block.name, { roundKey: key });
     return { ok: true, roundKey: key };
 }
