@@ -53,38 +53,55 @@ export function updateWard(wardId: number, vacant: number, reserved: number, use
   return { ward: ward.name, vacant: v, reserved: r, occupied, total: ward.total };
 }
 
-// Build the floor → PRE structure dynamically from the database, so wards/PREs
-// created by the Manager show up without code changes. Falls back to listing
-// any pre_code that has wards even if its floor is unset.
+// Build the floor → PRE structure dynamically from the database.
+// FIX: normalises floor names (TRIM+LOWER) so "1st Floor" and "1st floor "
+// collapse to the same bucket.  Each PRE is placed on exactly ONE floor:
+// any named floor beats Unassigned, so a PRE whose ward just lost its
+// floor_id doesn't ghost into Unassigned while still appearing on its real floor.
 export function floorStructure(): { name: string; pres: string[] }[] {
-  // floors that have at least one ward, ordered
+  // Collect all (pre_code, normalised_key, trimmed_display) pairs from wards.
   const rows = db.prepare(
-    `SELECT DISTINCT COALESCE(f.name, 'Unassigned') AS floor, w.pre_code AS pre, f.id AS fid
+    `SELECT DISTINCT
+       w.pre_code                         AS pre,
+       TRIM(LOWER(COALESCE(f.name, '')))  AS floor_key,
+       TRIM(COALESCE(f.name, ''))         AS floor_disp
      FROM wards w LEFT JOIN floors f ON f.id = w.floor_id`
-  ).all<{ floor: string; pre: string; fid: number | null }>();
-  // also include PREs that exist via assignment but have no wards yet
+  ).all<{ pre: string; floor_key: string; floor_disp: string }>();
+
+  // For each PRE: exactly one floor entry.
+  // Rule: a real (non-empty) floor name wins over a NULL/Unassigned one.
+  const preToFloor = new Map<string, { key: string; disp: string }>();
+  for (const row of rows) {
+    const cur = preToFloor.get(row.pre);
+    if (!cur || (cur.key === '' && row.floor_key !== '')) {
+      preToFloor.set(row.pre, { key: row.floor_key, disp: row.floor_disp });
+    }
+  }
+
+  // PREs that have a user assignment but zero wards go to Unassigned.
   const assigned = db.prepare(
     `SELECT DISTINCT a.pre_code AS pre FROM pre_assignments a`
   ).all<{ pre: string }>();
-
-  const byFloor = new Map<string, Set<string>>();
-  for (const r of rows) {
-    if (!byFloor.has(r.floor)) byFloor.set(r.floor, new Set());
-    byFloor.get(r.floor)!.add(r.pre);
-  }
-  // place assignment-only PREs (no wards) under 'Unassigned'
-  const known = new Set(rows.map((r) => r.pre));
   for (const a of assigned) {
-    if (!known.has(a.pre)) {
-      if (!byFloor.has("Unassigned")) byFloor.set("Unassigned", new Set());
-      byFloor.get("Unassigned")!.add(a.pre);
-    }
+    if (!preToFloor.has(a.pre)) preToFloor.set(a.pre, { key: '', disp: '' });
   }
-  // stable ordering: floor name, then pre code numeric
-  const order = (p: string) => parseInt(p.replace(/\D/g, "") || "999", 10);
-  return [...byFloor.entries()]
-    .sort((a, b) => a[0].localeCompare(b[0]))
-    .map(([name, set]) => ({ name, pres: [...set].sort((a, b) => order(a) - order(b)) }));
+
+  // Group by normalised key — merges "1st Floor" / "1st floor " / "1ST FLOOR" etc.
+  const byFloor = new Map<string, { disp: string; pres: Set<string> }>();
+  for (const [pre, { key, disp }] of preToFloor) {
+    const gKey  = key  || 'unassigned';
+    const gDisp = disp || 'Unassigned';
+    if (!byFloor.has(gKey)) byFloor.set(gKey, { disp: gDisp, pres: new Set() });
+    byFloor.get(gKey)!.pres.add(pre);
+  }
+
+  const order = (p: string) => parseInt(p.replace(/\D/g, '') || '999', 10);
+  return [...byFloor.values()]
+    .sort((a, b) => a.disp.localeCompare(b.disp))
+    .map(({ disp, pres }) => ({
+      name: disp,
+      pres: [...pres].sort((a, b) => order(a) - order(b)),
+    }));
 }
 
 // Hospital-wide view grouped by floor → PRE, for the COO dashboard.
@@ -106,8 +123,13 @@ export function orgOverview() {
       };
     }),
   }));
+  // FIX: deduplicate PREs before summing so a PRE that somehow appears in two
+  // floor buckets (legacy data race) is not counted twice.
   let v = 0, o = 0, r = 0, total = 0, presReporting = 0, presTotal = 0;
+  const counted = new Set<string>();
   for (const f of floors) for (const p of f.pres) {
+    if (counted.has(p.pre)) continue;
+    counted.add(p.pre);
     v += p.summary.v; o += p.summary.o; r += p.summary.r; total += p.summary.total;
     if (p.summary.wards > 0) { presTotal++; if (p.summary.wardsDone > 0) presReporting++; }
   }

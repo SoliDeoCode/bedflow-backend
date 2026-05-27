@@ -41,35 +41,41 @@ export function updateWard(wardId, vacant, reserved, userId) {
     audit(userId, "ward_update", ward.pre_code, { ward: ward.name, vacant: v, reserved: r, occupied });
     return { ward: ward.name, vacant: v, reserved: r, occupied, total: ward.total };
 }
-// Build the floor → PRE structure dynamically from the database, so wards/PREs
-// created by the Manager show up without code changes. Falls back to listing
-// any pre_code that has wards even if its floor is unset.
+// FIX: normalises floor names (TRIM+LOWER) so "1st Floor" / "1st floor " collapse
+// to one bucket. Each PRE is placed on exactly ONE floor (named floor beats Unassigned).
 export function floorStructure() {
-    // floors that have at least one ward, ordered
-    const rows = db.prepare(`SELECT DISTINCT COALESCE(f.name, 'Unassigned') AS floor, w.pre_code AS pre, f.id AS fid
+    const rows = db.prepare(`SELECT DISTINCT
+       w.pre_code                         AS pre,
+       TRIM(LOWER(COALESCE(f.name, '')))  AS floor_key,
+       TRIM(COALESCE(f.name, ''))         AS floor_disp
      FROM wards w LEFT JOIN floors f ON f.id = w.floor_id`).all();
-    // also include PREs that exist via assignment but have no wards yet
-    const assigned = db.prepare(`SELECT DISTINCT a.pre_code AS pre FROM pre_assignments a`).all();
-    const byFloor = new Map();
-    for (const r of rows) {
-        if (!byFloor.has(r.floor))
-            byFloor.set(r.floor, new Set());
-        byFloor.get(r.floor).add(r.pre);
-    }
-    // place assignment-only PREs (no wards) under 'Unassigned'
-    const known = new Set(rows.map((r) => r.pre));
-    for (const a of assigned) {
-        if (!known.has(a.pre)) {
-            if (!byFloor.has("Unassigned"))
-                byFloor.set("Unassigned", new Set());
-            byFloor.get("Unassigned").add(a.pre);
+    // For each PRE: one floor — named floor wins over empty/Unassigned
+    const preToFloor = new Map();
+    for (const row of rows) {
+        const cur = preToFloor.get(row.pre);
+        if (!cur || (cur.key === '' && row.floor_key !== '')) {
+            preToFloor.set(row.pre, { key: row.floor_key, disp: row.floor_disp });
         }
     }
-    // stable ordering: floor name, then pre code numeric
-    const order = (p) => parseInt(p.replace(/\D/g, "") || "999", 10);
-    return [...byFloor.entries()]
-        .sort((a, b) => a[0].localeCompare(b[0]))
-        .map(([name, set]) => ({ name, pres: [...set].sort((a, b) => order(a) - order(b)) }));
+    // PREs with assignments but no wards → Unassigned
+    const assigned = db.prepare(`SELECT DISTINCT a.pre_code AS pre FROM pre_assignments a`).all();
+    for (const a of assigned) {
+        if (!preToFloor.has(a.pre))
+            preToFloor.set(a.pre, { key: '', disp: '' });
+    }
+    // Group by normalised key
+    const byFloor = new Map();
+    for (const [pre, { key, disp }] of preToFloor) {
+        const gKey = key || 'unassigned';
+        const gDisp = disp || 'Unassigned';
+        if (!byFloor.has(gKey))
+            byFloor.set(gKey, { disp: gDisp, pres: new Set() });
+        byFloor.get(gKey).pres.add(pre);
+    }
+    const order = (p) => parseInt(p.replace(/\D/g, '') || '999', 10);
+    return [...byFloor.values()]
+        .sort((a, b) => a.disp.localeCompare(b.disp))
+        .map(({ disp, pres }) => ({ name: disp, pres: [...pres].sort((a, b) => order(a) - order(b)) }));
 }
 // Hospital-wide view grouped by floor → PRE, for the COO dashboard.
 export function orgOverview() {
@@ -91,9 +97,14 @@ export function orgOverview() {
             };
         }),
     }));
+    // FIX: deduplicate PREs so legacy data with a PRE in two floor buckets
+    // doesn't inflate the hospital-wide totals.
     let v = 0, o = 0, r = 0, total = 0, presReporting = 0, presTotal = 0;
+    const counted = new Set();
     for (const f of floors)
         for (const p of f.pres) {
+            if (counted.has(p.pre)) continue;
+            counted.add(p.pre);
             v += p.summary.v;
             o += p.summary.o;
             r += p.summary.r;

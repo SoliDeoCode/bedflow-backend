@@ -4,7 +4,8 @@ import { authRequired, requireRole } from "../middleware/auth.js";
 import { asyncH } from "../middleware/error.js";
 import { db } from "../db/index.js";
 import {
-  createPre, editPre, setPreShift, createWard, editWard, deleteWard,
+  createPre, editPre, setPreShift, deletePre, setPreFloor,
+  createWard, editWard, deleteWard,
   availableDates, historyForDate,
 } from "../services/managerService.js";
 
@@ -56,6 +57,17 @@ router.put("/pre/:id", asyncH(async (req, res) => {
 router.post("/pre/:id/shift", asyncH(async (req, res) => {
   const { shift } = z.object({ shift: z.enum(["morning", "night"]) }).parse(req.body);
   res.json(setPreShift(Number(req.params.id), shift, req.user!.id));
+}));
+
+// FIX: soft-guarded PRE delete (refuses if wards still exist)
+router.delete("/pre/:id", asyncH(async (req, res) => {
+  res.json(deletePre(Number(req.params.id), req.user!.id));
+}));
+
+// FIX: move ALL wards of a PRE to a different floor atomically
+router.put("/pre/:code/floor", asyncH(async (req, res) => {
+  const { floor } = z.object({ floor: z.string().nullable() }).parse(req.body);
+  res.json(setPreFloor(req.params.code, floor, req.user!.id));
 }));
 
 // ---- ward / bed management ----

@@ -2,6 +2,16 @@ import bcrypt from "bcryptjs";
 import { db } from "../db/index.js";
 import { HttpError } from "../middleware/error.js";
 import { audit } from "./auditService.js";
+// FIX: case-insensitive floor lookup/create — "1st Floor" and "1st floor " map to one row
+function resolveFloor(name) {
+    const normalized = name.trim();
+    const existing = db.prepare("SELECT id FROM floors WHERE TRIM(LOWER(name)) = TRIM(LOWER(?))")
+        .get(normalized);
+    if (existing)
+        return existing.id;
+    const r = db.prepare("INSERT INTO floors (name) VALUES (?)").run(normalized);
+    return Number(r.lastInsertRowid);
+}
 // ---- PRE user lifecycle ----
 export function createPre(opts) {
     const username = opts.username.trim().toLowerCase();
@@ -18,9 +28,9 @@ export function createPre(opts) {
         userId = Number(r.lastInsertRowid);
         db.prepare("INSERT OR IGNORE INTO pre_assignments (user_id, pre_code, created_at) VALUES (?,?,?)")
             .run(userId, opts.preCode, now);
-        // optionally ensure floor exists
+        // FIX: resolveFloor normalises casing/spaces
         if (opts.floor)
-            db.prepare("INSERT OR IGNORE INTO floors (name) VALUES (?)").run(opts.floor);
+            resolveFloor(opts.floor);
     });
     audit(opts.managerId, "pre_create", opts.preCode, { username, name: opts.name, shift, floor: opts.floor });
     return { ok: true, id: userId, username, preCode: opts.preCode };
@@ -61,13 +71,10 @@ export function setPreShift(userId, shift, managerId) {
 // ---- ward / room management ----
 export function createWard(opts) {
     const now = Date.now();
-    let floorId = null;
-    if (opts.floor) {
-        db.prepare("INSERT OR IGNORE INTO floors (name) VALUES (?)").run(opts.floor);
-        floorId = db.prepare("SELECT id FROM floors WHERE name=?").get(opts.floor)?.id ?? null;
-    }
+    // FIX: resolveFloor normalises casing/spaces before insert
+    const floorId = opts.floor ? resolveFloor(opts.floor) : null;
     try {
-        const r = db.prepare("INSERT INTO wards (name, floor_id, pre_code, total_beds, created_at, updated_at) VALUES (?,?,?,?,?,?)").run(opts.name, floorId, opts.preCode, opts.totalBeds, now, now);
+        const r = db.prepare("INSERT INTO wards (name, floor_id, pre_code, total_beds, created_at, updated_at) VALUES (?,?,?,?,?,?)").run(opts.name.trim(), floorId, opts.preCode, opts.totalBeds, now, now);
         db.prepare("INSERT INTO beds (ward_id, total) VALUES (?,?)").run(r.lastInsertRowid, opts.totalBeds);
         audit(opts.managerId, "ward_create", opts.preCode, { name: opts.name, totalBeds: opts.totalBeds });
         return { ok: true, id: Number(r.lastInsertRowid) };
@@ -89,8 +96,8 @@ export function editWard(opts) {
             db.prepare("UPDATE beds SET total=? WHERE ward_id=?").run(opts.totalBeds, opts.wardId);
         }
         if (opts.floor) {
-            db.prepare("INSERT OR IGNORE INTO floors (name) VALUES (?)").run(opts.floor);
-            const fid = db.prepare("SELECT id FROM floors WHERE name=?").get(opts.floor)?.id ?? null;
+            // FIX: resolveFloor merges casing/spacing variants
+            const fid = resolveFloor(opts.floor);
             db.prepare("UPDATE wards SET floor_id=?, updated_at=? WHERE id=?").run(fid, now, opts.wardId);
         }
     });
@@ -103,6 +110,34 @@ export function deleteWard(wardId, managerId) {
         throw new HttpError(404, "Room not found");
     db.prepare("DELETE FROM wards WHERE id=?").run(wardId);
     audit(managerId, "ward_delete", ward.pre_code, { wardId });
+    return { ok: true };
+}
+// ---- PRE delete (soft guard: refuses if wards still assigned) ----
+export function deletePre(userId, managerId) {
+    const user = db.prepare("SELECT id, role, name FROM users WHERE id=?").get(userId);
+    if (!user || user.role !== "PRE")
+        throw new HttpError(404, "PRE not found");
+    const preCode = db.prepare("SELECT pre_code FROM pre_assignments WHERE user_id=?")
+        .get(userId)?.pre_code;
+    if (preCode) {
+        const wardCount = db.prepare("SELECT COUNT(*) AS n FROM wards WHERE pre_code=?")
+            .get(preCode)?.n ?? 0;
+        if (wardCount > 0)
+            throw new HttpError(409, `Remove the ${wardCount} ward(s) assigned to ${preCode} before deleting this PRE.`);
+    }
+    db.transaction(() => {
+        db.prepare("DELETE FROM pre_assignments WHERE user_id=?").run(userId);
+        db.prepare("DELETE FROM users WHERE id=?").run(userId);
+    })();
+    audit(managerId, "pre_delete", preCode ?? null, { userId, name: user.name });
+    return { ok: true };
+}
+// ---- PRE floor reassignment (moves ALL wards of a PRE to a new floor) ----
+export function setPreFloor(preCode, floorName, managerId) {
+    const floorId = floorName ? resolveFloor(floorName) : null;
+    db.prepare("UPDATE wards SET floor_id=?, updated_at=? WHERE pre_code=?")
+        .run(floorId, Date.now(), preCode);
+    audit(managerId, "pre_floor_change", preCode, { floorName });
     return { ok: true };
 }
 // ---- history (date dropdown) ----
