@@ -1,0 +1,17 @@
+# Dependencies — installed by npm on deploy
+node_modules/
+
+# Environment secrets — set via Render dashboard, never commit
+.env
+
+# SQLite WAL/SHM journal files — ephemeral, not needed in git
+database/*.db-shm
+database/*.db-wal
+
+# OS & editor noise
+.DS_Store
+*.swp
+*.swo
+
+# TypeScript build cache
+*.tsbuildinfo
