@@ -1,3 +1,4 @@
+import "dotenv/config";
 import bcrypt from "bcryptjs";
 import { db } from "./index.js";
 import { SHIFTS, PRE_INTERVAL_MIN } from "../config/domain.js";

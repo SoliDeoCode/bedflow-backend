@@ -1,9 +1,18 @@
+import "dotenv/config";
 import pg from "pg";
 import { AsyncLocalStorage } from "node:async_hooks";
 const { Pool } = pg;
+// Use DIRECT_URL when available — it points to the session-mode pooler (port 5432)
+// which supports transactions and prepared statements. DATABASE_URL may point to
+// PgBouncer's transaction-mode pooler (port 6543) which does not.
+const connectionString = process.env.DIRECT_URL || process.env.DATABASE_URL;
+if (!connectionString)
+    throw new Error("DATABASE_URL or DIRECT_URL must be set");
+// Strip Prisma-only flags (e.g. ?pgbouncer=true) that pg driver doesn't understand
+const cleanUrl = connectionString.replace(/[?&]pgbouncer=true/i, "");
 const pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    ssl: process.env.NODE_ENV === "production" ? { rejectUnauthorized: false } : false,
+    connectionString: cleanUrl,
+    ssl: { rejectUnauthorized: false }, // Supabase always requires SSL
     max: 10,
 });
 // Routes all db calls inside a db.transaction() to the same pg client,
