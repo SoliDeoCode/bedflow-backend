@@ -142,3 +142,26 @@ CREATE TABLE IF NOT EXISTS push_subscriptions (
   created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_push_user ON push_subscriptions(user_id);
+
+-- individual bed tracking (bed_details is the source of truth; beds table is the summary)
+CREATE TABLE IF NOT EXISTS bed_details (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  ward_id    INTEGER NOT NULL REFERENCES wards(id) ON DELETE CASCADE,
+  bed_number TEXT NOT NULL,
+  status     TEXT NOT NULL CHECK (status IN ('VACANT','RESERVED','OCCUPIED')),
+  updated_at INTEGER NOT NULL,
+  updated_by INTEGER REFERENCES users(id),
+  UNIQUE(ward_id, bed_number)
+);
+CREATE INDEX IF NOT EXISTS idx_bed_details_ward ON bed_details(ward_id, status);
+
+-- immutable log of every individual bed status change
+CREATE TABLE IF NOT EXISTS bed_movements (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  bed_id     INTEGER NOT NULL REFERENCES bed_details(id) ON DELETE CASCADE,
+  old_status TEXT NOT NULL,
+  new_status TEXT NOT NULL,
+  changed_by INTEGER REFERENCES users(id),
+  changed_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_bed_movements_bed ON bed_movements(bed_id, changed_at);

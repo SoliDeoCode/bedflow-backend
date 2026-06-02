@@ -129,6 +129,39 @@ CREATE TABLE IF NOT EXISTS push_subscriptions (
   created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_push_user ON push_subscriptions(user_id);
+
+CREATE TABLE IF NOT EXISTS bed_details (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  ward_id    INTEGER NOT NULL REFERENCES wards(id) ON DELETE CASCADE,
+  bed_number TEXT NOT NULL,
+  status     TEXT NOT NULL CHECK (status IN ('VACANT','RESERVED','OCCUPIED')),
+  updated_at INTEGER NOT NULL,
+  updated_by INTEGER REFERENCES users(id),
+  UNIQUE(ward_id, bed_number)
+);
+CREATE INDEX IF NOT EXISTS idx_bed_details_ward ON bed_details(ward_id, status);
+
+CREATE TABLE IF NOT EXISTS bed_movements (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  bed_id     INTEGER NOT NULL REFERENCES bed_details(id) ON DELETE CASCADE,
+  old_status TEXT NOT NULL,
+  new_status TEXT NOT NULL,
+  changed_by INTEGER REFERENCES users(id),
+  changed_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_bed_movements_bed ON bed_movements(bed_id, changed_at);
+
+CREATE TABLE IF NOT EXISTS saved_views (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  name           TEXT NOT NULL,
+  created_by     INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  selected_wards TEXT NOT NULL DEFAULT '[]',
+  is_shared      INTEGER NOT NULL DEFAULT 0,
+  is_system      INTEGER NOT NULL DEFAULT 0,
+  created_at     INTEGER NOT NULL,
+  updated_at     INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_saved_views_user ON saved_views(created_by);
 `;
 export function migrate() {
     // ── Step 1: run base schema (CREATE TABLE IF NOT EXISTS — all idempotent) ──
@@ -146,6 +179,26 @@ export function migrate() {
     db.exec("CREATE INDEX IF NOT EXISTS idx_wards_floor ON wards(floor_id)");
     // ── Step 3: one-time migration from floors / pre_assignments → blocks ──────
     runV2Migration();
+    seedSystemViews();
+}
+function seedSystemViews() {
+    const now = Date.now();
+    const SYSTEM_VIEWS = [
+        { name: "All Beds", wards: [] },
+        { name: "Critical Care", wards: ["ICU", "CTICU", "NICU", "PICU", "Leukemia/ICU"] },
+        { name: "Pediatrics", wards: ["PICU", "NICU", "DAYCARE"] },
+        { name: "Emergency", wards: ["ER", "Pre & Post OP"] },
+        { name: "Dialysis", wards: ["DIALYSIS"] },
+    ];
+    const ins = db.prepare(`INSERT OR IGNORE INTO saved_views (name, created_by, selected_wards, is_shared, is_system, created_at, updated_at)
+     VALUES (?, NULL, ?, 1, 1, ?, ?)`);
+    // Use name as de-dup key — if system view with this name already exists, skip
+    const exists = db.prepare("SELECT name FROM saved_views WHERE is_system=1").all();
+    const existingNames = new Set(exists.map(r => r.name));
+    for (const v of SYSTEM_VIEWS) {
+        if (!existingNames.has(v.name))
+            ins.run(v.name, JSON.stringify(v.wards), now, now);
+    }
 }
 function addColumnIfMissing(table, column, definition) {
     const cols = db.prepare(`PRAGMA table_info(${table})`)

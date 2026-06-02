@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { authRequired, requireRole } from "../middleware/auth.js";
-import { asyncH } from "../middleware/error.js";
+import { asyncH, HttpError } from "../middleware/error.js";
+import { z } from "zod";
 import { orgOverview } from "../services/bedService.js";
 import { alarmState, userShift } from "../services/roundService.js";
 import { recentAudit } from "../services/auditService.js";
@@ -64,5 +65,68 @@ router.get("/compliance", asyncH(async (_req, res) => {
 router.get("/snapshots", asyncH(async (_req, res) => {
     const rows = db.prepare("SELECT ts,total,vacant,reserved,occupied FROM occupancy_snapshots ORDER BY ts DESC LIMIT 48").all();
     res.json({ snapshots: rows.reverse() });
+}));
+function parseView(v, currentUserId) {
+    return {
+        id: v.id,
+        name: v.name,
+        selected_wards: JSON.parse(v.selected_wards),
+        is_shared: !!v.is_shared,
+        is_system: !!v.is_system,
+        mine: v.created_by === currentUserId,
+        created_at: v.created_at,
+        updated_at: v.updated_at,
+        // Note: created_by user ID intentionally omitted — frontend only needs `mine`.
+    };
+}
+router.get("/views", asyncH(async (req, res) => {
+    const userId = req.user.id;
+    const rows = db.prepare(`
+    SELECT id, name, created_by, selected_wards, is_shared, is_system, created_at, updated_at
+    FROM saved_views
+    WHERE is_system = 1 OR is_shared = 1 OR created_by = ?
+    ORDER BY is_system DESC, name ASC
+  `).all(userId);
+    res.json({ views: rows.map(r => parseView(r, userId)) });
+}));
+router.post("/views", asyncH(async (req, res) => {
+    const { name, selected_wards, is_shared } = z.object({
+        name: z.string().min(1).max(60),
+        selected_wards: z.array(z.string()),
+        is_shared: z.boolean().optional().default(false),
+    }).parse(req.body);
+    const now = Date.now();
+    const r = db.prepare(`INSERT INTO saved_views (name, created_by, selected_wards, is_shared, is_system, created_at, updated_at)
+     VALUES (?,?,?,?,0,?,?)`).run(name, req.user.id, JSON.stringify(selected_wards), is_shared ? 1 : 0, now, now);
+    res.status(201).json({ ok: true, id: r.lastInsertRowid });
+}));
+router.put("/views/:id", asyncH(async (req, res) => {
+    const id = Number(req.params.id);
+    const view = db.prepare("SELECT * FROM saved_views WHERE id=?").get(id);
+    if (!view)
+        throw new HttpError(404, "View not found");
+    if (view.is_system)
+        throw new HttpError(403, "System views cannot be edited");
+    if (view.created_by !== req.user.id)
+        throw new HttpError(403, "Not your view");
+    const { name, selected_wards, is_shared } = z.object({
+        name: z.string().min(1).max(60),
+        selected_wards: z.array(z.string()),
+        is_shared: z.boolean(),
+    }).parse(req.body);
+    db.prepare("UPDATE saved_views SET name=?, selected_wards=?, is_shared=?, updated_at=? WHERE id=?").run(name, JSON.stringify(selected_wards), is_shared ? 1 : 0, Date.now(), id);
+    res.json({ ok: true });
+}));
+router.delete("/views/:id", asyncH(async (req, res) => {
+    const id = Number(req.params.id);
+    const view = db.prepare("SELECT * FROM saved_views WHERE id=?").get(id);
+    if (!view)
+        throw new HttpError(404, "View not found");
+    if (view.is_system)
+        throw new HttpError(403, "System views cannot be deleted");
+    if (view.created_by !== req.user.id)
+        throw new HttpError(403, "Not your view");
+    db.prepare("DELETE FROM saved_views WHERE id=?").run(id);
+    res.json({ ok: true });
 }));
 export default router;

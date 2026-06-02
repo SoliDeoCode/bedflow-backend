@@ -15,16 +15,42 @@ import cooRoutes from "./routes/coo.js";
 import metaRoutes from "./routes/meta.js";
 migrate(); // ensure schema exists
 const app = express();
-app.use(helmet());
-app.use(cors({ origin: env.CORS_ORIGIN }));
-app.use(express.json());
-// rate limit auth endpoints against brute force
-app.use("/api/auth", rateLimit({ windowMs: 15 * 60 * 1000, max: 50 }));
+app.use(helmet({
+    // SPA needs inline styles (vite-injected) and connection to its own origin.
+    // Tighten further if you fingerprint inline assets.
+    contentSecurityPolicy: env.isProd ? {
+        directives: {
+            defaultSrc: ["'self'"],
+            scriptSrc: ["'self'"],
+            styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
+            fontSrc: ["'self'", "https://fonts.gstatic.com"],
+            imgSrc: ["'self'", "data:"],
+            connectSrc: ["'self'", "ws:", "wss:"],
+            frameAncestors: ["'none'"],
+        },
+    } : false,
+    hsts: env.isProd ? { maxAge: 31536000, includeSubDomains: true } : false,
+}));
+app.use(cors({ origin: env.CORS_ORIGIN, credentials: false }));
+app.use(express.json({ limit: "100kb" })); // Prevent huge-body DoS
+// Brute-force protection: tighter cap than before, hides the count
+app.use("/api/auth", rateLimit({
+    windowMs: 15 * 60 * 1000, max: 20,
+    standardHeaders: true, legacyHeaders: false,
+    message: { error: "Too many attempts. Try again later." },
+}));
+// Cap push subscription churn — authenticated, per-IP
+const pushLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000, max: 10,
+    standardHeaders: true, legacyHeaders: false,
+    message: { error: "Too many push registrations. Try again later." },
+});
 app.get("/api/health", (_req, res) => res.json({ ok: true }));
 app.use("/api/auth", authRoutes);
 app.use("/api/pre", preRoutes);
 app.use("/api/manager", managerRoutes);
 app.use("/api/coo", cooRoutes);
+app.use("/api/push", pushLimiter);
 app.use("/api", metaRoutes);
 app.use(errorHandler);
 const server = createServer(app);

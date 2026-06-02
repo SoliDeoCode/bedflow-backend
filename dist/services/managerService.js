@@ -78,13 +78,29 @@ export function deleteBlock(blockId, managerId) {
 export function createWard(opts) {
     const block = requireBlock(opts.blockId);
     const now = Date.now();
+    const total = Math.max(0, Math.floor(opts.totalBeds));
     try {
-        const r = db.prepare("INSERT INTO wards (name, block_id, total_beds, created_at, updated_at) VALUES (?,?,?,?,?)").run(opts.name.trim(), opts.blockId, opts.totalBeds, now, now);
-        db.prepare("INSERT INTO beds (ward_id, total) VALUES (?,?)").run(r.lastInsertRowid, opts.totalBeds);
-        audit(opts.managerId, "ward_create", block.name, { name: opts.name, totalBeds: opts.totalBeds });
-        return { ok: true, id: Number(r.lastInsertRowid) };
+        let wardId = 0;
+        db.transaction(() => {
+            const r = db.prepare("INSERT INTO wards (name, block_id, total_beds, created_at, updated_at) VALUES (?,?,?,?,?)").run(opts.name.trim(), opts.blockId, total, now, now);
+            wardId = Number(r.lastInsertRowid);
+            db.prepare("INSERT INTO beds (ward_id, total) VALUES (?,?)").run(wardId, total);
+            // Auto-create bed_details rows numbered 1..N (VACANT). bed_details is now
+            // the source of truth for capacity, so the ward's bed_details count must
+            // match the totalBeds the manager declared at creation time.
+            if (total > 0) {
+                const insBed = db.prepare("INSERT INTO bed_details (ward_id, bed_number, status, updated_at, updated_by) VALUES (?,?,?,?,?)");
+                for (let i = 1; i <= total; i++) {
+                    insBed.run(wardId, String(i), "VACANT", now, opts.managerId);
+                }
+            }
+        });
+        audit(opts.managerId, "ward_create", block.name, { name: opts.name, totalBeds: total });
+        return { ok: true, id: wardId };
     }
-    catch {
+    catch (e) {
+        if (e instanceof HttpError)
+            throw e;
         throw new HttpError(409, `Ward "${opts.name}" already exists in block ${block.name}`);
     }
 }
@@ -100,9 +116,15 @@ export function editWard(opts) {
             db.prepare("UPDATE wards SET name=?, updated_at=? WHERE id=?")
                 .run(opts.name.trim(), now, opts.wardId);
         if (opts.totalBeds !== undefined) {
-            db.prepare("UPDATE wards SET total_beds=?, updated_at=? WHERE id=?")
-                .run(opts.totalBeds, now, opts.wardId);
-            db.prepare("UPDATE beds SET total=? WHERE ward_id=?").run(opts.totalBeds, opts.wardId);
+            // Capacity is now derived from bed_details. Reject any edit that doesn't
+            // match the current actual count — managers must add/delete individual
+            // beds via the bed endpoints to change capacity.
+            const actual = db.prepare("SELECT COUNT(*) AS c FROM bed_details WHERE ward_id=?").get(opts.wardId)?.c ?? 0;
+            if (opts.totalBeds !== actual)
+                throw new HttpError(409, `Capacity is derived from beds (currently ${actual}). ` +
+                    `Add or delete beds to change it.`);
+            // Matches — no-op write, but bump updated_at for consistency
+            db.prepare("UPDATE wards SET updated_at=? WHERE id=?").run(now, opts.wardId);
         }
         if (opts.blockId !== undefined) {
             requireBlock(opts.blockId); // validate target block exists

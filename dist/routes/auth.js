@@ -11,8 +11,15 @@ const loginSchema = z.object({
 });
 router.post("/login", asyncH(async (req, res) => {
     const { username, password, role } = loginSchema.parse(req.body);
-    const result = login(username, password, role);
-    audit(result.user.id, "login", "user", { username });
-    res.json(result);
+    try {
+        const result = login(username, password, role);
+        audit(result.user.id, "login", "user", { username });
+        res.json(result);
+    }
+    catch (e) {
+        // Audit failed attempts so brute-force is visible; do NOT log the password.
+        audit(null, "login_failed", "user", { username, reason: e.message });
+        throw e;
+    }
 }));
 export default router;
