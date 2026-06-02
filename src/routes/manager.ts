@@ -9,6 +9,9 @@ import {
   createPre, editPre, setPreShift, deletePre,
   availableDates, historyForDate,
 } from "../services/managerService.js";
+import {
+  generateBeds, addSingleBed, listBeds, renameBed, deleteBed,
+} from "../services/bedDetailService.js";
 
 const router = Router();
 router.use(authRequired, requireRole("MANAGER", "COO"));
@@ -92,9 +95,9 @@ router.get("/users", asyncH(async (_req, res) => {
 
 router.post("/pre", asyncH(async (req, res) => {
   const b = z.object({
-    username: z.string().min(1),
-    password: z.string().min(3),
-    name:     z.string().min(1),
+    username: z.string().min(1).max(40),
+    password: z.string().min(8).max(72),
+    name:     z.string().min(1).max(80),
     blockId:  z.number().int().nullable().optional(),
     shift:    z.enum(["morning", "night"]).optional(),
   }).parse(req.body);
@@ -103,8 +106,8 @@ router.post("/pre", asyncH(async (req, res) => {
 
 router.put("/pre/:id", asyncH(async (req, res) => {
   const b = z.object({
-    name:     z.string().optional(),
-    password: z.string().min(3).optional(),
+    name:     z.string().min(1).max(80).optional(),
+    password: z.string().min(8).max(72).optional(),
     shift:    z.enum(["morning", "night"]).optional(),
     blockId:  z.number().int().nullable().optional(),
   }).parse(req.body);
@@ -118,6 +121,40 @@ router.post("/pre/:id/shift", asyncH(async (req, res) => {
 
 router.delete("/pre/:id", asyncH(async (req, res) => {
   res.json(deletePre(Number(req.params.id), req.user!.id));
+}));
+
+// ── bed details ───────────────────────────────────────────────────────────────
+
+router.get("/wards/:id/beds", asyncH(async (req, res) => {
+  const wardId = Number(req.params.id);
+  const status = req.query.status as string | undefined;
+  res.json({ beds: listBeds(wardId, status) });
+}));
+
+router.post("/wards/:id/generate-beds", asyncH(async (req, res) => {
+  const { startNumber, count } = z.object({
+    startNumber: z.number().int().min(1),
+    count:       z.number().int().min(1).max(500),
+  }).parse(req.body);
+  res.status(201).json(
+    generateBeds({ wardId: Number(req.params.id), startNumber, count, userId: req.user!.id })
+  );
+}));
+
+router.post("/wards/:id/beds", asyncH(async (req, res) => {
+  const { bedNumber } = z.object({ bedNumber: z.string().min(1) }).parse(req.body);
+  res.status(201).json(
+    addSingleBed({ wardId: Number(req.params.id), bedNumber, userId: req.user!.id })
+  );
+}));
+
+router.patch("/beds/:id/number", asyncH(async (req, res) => {
+  const { bedNumber } = z.object({ bedNumber: z.string().min(1) }).parse(req.body);
+  res.json(renameBed({ bedId: Number(req.params.id), newBedNumber: bedNumber, userId: req.user!.id }));
+}));
+
+router.delete("/beds/:id", asyncH(async (req, res) => {
+  res.json(deleteBed({ bedId: Number(req.params.id), userId: req.user!.id }));
 }));
 
 // ── history ───────────────────────────────────────────────────────────────────

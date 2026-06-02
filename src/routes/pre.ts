@@ -4,6 +4,7 @@ import { authRequired, requireRole } from "../middleware/auth.js";
 import { asyncH, HttpError } from "../middleware/error.js";
 import { wardsForBlock, summarize, updateWard } from "../services/bedService.js";
 import { alarmState, setShift, userShift, submitRound } from "../services/roundService.js";
+import { listBeds, updateBedStatus } from "../services/bedDetailService.js";
 import { emitUpdate } from "../websocket/io.js";
 import { db } from "../db/index.js";
 
@@ -64,6 +65,36 @@ router.post("/submit", asyncH(async (req, res) => {
   const { block_id, block_name } = myBlock(req);
   const result = submitRound(block_id, req.user!.id);
   emitUpdate("round:submit", { block: block_name }, block_name);
+  res.json(result);
+}));
+
+// ── bed-level tracking (PRE only) ─────────────────────────────────────────────
+
+router.get("/wards/:id/beds", asyncH(async (req, res) => {
+  const { block_id } = myBlock(req);
+  const wardId = Number(req.params.id);
+  if (!db.prepare("SELECT 1 FROM wards WHERE id=? AND block_id=?").get(wardId, block_id))
+    throw new HttpError(403, "Ward not in your block");
+  const status = req.query.status as string | undefined;
+  res.json({ beds: listBeds(wardId, status) });
+}));
+
+router.patch("/beds/:id/status", asyncH(async (req, res) => {
+  const { block_id, block_name } = myBlock(req);
+  const bedId = Number(req.params.id);
+  const { status } = z.object({
+    status: z.enum(["VACANT", "RESERVED", "OCCUPIED"]),
+  }).parse(req.body);
+
+  const owns = db.prepare(
+    `SELECT bd.id FROM bed_details bd
+     JOIN wards w ON w.id = bd.ward_id
+     WHERE bd.id = ? AND w.block_id = ?`
+  ).get(bedId, block_id);
+  if (!owns) throw new HttpError(403, "Bed not in your block");
+
+  const result = updateBedStatus({ bedId, newStatus: status, userId: req.user!.id });
+  emitUpdate("bed:update", { block: block_name }, block_name);
   res.json(result);
 }));
 

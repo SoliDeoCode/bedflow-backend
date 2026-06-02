@@ -44,8 +44,16 @@ export function submitRound(blockId: number, userId: number) {
   for (const w of wards) {
     if (w.vacant === null)
       throw new HttpError(400, `Enter all wards first (${w.ward} missing)`);
-    if ((w.vacant + (w.reserved || 0) + (w.occupied || 0)) !== w.total)
-      throw new HttpError(400, `${w.ward}: counts must total ${w.total}`);
+    // When individual beds are tracked via bed_details, sum equals the tracked count
+    // (which may differ from total_beds). Skip the equality check in that case.
+    const hasBedDetails = !!db.prepare(
+      "SELECT 1 FROM bed_details WHERE ward_id=? LIMIT 1"
+    ).get(w.id);
+    if (!hasBedDetails) {
+      const sum = w.vacant + (w.reserved || 0) + (w.occupied || 0);
+      if (sum !== w.total)
+        throw new HttpError(400, `${w.ward}: counts must total ${w.total}`);
+    }
   }
 
   const block = db.prepare("SELECT name FROM blocks WHERE id=?")
