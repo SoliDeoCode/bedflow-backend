@@ -12,7 +12,7 @@ router.get("/meta", (_req, res) => {
 });
 router.post("/push/subscribe", authRequired, asyncH(async (req, res) => {
     const { subscription } = z.object({ subscription: z.object({ endpoint: z.string() }).passthrough() }).parse(req.body);
-    saveSubscription(req.user.id, subscription);
+    await saveSubscription(req.user.id, subscription);
     res.json({ ok: true });
 }));
 export default router;

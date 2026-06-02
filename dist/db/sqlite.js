@@ -1,17 +1,14 @@
-// SQLite implementation of the Db adapter.
+// SQLite implementation — kept for reference / local dev fallback.
+// NOTE: Not currently used. db/index.ts points to db/postgres.ts.
+// To switch back to SQLite, change db/index.ts to export from "./sqlite.js".
 //
-// Uses Node 22's built-in node:sqlite (no native build step). To switch to
-// better-sqlite3 in production, install it and change the import below — the
-// exported `db` keeps the same shape so nothing else changes.
-//
-// To switch to PostgreSQL: create db/postgres.ts implementing the Db interface
-// (e.g. with `pg`), then point db/index.ts at it. Service/route code is untouched.
+// The async interface wrappers below satisfy the updated Db type so the file
+// compiles cleanly, even though the underlying DatabaseSync calls are synchronous.
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import fs from "node:fs";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-// database files live in backend/database (separate folder, per requirements)
 const dbDir = path.resolve(__dirname, "..", "..", "database");
 if (!fs.existsSync(dbDir))
     fs.mkdirSync(dbDir, { recursive: true });
@@ -20,22 +17,22 @@ const raw = new DatabaseSync(dbPath);
 raw.exec("PRAGMA journal_mode = WAL;");
 raw.exec("PRAGMA foreign_keys = ON;");
 export const db = {
-    exec: (sql) => raw.exec(sql),
+    exec: async (sql) => { raw.exec(sql); },
     prepare: (sql) => {
         const stmt = raw.prepare(sql);
         return {
-            run: (...p) => {
+            run: async (...p) => {
                 const r = stmt.run(...p);
                 return { changes: Number(r.changes), lastInsertRowid: r.lastInsertRowid };
             },
-            get: (...p) => stmt.get(...p),
-            all: (...p) => stmt.all(...p),
+            get: async (...p) => stmt.get(...p),
+            all: async (...p) => stmt.all(...p),
         };
     },
-    transaction: (fn) => {
+    transaction: async (fn) => {
         raw.exec("BEGIN");
         try {
-            const out = fn();
+            const out = await fn();
             raw.exec("COMMIT");
             return out;
         }

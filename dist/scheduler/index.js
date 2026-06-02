@@ -6,22 +6,24 @@ import { emitUpdate } from "../websocket/io.js";
 import { COO_REMINDERS, hmToMin, minsNow, todayStr } from "../config/domain.js";
 const lastPush = new Map();
 const REPUSH_MS = 5 * 60 * 1000;
-function tick() {
+async function tick() {
     const now = Date.now();
     // PRE overdue → push (works whether or not they're logged in)
-    const pres = db.prepare("SELECT id, username FROM users WHERE role='PRE'")
+    const pres = await db.prepare("SELECT id, username FROM users WHERE role='PRE'")
         .all();
     for (const u of pres) {
         // Look up assigned block directly from users.block_id
-        const blockRow = db.prepare(`SELECT b.id, b.name FROM users usr
+        const blockRow = await db.prepare(`SELECT b.id, b.name FROM users usr
        JOIN blocks b ON b.id = usr.block_id
        WHERE usr.id = ?`).get(u.id);
         if (!blockRow)
             continue;
-        const wardCount = db.prepare("SELECT COUNT(*) AS n FROM wards WHERE block_id = ?").get(blockRow.id)?.n ?? 0;
+        const wardCountRow = await db.prepare("SELECT COUNT(*) AS n FROM wards WHERE block_id = ?").get(blockRow.id);
+        const wardCount = wardCountRow?.n ?? 0;
         if (wardCount === 0)
             continue;
-        const st = alarmState(blockRow.name, userShift(u.id));
+        const shift = await userShift(u.id);
+        const st = await alarmState(blockRow.name, shift);
         if (st.alarmActive) {
             emitUpdate("alarm:active", { pre: blockRow.name }, blockRow.name);
             const key = "pre:" + u.id;
@@ -42,7 +44,8 @@ function tick() {
             const flag = "coo:" + todayStr() + ":" + r;
             if (!lastPush.has(flag)) {
                 lastPush.set(flag, now);
-                for (const c of db.prepare("SELECT id FROM users WHERE role='COO'").all())
+                const coos = await db.prepare("SELECT id FROM users WHERE role='COO'").all();
+                for (const c of coos)
                     void pushToUser(c.id, {
                         title: "Hospital bed-status review",
                         body: `Your ${r} review is ready.`, tag: "coo-reminder",
@@ -53,9 +56,9 @@ function tick() {
     // hourly occupancy snapshot — use IST minutes so Render (UTC) fires at the right time
     const india = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
     if (india.getMinutes() === 0)
-        snapshotOccupancy();
+        void snapshotOccupancy();
 }
 export function startScheduler() {
-    setInterval(tick, 30 * 1000);
+    setInterval(() => { void tick(); }, 30 * 1000);
     console.log("Scheduler started (30s tick)");
 }

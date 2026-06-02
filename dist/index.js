@@ -13,7 +13,11 @@ import preRoutes from "./routes/pre.js";
 import managerRoutes from "./routes/manager.js";
 import cooRoutes from "./routes/coo.js";
 import metaRoutes from "./routes/meta.js";
-migrate(); // ensure schema exists
+// Serialize BigInt as Number in all JSON responses (timestamps are epoch-ms BigInt in Postgres)
+BigInt.prototype.toJSON = function () {
+    return Number(this);
+};
+migrate(); // ensure schema exists (no-op with Prisma — run: npx prisma migrate deploy)
 const app = express();
 app.use(helmet({
     // SPA needs inline styles (vite-injected) and connection to its own origin.

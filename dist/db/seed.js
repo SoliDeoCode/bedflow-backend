@@ -1,6 +1,5 @@
 import bcrypt from "bcryptjs";
 import { db } from "./index.js";
-import { migrate } from "./migrate.js";
 import { SHIFTS, PRE_INTERVAL_MIN } from "../config/domain.js";
 // ── Hospital data (Image #11) ─────────────────────────────────────────────────
 // Columns 1-5 in image are floor numbers; total = Grand Total column.
@@ -86,43 +85,33 @@ const PRE_ACCOUNTS = [
 function bedBase(blockName) {
     return (parseInt(blockName[0], 10) || 1) * 100 + 1;
 }
-function wipe() {
-    // Delete in FK-safe order (children before parents)
-    const tables = [
-        "bed_movements", "bed_details", "bed_status_updates",
-        "push_subscriptions", "audit_logs", "occupancy_snapshots",
-        "pre_rounds", "beds", "pre_assignments",
-        "wards", "users", "blocks", "floors",
-        "reminders", "shifts",
-    ];
-    db.exec("PRAGMA foreign_keys = OFF");
-    db.transaction(() => {
-        for (const t of tables)
-            db.exec(`DELETE FROM ${t}`);
-    });
-    db.exec("PRAGMA foreign_keys = ON");
+async function wipe() {
+    // TRUNCATE ... CASCADE is PostgreSQL — drops all rows and resets sequences in FK-safe order
+    await db.exec(`
+    TRUNCATE TABLE
+      bed_movements, bed_details, bed_status_updates,
+      push_subscriptions, audit_logs, occupancy_snapshots,
+      pre_rounds, beds, pre_assignments,
+      saved_views, wards, users, blocks, floors,
+      reminders, shifts
+    RESTART IDENTITY CASCADE
+  `);
     console.log("Database wiped.");
 }
-function run() {
-    migrate();
-    wipe();
+async function run() {
+    await wipe();
     const now = Date.now();
-    db.transaction(() => {
+    await db.transaction(async () => {
         // ── 1. Blocks ────────────────────────────────────────────────────────────
-        const insBlock = db.prepare(`INSERT INTO blocks (name, name_key, label, sort_order, created_at, updated_at)
-       VALUES (?,?,?,?,?,?)`);
-        for (const b of BLOCK_DATA)
-            insBlock.run(b.name, b.name.toUpperCase(), b.label, b.sortOrder, now, now);
+        for (const b of BLOCK_DATA) {
+            await db.prepare(`INSERT INTO blocks (name, name_key, label, sort_order, created_at, updated_at)
+         VALUES (?,?,?,?,?,?)`).run(b.name, b.name.toUpperCase(), b.label, b.sortOrder, now, now);
+        }
+        const blockRows = await db.prepare("SELECT id, name_key FROM blocks").all();
         const blockIdFor = {};
-        for (const row of db.prepare("SELECT id, name_key FROM blocks").all())
+        for (const row of blockRows)
             blockIdFor[row.name_key] = row.id;
         // ── 2. Wards + summary beds row + individual bed_details ─────────────────
-        const insWard = db.prepare(`INSERT INTO wards (name, block_id, total_beds, created_at, updated_at)
-       VALUES (?,?,?,?,?)`);
-        const insBedSummary = db.prepare(`INSERT INTO beds (ward_id, total, vacant, reserved, occupied, updated_at)
-       VALUES (?,?,NULL,NULL,NULL,NULL)`);
-        const insBedDetail = db.prepare(`INSERT INTO bed_details (ward_id, bed_number, status, updated_at, updated_by)
-       VALUES (?,?,?,?,NULL)`);
         let wardCount = 0, bedTotal = 0;
         for (const b of BLOCK_DATA) {
             const blockId = blockIdFor[b.name.toUpperCase()];
@@ -130,36 +119,52 @@ function run() {
                 continue;
             const start = bedBase(b.name);
             for (const w of b.wards) {
-                insWard.run(w.name, blockId, w.total, now, now);
-                const ward = db.prepare("SELECT id FROM wards WHERE block_id=? AND name=?")
+                await db.prepare(`INSERT INTO wards (name, block_id, total_beds, created_at, updated_at)
+           VALUES (?,?,?,?,?)`).run(w.name, blockId, w.total, now, now);
+                const ward = await db.prepare("SELECT id FROM wards WHERE block_id=? AND name=?")
                     .get(blockId, w.name);
                 if (!ward)
                     continue;
-                insBedSummary.run(ward.id, w.total);
+                await db.prepare(`INSERT INTO beds (ward_id, total, vacant, reserved, occupied, updated_at)
+           VALUES (?,?,NULL,NULL,NULL,NULL)`).run(ward.id, w.total);
                 // Generate individual beds: start..start+total-1 (per-ward, not global)
-                for (let i = 0; i < w.total; i++)
-                    insBedDetail.run(ward.id, String(start + i), "VACANT", now);
+                for (let i = 0; i < w.total; i++) {
+                    await db.prepare(`INSERT INTO bed_details (ward_id, bed_number, status, updated_at, updated_by)
+             VALUES (?,?,?,?,NULL) ON CONFLICT (ward_id, bed_number) DO NOTHING`).run(ward.id, String(start + i), "VACANT", now);
+                }
                 wardCount++;
                 bedTotal += w.total;
             }
         }
         // ── 3. Users ─────────────────────────────────────────────────────────────
-        const insUser = db.prepare(`INSERT INTO users
-         (username, password_hash, role, name, shift, block_id, created_at, updated_at)
-       VALUES (?,?,?,?,?,?,?,?)`);
         for (const a of PRE_ACCOUNTS) {
             const blockId = blockIdFor[a.block.toUpperCase()] ?? null;
-            insUser.run(a.username, bcrypt.hashSync(`${a.username}123`, 10), "PRE", a.name, "morning", blockId, now, now);
+            await db.prepare(`INSERT INTO users
+           (username, password_hash, role, name, shift, block_id, created_at, updated_at)
+         VALUES (?,?,?,?,?,?,?,?)`).run(a.username, bcrypt.hashSync(`${a.username}123`, 10), "PRE", a.name, "morning", blockId, now, now);
         }
-        insUser.run("manager", bcrypt.hashSync("manager123", 10), "MANAGER", "Ward Manager", "morning", null, now, now);
-        insUser.run("coo", bcrypt.hashSync("coo123", 10), "COO", "Chief Operating Officer", "morning", null, now, now);
+        await db.prepare(`INSERT INTO users (username, password_hash, role, name, shift, block_id, created_at, updated_at)
+       VALUES (?,?,?,?,?,NULL,?,?)`).run("manager", bcrypt.hashSync("manager123", 10), "MANAGER", "Ward Manager", "morning", now, now);
+        await db.prepare(`INSERT INTO users (username, password_hash, role, name, shift, block_id, created_at, updated_at)
+       VALUES (?,?,?,?,?,NULL,?,?)`).run("coo", bcrypt.hashSync("coo123", 10), "COO", "Chief Operating Officer", "morning", now, now);
         // ── 4. Shifts + reminders ─────────────────────────────────────────────────
-        const insShift = db.prepare("INSERT INTO shifts (key, label, start_time, end_time) VALUES (?,?,?,?)");
-        for (const [key, s] of Object.entries(SHIFTS))
-            insShift.run(key, s.label, s.start, s.end);
-        const insRem = db.prepare("INSERT INTO reminders (target_role, interval_min, window_start, window_end, active) VALUES (?,?,?,?,1)");
-        insRem.run("PRE", PRE_INTERVAL_MIN, "09:00", "18:30");
-        insRem.run("COO", 180, "09:00", "18:00");
+        for (const [key, s] of Object.entries(SHIFTS)) {
+            await db.prepare("INSERT INTO shifts (key, label, start_time, end_time) VALUES (?,?,?,?)").run(key, s.label, s.start, s.end);
+        }
+        await db.prepare("INSERT INTO reminders (target_role, interval_min, window_start, window_end, active) VALUES (?,?,?,?,1)").run("PRE", PRE_INTERVAL_MIN, "09:00", "18:30");
+        await db.prepare("INSERT INTO reminders (target_role, interval_min, window_start, window_end, active) VALUES (?,?,?,?,1)").run("COO", 180, "09:00", "18:00");
+        // ── 5. System saved views ─────────────────────────────────────────────────
+        const SYSTEM_VIEWS = [
+            { name: "All Beds", wards: [] },
+            { name: "Critical Care", wards: ["ICU", "CTICU", "NICU", "PICU", "Leukemia/ICU"] },
+            { name: "Pediatrics", wards: ["PICU", "NICU", "DAYCARE"] },
+            { name: "Emergency", wards: ["ER", "Pre & Post OP"] },
+            { name: "Dialysis", wards: ["DIALYSIS"] },
+        ];
+        for (const v of SYSTEM_VIEWS) {
+            await db.prepare(`INSERT INTO saved_views (name, created_by, selected_wards, is_shared, is_system, created_at, updated_at)
+         VALUES (?, NULL, ?, 1, 1, ?, ?) ON CONFLICT DO NOTHING`).run(v.name, JSON.stringify(v.wards), now, now);
+        }
         console.log(`Seeded: ${BLOCK_DATA.length} blocks, ${wardCount} wards, ${bedTotal} total beds.`);
         console.log("");
         console.log("Logins:");
@@ -169,4 +174,4 @@ function run() {
         console.log("  coo      →  coo123");
     });
 }
-run();
+run().catch(err => { console.error("Seed failed:", err); process.exit(1); });

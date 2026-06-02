@@ -15,7 +15,7 @@ router.get("/meta", (_req, res) => {
 
 router.post("/push/subscribe", authRequired, asyncH(async (req, res) => {
   const { subscription } = z.object({ subscription: z.object({ endpoint: z.string() }).passthrough() }).parse(req.body);
-  saveSubscription(req.user!.id, subscription as { endpoint: string });
+  await saveSubscription(req.user!.id, subscription as { endpoint: string });
   res.json({ ok: true });
 }));
 

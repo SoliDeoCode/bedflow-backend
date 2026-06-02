@@ -14,17 +14,15 @@ export interface PreSummary {
   wards: number; wardsDone: number; complete: boolean;
 }
 
-/** All wards for a block, joined with their current bed snapshot. */
-export function wardsForBlock(blockId: number): WardView[] {
+export async function wardsForBlock(blockId: number): Promise<WardView[]> {
   return db.prepare(
     `SELECT w.id, w.name AS ward, w.total_beds AS total,
-            b.vacant, b.reserved, b.occupied, b.updated_at AS updatedAt
+            b.vacant, b.reserved, b.occupied, b.updated_at AS "updatedAt"
      FROM wards w JOIN beds b ON b.ward_id = w.id
      WHERE w.block_id = ? ORDER BY w.name`
   ).all<WardView>(blockId);
 }
 
-/** Summarise an array of WardViews into v/o/r totals. */
 export function summarize(wards: WardView[]): PreSummary {
   let v = 0, o = 0, r = 0, total = 0, wardsDone = 0;
   for (const w of wards) {
@@ -37,9 +35,8 @@ export function summarize(wards: WardView[]): PreSummary {
            complete: wards.length > 0 && wardsDone === wards.length };
 }
 
-/** Auto-calculation: caller provides vacant + reserved; occupied is derived. */
-export function updateWard(wardId: number, vacant: number, reserved: number, userId: number) {
-  const ward = db.prepare(
+export async function updateWard(wardId: number, vacant: number, reserved: number, userId: number) {
+  const ward = await db.prepare(
     "SELECT id, name, total_beds AS total, block_id FROM wards WHERE id = ?"
   ).get<{ id: number; name: string; total: number; block_id: number }>(wardId);
   if (!ward) throw new HttpError(404, "Ward not found");
@@ -50,78 +47,61 @@ export function updateWard(wardId: number, vacant: number, reserved: number, use
   const occupied = ward.total - v - r;
   const now = Date.now();
 
-  db.transaction(() => {
-    db.prepare(
+  await db.transaction(async () => {
+    await db.prepare(
       "UPDATE beds SET vacant=?, reserved=?, occupied=?, updated_at=?, updated_by=? WHERE ward_id=?"
     ).run(v, r, occupied, now, userId, wardId);
-    db.prepare(
+    await db.prepare(
       "INSERT INTO bed_status_updates (ward_id, vacant, reserved, occupied, updated_by, created_at) VALUES (?,?,?,?,?,?)"
     ).run(wardId, v, r, occupied, userId, now);
   });
 
-  // look up block name for audit
-  const blockName = db.prepare("SELECT name FROM blocks WHERE id = ?")
-    .get<{ name: string }>(ward.block_id)?.name ?? String(ward.block_id);
-  audit(userId, "ward_update", blockName, { ward: ward.name, vacant: v, reserved: r, occupied });
+  const blockName = (await db.prepare("SELECT name FROM blocks WHERE id = ?")
+    .get<{ name: string }>(ward.block_id))?.name ?? String(ward.block_id);
+  await audit(userId, "ward_update", blockName, { ward: ward.name, vacant: v, reserved: r, occupied });
   return { ward: ward.name, vacant: v, reserved: r, occupied, total: ward.total };
 }
 
-// ── COO / overview aggregation ────────────────────────────────────────────────
-
 interface BlockOverviewItem {
-  block_id: number;
-  pre: string;              // block name — kept as "pre" so COO frontend stays compatible
-  floor: string;            // same as block name
-  label: string;
-  wards: WardView[];
-  summary: PreSummary;
-  lastSubmittedAt: number | null;
-  roundsToday: number;
+  block_id: number; pre: string; floor: string; label: string;
+  wards: WardView[]; summary: PreSummary;
+  lastSubmittedAt: number | null; roundsToday: number;
   assignedUser: { id: number; name: string; shift: string } | null;
 }
 
-export function orgOverview(): {
+export async function orgOverview(): Promise<{
   floors: { name: string; pres: BlockOverviewItem[] }[];
   totals: { v: number; o: number; r: number; total: number; presReporting: number; presTotal: number };
-} {
-  const blocks = db.prepare(
+}> {
+  const blocks = await db.prepare(
     "SELECT id, name, label, sort_order FROM blocks ORDER BY sort_order, name"
   ).all<{ id: number; name: string; label: string | null; sort_order: number }>();
 
   const today = startOfDayIST();
 
-  const items: BlockOverviewItem[] = blocks.map(block => {
-    const wards = wardsForBlock(block.id);
-
-    const last = db.prepare(
+  const items: BlockOverviewItem[] = await Promise.all(blocks.map(async block => {
+    const wards = await wardsForBlock(block.id);
+    const last  = await db.prepare(
       "SELECT submitted_at FROM pre_rounds WHERE block_id=? ORDER BY submitted_at DESC LIMIT 1"
     ).get<{ submitted_at: number }>(block.id);
-
-    const roundsToday = db.prepare(
+    const roundsRow = await db.prepare(
       "SELECT COUNT(*) AS c FROM pre_rounds WHERE block_id=? AND submitted_at>=?"
-    ).get<{ c: number }>(block.id, today)?.c ?? 0;
-
-    const assignedUser = db.prepare(
+    ).get<{ c: number }>(block.id, today);
+    const assignedUser = await db.prepare(
       "SELECT id, name, shift FROM users WHERE block_id=? AND role='PRE' LIMIT 1"
     ).get<{ id: number; name: string; shift: string }>(block.id) ?? null;
 
     return {
-      block_id: block.id,
-      pre:   block.name,               // block name doubles as "pre" key in COO frontend
-      floor: block.name,
-      label: block.label || block.name,
-      wards,
+      block_id: block.id, pre: block.name, floor: block.name,
+      label: block.label || block.name, wards,
       summary: summarize(wards),
       lastSubmittedAt: last?.submitted_at ?? null,
-      roundsToday,
+      roundsToday: roundsRow?.c ?? 0,
       assignedUser,
     };
-  });
+  }));
 
-  // Wrap each block in a { name, pres: [...] } shell so the COO frontend
-  // (which iterates floors → pres) keeps working without changes.
   const floors = items.map(item => ({ name: item.pre, pres: [item] }));
-
   let v = 0, o = 0, r = 0, total = 0, presReporting = 0, presTotal = 0;
   for (const item of items) {
     v += item.summary.v; o += item.summary.o;
@@ -134,9 +114,9 @@ export function orgOverview(): {
   return { floors, totals: { v, o, r, total, presReporting, presTotal } };
 }
 
-export function snapshotOccupancy() {
-  const { totals } = orgOverview();
-  db.prepare(
+export async function snapshotOccupancy() {
+  const { totals } = await orgOverview();
+  await db.prepare(
     "INSERT INTO occupancy_snapshots (ts, total, vacant, reserved, occupied) VALUES (?,?,?,?,?)"
   ).run(Date.now(), totals.total, totals.v, totals.r, totals.o);
 }

@@ -1,0 +1,255 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+ // url       = env("DATABASE_URL")
+  //directUrl = env("DIRECT_URL")
+}
+
+// All timestamp columns use BigInt (epoch-ms). PostgreSQL INTEGER is 32-bit and
+// would overflow epoch-ms values (~1.7 trillion in 2026). BIGINT (64-bit) is safe.
+
+model User {
+  id            Int     @id @default(autoincrement())
+  username      String  @unique @db.VarChar(255)
+  password_hash String
+  role          String  @db.VarChar(20)
+  name          String
+  shift         String  @default("morning") @db.VarChar(20)
+  created_at    BigInt
+  updated_at    BigInt
+  block_id      Int?
+
+  block              Block?            @relation("UserBlock", fields: [block_id], references: [id], onDelete: SetNull)
+  bed_status_updates BedStatusUpdate[] @relation("BedStatusUpdater")
+  bed_details        BedDetail[]       @relation("BedDetailUpdater")
+  bed_movements      BedMovement[]     @relation("BedMover")
+  pre_rounds         PreRound[]        @relation("RoundUser")
+  pre_assignments    PreAssignment[]
+  push_subscriptions PushSubscription[]
+  audit_logs         AuditLog[]
+  saved_views        SavedView[]       @relation("ViewCreator")
+  beds_updated       Bed[]             @relation("BedUpdater")
+
+  @@map("users")
+}
+
+model Floor {
+  id    Int    @id @default(autoincrement())
+  name  String @unique
+
+  wards Ward[]
+
+  @@map("floors")
+}
+
+model Block {
+  id         Int     @id @default(autoincrement())
+  name       String
+  name_key   String  @unique
+  label      String?
+  sort_order Int     @default(0)
+  created_at BigInt
+  updated_at BigInt
+
+  users      User[]    @relation("UserBlock")
+  wards      Ward[]
+  pre_rounds PreRound[] @relation("RoundBlock")
+
+  @@index([name_key])
+  @@map("blocks")
+}
+
+model Ward {
+  id         Int     @id @default(autoincrement())
+  name       String
+  total_beds Int
+  created_at BigInt
+  updated_at BigInt
+  block_id   Int?
+  floor_id   Int?
+  pre_code   String?
+
+  block              Block?            @relation(fields: [block_id], references: [id], onDelete: Restrict)
+  floor              Floor?            @relation(fields: [floor_id], references: [id], onDelete: SetNull)
+  bed                Bed?
+  bed_status_updates BedStatusUpdate[]
+  bed_details        BedDetail[]
+
+  @@index([block_id])
+  @@index([pre_code])
+  @@index([floor_id])
+  @@map("wards")
+}
+
+model Bed {
+  ward_id    Int     @id
+  total      Int
+  vacant     Int?
+  reserved   Int?
+  occupied   Int?
+  updated_at BigInt?
+  updated_by Int?
+
+  ward    Ward  @relation(fields: [ward_id], references: [id], onDelete: Cascade)
+  updater User? @relation("BedUpdater", fields: [updated_by], references: [id])
+
+  @@map("beds")
+}
+
+model PreAssignment {
+  id         Int    @id @default(autoincrement())
+  user_id    Int
+  pre_code   String
+  created_at BigInt
+
+  user User @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@unique([user_id, pre_code])
+  @@index([user_id])
+  @@map("pre_assignments")
+}
+
+model BedStatusUpdate {
+  id         Int    @id @default(autoincrement())
+  ward_id    Int
+  vacant     Int
+  reserved   Int
+  occupied   Int
+  updated_by Int?
+  created_at BigInt
+
+  ward    Ward  @relation(fields: [ward_id], references: [id], onDelete: Cascade)
+  updater User? @relation("BedStatusUpdater", fields: [updated_by], references: [id])
+
+  @@index([ward_id, created_at])
+  @@map("bed_status_updates")
+}
+
+model PreRound {
+  id           Int     @id @default(autoincrement())
+  pre_code     String
+  user_id      Int?
+  shift        String  @db.VarChar(20)
+  round_key    String  @unique
+  start_min    Int
+  submitted_at BigInt
+  snapshot     String? @db.Text
+  block_id     Int?
+
+  user  User?  @relation("RoundUser",  fields: [user_id],  references: [id])
+  block Block? @relation("RoundBlock", fields: [block_id], references: [id])
+
+  @@index([pre_code, submitted_at])
+  @@map("pre_rounds")
+}
+
+model Reminder {
+  id           Int    @id @default(autoincrement())
+  target_role  String @db.VarChar(20)
+  interval_min Int
+  window_start String @db.VarChar(10)
+  window_end   String @db.VarChar(10)
+  active       Int    @default(1)
+
+  @@map("reminders")
+}
+
+model Shift {
+  id         Int    @id @default(autoincrement())
+  key        String @unique
+  label      String
+  start_time String @db.VarChar(10)
+  end_time   String @db.VarChar(10)
+
+  @@map("shifts")
+}
+
+model AuditLog {
+  id      Int     @id @default(autoincrement())
+  ts      BigInt
+  user_id Int?
+  action  String
+  entity  String?
+  detail  String? @db.Text
+
+  user User? @relation(fields: [user_id], references: [id])
+
+  @@index([ts])
+  @@map("audit_logs")
+}
+
+model OccupancySnapshot {
+  id       Int    @id @default(autoincrement())
+  ts       BigInt
+  total    Int
+  vacant   Int
+  reserved Int
+  occupied Int
+
+  @@index([ts])
+  @@map("occupancy_snapshots")
+}
+
+model PushSubscription {
+  id         Int    @id @default(autoincrement())
+  user_id    Int
+  endpoint   String @unique
+  sub_json   String @db.Text
+  created_at BigInt
+
+  user User @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@index([user_id])
+  @@map("push_subscriptions")
+}
+
+model BedDetail {
+  id         Int    @id @default(autoincrement())
+  ward_id    Int
+  bed_number String
+  status     String @db.VarChar(20)
+  updated_at BigInt
+  updated_by Int?
+
+  ward      Ward          @relation(fields: [ward_id], references: [id], onDelete: Cascade)
+  updater   User?         @relation("BedDetailUpdater", fields: [updated_by], references: [id])
+  movements BedMovement[]
+
+  @@unique([ward_id, bed_number])
+  @@index([ward_id, status])
+  @@map("bed_details")
+}
+
+model BedMovement {
+  id         Int    @id @default(autoincrement())
+  bed_id     Int
+  old_status String @db.VarChar(20)
+  new_status String @db.VarChar(20)
+  changed_by Int?
+  changed_at BigInt
+
+  bed     BedDetail @relation(fields: [bed_id], references: [id], onDelete: Cascade)
+  changer User?     @relation("BedMover", fields: [changed_by], references: [id])
+
+  @@index([bed_id, changed_at])
+  @@map("bed_movements")
+}
+
+model SavedView {
+  id             Int    @id @default(autoincrement())
+  name           String
+  created_by     Int?
+  selected_wards String @default("[]") @db.Text
+  is_shared      Int    @default(0)
+  is_system      Int    @default(0)
+  created_at     BigInt
+  updated_at     BigInt
+
+  creator User? @relation("ViewCreator", fields: [created_by], references: [id], onDelete: Cascade)
+
+  @@index([created_by])
+  @@map("saved_views")
+}
