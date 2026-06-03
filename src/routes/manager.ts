@@ -127,8 +127,9 @@ router.delete("/pre/:id", asyncH(async (req, res) => {
 
 router.get("/wards/:id/beds", asyncH(async (req, res) => {
   const wardId = Number(req.params.id);
-  const status = req.query.status as string | undefined;
-  res.json({ beds: await listBeds(wardId, status) });
+  const physicalStatus    = req.query.physical_status    as string | undefined;
+  const reservationStatus = req.query.reservation_status as string | undefined;
+  res.json({ beds: await listBeds(wardId, physicalStatus, reservationStatus) });
 }));
 
 router.post("/wards/:id/generate-beds", asyncH(async (req, res) => {

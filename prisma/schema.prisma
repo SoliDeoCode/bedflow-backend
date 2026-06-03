@@ -85,13 +85,14 @@ model Ward {
 }
 
 model Bed {
-  ward_id    Int     @id
-  total      Int
-  vacant     Int?
-  reserved   Int?
-  occupied   Int?
-  updated_at BigInt?
-  updated_by Int?
+  ward_id           Int     @id
+  total             Int
+  vacant            Int?
+  reserved          Int?
+  occupied          Int?
+  occupied_reserved Int?
+  updated_at        BigInt?
+  updated_by        Int?
 
   ward    Ward  @relation(fields: [ward_id], references: [id], onDelete: Cascade)
   updater User? @relation("BedUpdater", fields: [updated_by], references: [id])
@@ -113,13 +114,14 @@ model PreAssignment {
 }
 
 model BedStatusUpdate {
-  id         Int    @id @default(autoincrement())
-  ward_id    Int
-  vacant     Int
-  reserved   Int
-  occupied   Int
-  updated_by Int?
-  created_at BigInt
+  id                Int    @id @default(autoincrement())
+  ward_id           Int
+  vacant_none       Int
+  vacant_reserved   Int
+  occupied_none     Int
+  occupied_reserved Int
+  updated_by        Int?
+  created_at        BigInt
 
   ward    Ward  @relation(fields: [ward_id], references: [id], onDelete: Cascade)
   updater User? @relation("BedStatusUpdater", fields: [updated_by], references: [id])
@@ -207,29 +209,32 @@ model PushSubscription {
 }
 
 model BedDetail {
-  id         Int    @id @default(autoincrement())
-  ward_id    Int
-  bed_number String
-  status     String @db.VarChar(20)
-  updated_at BigInt
-  updated_by Int?
+  id                 Int    @id @default(autoincrement())
+  ward_id            Int
+  bed_number         String
+  physical_status    String @default("VACANT")   @db.VarChar(20)
+  reservation_status String @default("NONE")     @db.VarChar(20)
+  updated_at         BigInt
+  updated_by         Int?
 
   ward      Ward          @relation(fields: [ward_id], references: [id], onDelete: Cascade)
   updater   User?         @relation("BedDetailUpdater", fields: [updated_by], references: [id])
   movements BedMovement[]
 
   @@unique([ward_id, bed_number])
-  @@index([ward_id, status])
+  @@index([ward_id, physical_status, reservation_status])
   @@map("bed_details")
 }
 
 model BedMovement {
-  id         Int    @id @default(autoincrement())
-  bed_id     Int
-  old_status String @db.VarChar(20)
-  new_status String @db.VarChar(20)
-  changed_by Int?
-  changed_at BigInt
+  id              Int    @id @default(autoincrement())
+  bed_id          Int
+  old_physical    String @db.VarChar(20)
+  new_physical    String @db.VarChar(20)
+  old_reservation String @db.VarChar(20)
+  new_reservation String @db.VarChar(20)
+  changed_by      Int?
+  changed_at      BigInt
 
   bed     BedDetail @relation(fields: [bed_id], references: [id], onDelete: Cascade)
   changer User?     @relation("BedMover", fields: [changed_by], references: [id])

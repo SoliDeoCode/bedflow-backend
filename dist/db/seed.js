@@ -129,9 +129,10 @@ async function run() {
                 await db.prepare(`INSERT INTO beds (ward_id, total, vacant, reserved, occupied, updated_at)
            VALUES (?,?,NULL,NULL,NULL,NULL)`).run(ward.id, w.total);
                 // Generate individual beds: start..start+total-1 (per-ward, not global)
+                const insBedDetail = db.prepare(`INSERT INTO bed_details (ward_id, bed_number, physical_status, reservation_status, updated_at, updated_by)
+           VALUES (?,?,'VACANT','NONE',?,NULL) ON CONFLICT (ward_id, bed_number) DO NOTHING`);
                 for (let i = 0; i < w.total; i++) {
-                    await db.prepare(`INSERT INTO bed_details (ward_id, bed_number, status, updated_at, updated_by)
-             VALUES (?,?,?,?,NULL) ON CONFLICT (ward_id, bed_number) DO NOTHING`).run(ward.id, String(start + i), "VACANT", now);
+                    await insBedDetail.run(ward.id, String(start + i), now);
                 }
                 wardCount++;
                 bedTotal += w.total;

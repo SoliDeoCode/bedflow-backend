@@ -97,8 +97,9 @@ router.delete("/pre/:id", asyncH(async (req, res) => {
 // ── bed details ───────────────────────────────────────────────────────────────
 router.get("/wards/:id/beds", asyncH(async (req, res) => {
     const wardId = Number(req.params.id);
-    const status = req.query.status;
-    res.json({ beds: await listBeds(wardId, status) });
+    const physicalStatus = req.query.physical_status;
+    const reservationStatus = req.query.reservation_status;
+    res.json({ beds: await listBeds(wardId, physicalStatus, reservationStatus) });
 }));
 router.post("/wards/:id/generate-beds", asyncH(async (req, res) => {
     const { startNumber, count } = z.object({

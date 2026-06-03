@@ -46,15 +46,19 @@ router.post("/shift", asyncH(async (req, res) => {
 
 router.post("/ward", asyncH(async (req, res) => {
   const { block_id } = await myBlock(req);
-  const { wardId, vacant, reserved } = z.object({
-    wardId: z.number().int(), vacant: z.number().int().min(0), reserved: z.number().int().min(0),
+  const { wardId, vacant_none, vacant_reserved, occupied_none, occupied_reserved } = z.object({
+    wardId:            z.number().int(),
+    vacant_none:       z.number().int().min(0),
+    vacant_reserved:   z.number().int().min(0),
+    occupied_none:     z.number().int().min(0),
+    occupied_reserved: z.number().int().min(0),
   }).parse(req.body);
 
   // Verify the ward belongs to this user's block
   const owns = await db.prepare("SELECT 1 FROM wards WHERE id=? AND block_id=?").get(wardId, block_id);
   if (!owns) throw new HttpError(403, "Ward not assigned to your block");
 
-  const result = await updateWard(wardId, vacant, reserved, req.user!.id);
+  const result = await updateWard(wardId, vacant_none, vacant_reserved, occupied_none, occupied_reserved, req.user!.id);
   const blockName = (await db.prepare("SELECT name FROM blocks WHERE id=?")
     .get<{ name: string }>(block_id))?.name ?? "";
   emitUpdate("bed:update", { block: blockName, ...result }, blockName);
@@ -75,15 +79,17 @@ router.get("/wards/:id/beds", asyncH(async (req, res) => {
   const wardId = Number(req.params.id);
   if (!await db.prepare("SELECT 1 FROM wards WHERE id=? AND block_id=?").get(wardId, block_id))
     throw new HttpError(403, "Ward not in your block");
-  const status = req.query.status as string | undefined;
-  res.json({ beds: await listBeds(wardId, status) });
+  const physicalStatus    = req.query.physical_status    as string | undefined;
+  const reservationStatus = req.query.reservation_status as string | undefined;
+  res.json({ beds: await listBeds(wardId, physicalStatus, reservationStatus) });
 }));
 
 router.patch("/beds/:id/status", asyncH(async (req, res) => {
   const { block_id, block_name } = await myBlock(req);
   const bedId = Number(req.params.id);
-  const { status } = z.object({
-    status: z.enum(["VACANT", "RESERVED", "OCCUPIED"]),
+  const { physical_status, reservation_status } = z.object({
+    physical_status:    z.enum(["VACANT", "OCCUPIED"]),
+    reservation_status: z.enum(["NONE", "RESERVED"]),
   }).parse(req.body);
 
   const owns = await db.prepare(
@@ -93,7 +99,7 @@ router.patch("/beds/:id/status", asyncH(async (req, res) => {
   ).get(bedId, block_id);
   if (!owns) throw new HttpError(403, "Bed not in your block");
 
-  const result = await updateBedStatus({ bedId, newStatus: status, userId: req.user!.id });
+  const result = await updateBedStatus({ bedId, physicalStatus: physical_status, reservationStatus: reservation_status, userId: req.user!.id });
   emitUpdate("bed:update", { block: block_name }, block_name);
   res.json(result);
 }));

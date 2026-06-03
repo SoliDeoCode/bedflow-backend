@@ -90,8 +90,9 @@ export async function createWard(opts) {
             wardId = Number(r.lastInsertRowid);
             await db.prepare("INSERT INTO beds (ward_id, total) VALUES (?,?)").run(wardId, total);
             if (total > 0) {
+                const insBed = db.prepare("INSERT INTO bed_details (ward_id, bed_number, physical_status, reservation_status, updated_at, updated_by) VALUES (?,?,'VACANT','NONE',?,?)");
                 for (let i = 1; i <= total; i++) {
-                    await db.prepare("INSERT INTO bed_details (ward_id, bed_number, status, updated_at, updated_by) VALUES (?,?,?,?,?)").run(wardId, String(i), "VACANT", now, opts.managerId);
+                    await insBed.run(wardId, String(i), now, opts.managerId);
                 }
             }
         });
