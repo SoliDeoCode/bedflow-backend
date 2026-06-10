@@ -1,4 +1,4 @@
-export type Role = "PRE" | "MANAGER" | "COO";
+export type Role = "PRE" | "MANAGER" | "COO" | "NURSE";
 
 export interface User {
   id: number;
@@ -7,7 +7,8 @@ export interface User {
   role: Role;
   name: string;
   shift: "morning" | "night";
-  block_id: number | null;   // NEW: replaces pre_assignments join
+  block_id: number | null;
+  nursing_station: string | null;
   created_at: number;
   updated_at: number;
 }
@@ -27,10 +28,12 @@ export interface JwtPayload {
   username: string;
   role: Role;
   name: string;
-  /** Block name (e.g. "1A") — null for MANAGER / COO */
+  /** Block name (e.g. "1A") — null for MANAGER / COO / NURSE */
   block: string | null;
   /** Legacy alias kept so old JWT tokens don't crash the middleware */
   pre?: string | null;
+  /** Nursing station name — set for NURSE role only */
+  nursing_station?: string | null;
 }
 
 export interface WardRow {

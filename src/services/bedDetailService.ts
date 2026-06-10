@@ -2,6 +2,14 @@ import { db } from "../db/index.js";
 import { HttpError } from "../middleware/error.js";
 import { audit } from "./auditService.js";
 
+const BED_NAME_RE = /^[A-Za-z0-9 \-]+$/;
+
+function validateBedName(name: string) {
+  if (!name.trim()) throw new HttpError(400, "Bed name required");
+  if (!BED_NAME_RE.test(name.trim()))
+    throw new HttpError(400, `Bed name "${name}" contains invalid characters. Only letters, numbers, spaces, and hyphens are allowed.`);
+}
+
 export async function _recalcWardTotals(wardId: number) {
   const counts = await db.prepare(`
     SELECT
@@ -23,113 +31,151 @@ export async function _recalcWardTotals(wardId: number) {
   ).run(total, now, wardId);
 }
 
+/** Generate beds from an explicit list of names (frontend expands patterns). */
 export async function generateBeds(opts: {
-  wardId: number; startNumber: number; count: number; userId: number;
+  wardId: number; bedNames: string[]; userId: number;
 }) {
   if (!await db.prepare("SELECT id FROM wards WHERE id=?").get(opts.wardId))
     throw new HttpError(404, "Ward not found");
-  if (opts.count < 1 || opts.count > 500)
-    throw new HttpError(400, "Count must be between 1 and 500");
+  if (opts.bedNames.length === 0)
+    throw new HttpError(400, "At least one bed name required");
+  if (opts.bedNames.length > 500)
+    throw new HttpError(400, "Cannot generate more than 500 beds at once");
+
+  for (const n of opts.bedNames) validateBedName(n);
 
   const now = Date.now();
   let inserted = 0;
   await db.transaction(async () => {
-    for (let i = 0; i < opts.count; i++) {
+    for (const rawName of opts.bedNames) {
+      const name = rawName.trim();
       const r = await db.prepare(
-        "INSERT INTO bed_details (ward_id, bed_number, physical_status, reservation_status, updated_at, updated_by) VALUES (?,?,'VACANT','NONE',?,?) ON CONFLICT (ward_id, bed_number) DO NOTHING"
-      ).run(opts.wardId, String(opts.startNumber + i), now, opts.userId);
+        "INSERT INTO bed_details (ward_id, bed_name, physical_status, reservation_status, updated_at, updated_by) VALUES (?,?,'VACANT','NONE',?,?) ON CONFLICT (ward_id, bed_name) DO NOTHING"
+      ).run(opts.wardId, name, now, opts.userId);
       inserted += r.changes;
     }
     await _recalcWardTotals(opts.wardId);
   });
 
   await audit(opts.userId, "beds_generate", String(opts.wardId),
-    { startNumber: opts.startNumber, count: opts.count, inserted });
+    { count: opts.bedNames.length, inserted });
   return { ok: true, generated: inserted };
 }
 
 export async function addSingleBed(opts: {
-  wardId: number; bedNumber: string; userId: number;
+  wardId: number; bedName: string; userId: number;
 }) {
   if (!await db.prepare("SELECT id FROM wards WHERE id=?").get(opts.wardId))
     throw new HttpError(404, "Ward not found");
 
-  const trimmed = opts.bedNumber.trim();
-  if (!trimmed) throw new HttpError(400, "Bed number required");
+  const trimmed = opts.bedName.trim();
+  validateBedName(trimmed);
 
   const now = Date.now();
   let newId = 0;
   await db.transaction(async () => {
     const existing = await db.prepare(
-      "SELECT id FROM bed_details WHERE ward_id=? AND bed_number=?"
+      "SELECT id FROM bed_details WHERE ward_id=? AND bed_name=?"
     ).get(opts.wardId, trimmed);
     if (existing) throw new HttpError(409, `Bed "${trimmed}" already exists in this ward`);
 
-    // RETURNING id so lastInsertRowid works in PostgreSQL
     const r = await db.prepare(
-      "INSERT INTO bed_details (ward_id, bed_number, physical_status, reservation_status, updated_at, updated_by) VALUES (?,?,'VACANT','NONE',?,?) RETURNING id"
+      "INSERT INTO bed_details (ward_id, bed_name, physical_status, reservation_status, updated_at, updated_by) VALUES (?,?,'VACANT','NONE',?,?) RETURNING id"
     ).run(opts.wardId, trimmed, now, opts.userId);
     newId = Number(r.lastInsertRowid);
     await _recalcWardTotals(opts.wardId);
   });
 
-  await audit(opts.userId, "bed_add", String(opts.wardId), { bedNumber: trimmed });
+  await audit(opts.userId, "bed_add", String(opts.wardId), { bedName: trimmed });
   return { ok: true, id: newId };
 }
 
 export interface BedDetail {
-  id: number; ward_id: number; bed_number: string;
+  id: number; ward_id: number; bed_name: string;
   physical_status: string; reservation_status: string;
+  bed_type: string; operational_status: boolean;
   updated_at: number; updated_by: number | null;
 }
 
 export async function listBeds(wardId: number, physicalStatus?: string, reservationStatus?: string): Promise<BedDetail[]> {
-  let sql = "SELECT id, ward_id, bed_number, physical_status, reservation_status, updated_at, updated_by FROM bed_details WHERE ward_id=?";
+  let sql = `SELECT id, ward_id, bed_name, physical_status, reservation_status,
+                    bed_type, operational_status, updated_at, updated_by
+             FROM bed_details WHERE ward_id=?`;
   const params: unknown[] = [wardId];
   if (physicalStatus) {
-    const validPhysical = ["VACANT", "OCCUPIED"];
-    if (!validPhysical.includes(physicalStatus.toUpperCase())) throw new HttpError(400, "Invalid physical_status filter");
+    if (!["VACANT", "OCCUPIED"].includes(physicalStatus.toUpperCase()))
+      throw new HttpError(400, "Invalid physical_status filter");
     sql += " AND physical_status=?"; params.push(physicalStatus.toUpperCase());
   }
   if (reservationStatus) {
-    const validReservation = ["NONE", "RESERVED"];
-    if (!validReservation.includes(reservationStatus.toUpperCase())) throw new HttpError(400, "Invalid reservation_status filter");
+    if (!["NONE", "RESERVED"].includes(reservationStatus.toUpperCase()))
+      throw new HttpError(400, "Invalid reservation_status filter");
     sql += " AND reservation_status=?"; params.push(reservationStatus.toUpperCase());
   }
-  sql += " ORDER BY CAST(bed_number AS INTEGER), bed_number";
+  // Natural sort: prefix alphabetically, then numeric portion numerically, then full name
+  sql += ` ORDER BY
+    substring(bed_name from '^[^0-9]*') ASC,
+    NULLIF(substring(bed_name from '[0-9]+'), '')::bigint NULLS LAST,
+    bed_name ASC`;
 
   return db.prepare(sql).all<BedDetail>(...params);
 }
 
 export async function renameBed(opts: {
-  bedId: number; newBedNumber: string; userId: number;
+  bedId: number; newBedName: string; userId: number;
 }) {
   const bed = await db.prepare(
-    "SELECT id, ward_id, bed_number FROM bed_details WHERE id=?"
-  ).get<{ id: number; ward_id: number; bed_number: string }>(opts.bedId);
+    "SELECT id, ward_id, bed_name FROM bed_details WHERE id=?"
+  ).get<{ id: number; ward_id: number; bed_name: string }>(opts.bedId);
   if (!bed) throw new HttpError(404, "Bed not found");
 
-  const trimmed = opts.newBedNumber.trim();
-  if (!trimmed) throw new HttpError(400, "Bed number required");
-  if (trimmed === bed.bed_number) return { ok: true };
+  const trimmed = opts.newBedName.trim();
+  validateBedName(trimmed);
+  if (trimmed === bed.bed_name) return { ok: true };
 
   const clash = await db.prepare(
-    "SELECT 1 FROM bed_details WHERE ward_id=? AND bed_number=? AND id!=?"
+    "SELECT 1 FROM bed_details WHERE ward_id=? AND bed_name=? AND id!=?"
   ).get(bed.ward_id, trimmed, opts.bedId);
   if (clash) throw new HttpError(409, `Bed "${trimmed}" already exists in this ward`);
 
-  await db.prepare("UPDATE bed_details SET bed_number=?, updated_at=? WHERE id=?")
+  await db.prepare("UPDATE bed_details SET bed_name=?, updated_at=? WHERE id=?")
     .run(trimmed, Date.now(), opts.bedId);
 
   await audit(opts.userId, "bed_rename", String(opts.bedId),
-    { from: bed.bed_number, to: trimmed });
+    { from: bed.bed_name, to: trimmed });
+  return { ok: true };
+}
+
+export async function updateBedMaster(opts: {
+  bedId: number; bedType?: string; operationalStatus?: boolean; userId: number;
+}) {
+  const bed = await db.prepare(
+    "SELECT id, ward_id FROM bed_details WHERE id=?"
+  ).get<{ id: number; ward_id: number }>(opts.bedId);
+  if (!bed) throw new HttpError(404, "Bed not found");
+
+  const now = Date.now();
+  if (opts.bedType !== undefined) {
+    const valid = ["Census", "Non-Census"];
+    if (!valid.includes(opts.bedType))
+      throw new HttpError(400, `Invalid bed_type. Must be one of: ${valid.join(", ")}`);
+    await db.prepare("UPDATE bed_details SET bed_type=?, updated_at=? WHERE id=?")
+      .run(opts.bedType, now, opts.bedId);
+  }
+  if (opts.operationalStatus !== undefined) {
+    await db.prepare("UPDATE bed_details SET operational_status=?, updated_at=? WHERE id=?")
+      .run(opts.operationalStatus, now, opts.bedId);
+  }
+
+  await audit(opts.userId, "bed_master_edit", String(opts.bedId),
+    { bedType: opts.bedType, operationalStatus: opts.operationalStatus });
   return { ok: true };
 }
 
 export async function deleteBed(opts: { bedId: number; userId: number }) {
   const bed = await db.prepare(
-    "SELECT id, ward_id, bed_number FROM bed_details WHERE id=?"
-  ).get<{ id: number; ward_id: number; bed_number: string }>(opts.bedId);
+    "SELECT id, ward_id, bed_name FROM bed_details WHERE id=?"
+  ).get<{ id: number; ward_id: number; bed_name: string }>(opts.bedId);
   if (!bed) throw new HttpError(404, "Bed not found");
 
   await db.transaction(async () => {
@@ -138,7 +184,7 @@ export async function deleteBed(opts: { bedId: number; userId: number }) {
   });
 
   await audit(opts.userId, "bed_delete", String(opts.bedId),
-    { bedNumber: bed.bed_number, wardId: bed.ward_id });
+    { bedName: bed.bed_name, wardId: bed.ward_id });
   return { ok: true };
 }
 
@@ -150,10 +196,10 @@ export async function updateBedStatus(opts: {
   ).get<{ id: number; ward_id: number; physical_status: string; reservation_status: string }>(opts.bedId);
   if (!bed) throw new HttpError(404, "Bed not found");
 
-  const validPhysical = ["VACANT", "OCCUPIED"];
-  const validReservation = ["NONE", "RESERVED"];
-  if (!validPhysical.includes(opts.physicalStatus)) throw new HttpError(400, "Invalid physical_status");
-  if (!validReservation.includes(opts.reservationStatus)) throw new HttpError(400, "Invalid reservation_status");
+  if (!["VACANT", "OCCUPIED"].includes(opts.physicalStatus))
+    throw new HttpError(400, "Invalid physical_status");
+  if (!["NONE", "RESERVED"].includes(opts.reservationStatus))
+    throw new HttpError(400, "Invalid reservation_status");
 
   if (bed.physical_status === opts.physicalStatus && bed.reservation_status === opts.reservationStatus)
     return { ok: true, physical_status: opts.physicalStatus, reservation_status: opts.reservationStatus };

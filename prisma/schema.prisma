@@ -20,7 +20,8 @@ model User {
   shift         String  @default("morning") @db.VarChar(20)
   created_at    BigInt
   updated_at    BigInt
-  block_id      Int?
+  block_id         Int?
+  nursing_station  String? @db.VarChar(100)
 
   block              Block?            @relation("UserBlock", fields: [block_id], references: [id], onDelete: SetNull)
   bed_status_updates BedStatusUpdate[] @relation("BedStatusUpdater")
@@ -63,14 +64,17 @@ model Block {
 }
 
 model Ward {
-  id         Int     @id @default(autoincrement())
-  name       String
-  total_beds Int
-  created_at BigInt
-  updated_at BigInt
-  block_id   Int?
-  floor_id   Int?
-  pre_code   String?
+  id              Int     @id @default(autoincrement())
+  name            String
+  total_beds      Int
+  created_at      BigInt
+  updated_at      BigInt
+  block_id        Int?
+  floor_id        Int?
+  pre_code        String?
+  nursing_station String? @db.VarChar(100)
+  unit_type       String? @db.VarChar(100)
+  room_type       String? @db.VarChar(100)
 
   block              Block?            @relation(fields: [block_id], references: [id], onDelete: Restrict)
   floor              Floor?            @relation(fields: [floor_id], references: [id], onDelete: SetNull)
@@ -209,11 +213,13 @@ model PushSubscription {
 }
 
 model BedDetail {
-  id                 Int    @id @default(autoincrement())
+  id                 Int     @id @default(autoincrement())
   ward_id            Int
-  bed_number         String
-  physical_status    String @default("VACANT")   @db.VarChar(20)
-  reservation_status String @default("NONE")     @db.VarChar(20)
+  bed_name           String
+  physical_status    String  @default("VACANT")  @db.VarChar(20)
+  reservation_status String  @default("NONE")    @db.VarChar(20)
+  bed_type           String  @default("Census")  @db.VarChar(50)
+  operational_status Boolean @default(true)
   updated_at         BigInt
   updated_by         Int?
 
@@ -221,7 +227,7 @@ model BedDetail {
   updater   User?         @relation("BedDetailUpdater", fields: [updated_by], references: [id])
   movements BedMovement[]
 
-  @@unique([ward_id, bed_number])
+  @@unique([ward_id, bed_name])
   @@index([ward_id, physical_status, reservation_status])
   @@map("bed_details")
 }

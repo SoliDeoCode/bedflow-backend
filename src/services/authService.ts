@@ -21,6 +21,7 @@ export async function login(username: string, password: string, role?: string) {
   const payload: JwtPayload = {
     id: user.id, username: user.username, role: user.role,
     name: user.name, block: blockName, pre: blockName,
+    nursing_station: user.nursing_station ?? null,
   };
   const token = jwt.sign(payload, env.JWT_SECRET, { expiresIn: "12h" });
   return { token, user: { ...payload, shift: user.shift } };
