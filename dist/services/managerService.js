@@ -85,12 +85,12 @@ export async function createWard(opts) {
     try {
         let wardId = 0;
         await db.transaction(async () => {
-            // RETURNING id so lastInsertRowid works in PostgreSQL
-            const r = await db.prepare("INSERT INTO wards (name, block_id, total_beds, created_at, updated_at) VALUES (?,?,?,?,?) RETURNING id").run(opts.name.trim(), opts.blockId, total, now, now);
+            const r = await db.prepare(`INSERT INTO wards (name, block_id, total_beds, nursing_station, unit_type, room_type, created_at, updated_at)
+         VALUES (?,?,?,?,?,?,?,?) RETURNING id`).run(opts.name.trim(), opts.blockId, total, opts.nursingStation?.trim() || null, opts.unitType?.trim() || null, opts.roomType?.trim() || null, now, now);
             wardId = Number(r.lastInsertRowid);
             await db.prepare("INSERT INTO beds (ward_id, total) VALUES (?,?)").run(wardId, total);
             if (total > 0) {
-                const insBed = db.prepare("INSERT INTO bed_details (ward_id, bed_number, physical_status, reservation_status, updated_at, updated_by) VALUES (?,?,'VACANT','NONE',?,?)");
+                const insBed = db.prepare("INSERT INTO bed_details (ward_id, bed_name, physical_status, reservation_status, updated_at, updated_by) VALUES (?,?,'VACANT','NONE',?,?)");
                 for (let i = 1; i <= total; i++) {
                     await insBed.run(wardId, String(i), now, opts.managerId);
                 }
@@ -129,6 +129,15 @@ export async function editWard(opts) {
             await db.prepare("UPDATE wards SET block_id=?, updated_at=? WHERE id=?")
                 .run(opts.blockId, now, opts.wardId);
         }
+        if (opts.nursingStation !== undefined)
+            await db.prepare("UPDATE wards SET nursing_station=?, updated_at=? WHERE id=?")
+                .run(opts.nursingStation?.trim() || null, now, opts.wardId);
+        if (opts.unitType !== undefined)
+            await db.prepare("UPDATE wards SET unit_type=?, updated_at=? WHERE id=?")
+                .run(opts.unitType?.trim() || null, now, opts.wardId);
+        if (opts.roomType !== undefined)
+            await db.prepare("UPDATE wards SET room_type=?, updated_at=? WHERE id=?")
+                .run(opts.roomType?.trim() || null, now, opts.wardId);
     });
     await audit(opts.managerId, "ward_edit", block.name, { wardId: opts.wardId, name: opts.name, totalBeds: opts.totalBeds, blockId: opts.blockId });
     return { ok: true };
@@ -210,6 +219,48 @@ export async function deletePre(userId, managerId) {
         throw new HttpError(404, "PRE not found");
     await db.prepare("DELETE FROM users WHERE id=?").run(userId);
     await audit(managerId, "pre_delete", null, { userId, name: user.name, blockId: user.block_id });
+    return { ok: true };
+}
+// ── Nurse In-Charge lifecycle ─────────────────────────────────────────────────
+export async function createNurse(opts) {
+    const username = opts.username.trim().toLowerCase();
+    if (!/^[a-z0-9_]+$/.test(username))
+        throw new HttpError(400, "Username: letters, numbers, underscore only");
+    if (!opts.nursingStation.trim())
+        throw new HttpError(400, "Nursing station is required for a Nurse account");
+    if (await db.prepare("SELECT 1 FROM users WHERE username=?").get(username))
+        throw new HttpError(409, "Username already taken");
+    const now = Date.now();
+    const r = await db.prepare("INSERT INTO users (username,password_hash,role,name,shift,nursing_station,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?) RETURNING id").run(username, bcrypt.hashSync(opts.password, 10), "NURSE", opts.name.trim(), "morning", opts.nursingStation.trim(), now, now);
+    await audit(opts.managerId, "nurse_create", opts.nursingStation, { username, name: opts.name });
+    return { ok: true, id: Number(r.lastInsertRowid), username };
+}
+export async function editNurse(opts) {
+    const user = await db.prepare("SELECT id, role FROM users WHERE id=?")
+        .get(opts.userId);
+    if (!user || user.role !== "NURSE")
+        throw new HttpError(404, "Nurse not found");
+    const now = Date.now();
+    await db.transaction(async () => {
+        if (opts.name !== undefined)
+            await db.prepare("UPDATE users SET name=?, updated_at=? WHERE id=?").run(opts.name, now, opts.userId);
+        if (opts.password)
+            await db.prepare("UPDATE users SET password_hash=?, updated_at=? WHERE id=?")
+                .run(bcrypt.hashSync(opts.password, 10), now, opts.userId);
+        if (opts.nursingStation !== undefined)
+            await db.prepare("UPDATE users SET nursing_station=?, updated_at=? WHERE id=?")
+                .run(opts.nursingStation.trim() || null, now, opts.userId);
+    });
+    await audit(opts.managerId, "nurse_edit", null, { userId: opts.userId });
+    return { ok: true };
+}
+export async function deleteNurse(userId, managerId) {
+    const user = await db.prepare("SELECT id, role, name FROM users WHERE id=?")
+        .get(userId);
+    if (!user || user.role !== "NURSE")
+        throw new HttpError(404, "Nurse not found");
+    await db.prepare("DELETE FROM users WHERE id=?").run(userId);
+    await audit(managerId, "nurse_delete", null, { userId, name: user.name });
     return { ok: true };
 }
 // ── history ───────────────────────────────────────────────────────────────────

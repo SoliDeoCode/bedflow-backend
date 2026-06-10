@@ -7,7 +7,7 @@ const router = Router();
 const loginSchema = z.object({
     username: z.string().min(1),
     password: z.string().min(1),
-    role: z.enum(["PRE", "MANAGER", "COO"]).optional(),
+    role: z.enum(["PRE", "MANAGER", "COO", "NURSE"]).optional(),
 });
 router.post("/login", asyncH(async (req, res) => {
     const { username, password, role } = loginSchema.parse(req.body);
