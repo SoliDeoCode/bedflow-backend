@@ -7,6 +7,35 @@ import { listBlocks, createBlock, editBlock, deleteBlock, createWard, editWard, 
 import { generateBeds, addSingleBed, listBeds, renameBed, deleteBed, updateBedMaster, } from "../services/bedDetailService.js";
 const router = Router();
 router.use(authRequired, requireRole("MANAGER", "COO"));
+// ── KPIs — live bed-master aggregates for the dashboard ───────────────────────
+router.get("/kpis", asyncH(async (_req, res) => {
+    const row = await db.prepare(`
+    SELECT
+      COUNT(*)::int                                                            AS total,
+      COUNT(*) FILTER (WHERE bed_type = 'Census')::int                         AS census,
+      COUNT(*) FILTER (WHERE bed_type <> 'Census')::int                        AS non_census,
+      COUNT(*) FILTER (WHERE operational_status)::int                          AS operational,
+      COUNT(*) FILTER (WHERE NOT operational_status)::int                      AS non_operational,
+      COUNT(*) FILTER (WHERE physical_status = 'VACANT'
+                         AND reservation_status = 'NONE'
+                         AND operational_status)::int                          AS vacant,
+      COUNT(*) FILTER (WHERE physical_status = 'VACANT'
+                         AND reservation_status = 'RESERVED')::int             AS vacant_reserved,
+      COUNT(*) FILTER (WHERE physical_status = 'OCCUPIED'
+                         AND reservation_status = 'NONE')::int                 AS occupied,
+      COUNT(*) FILTER (WHERE physical_status = 'OCCUPIED'
+                         AND reservation_status = 'RESERVED')::int             AS occupied_reserved
+    FROM bed_details
+  `).get();
+    const occupiedTotal = (row?.occupied ?? 0) + (row?.occupied_reserved ?? 0);
+    const operational = row?.operational ?? 0;
+    res.json({
+        ...row,
+        occupancy_pct: operational > 0 ? Math.round((occupiedTotal / operational) * 100) : 0,
+        census_occupancy_pct: (row?.census ?? 0) > 0
+            ? Math.round((occupiedTotal / (row.census)) * 100) : 0,
+    });
+}));
 // ── blocks ────────────────────────────────────────────────────────────────────
 router.get("/blocks", asyncH(async (_req, res) => {
     res.json({ blocks: await listBlocks() });
