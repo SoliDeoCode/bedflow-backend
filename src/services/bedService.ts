@@ -8,6 +8,7 @@ export interface WardView {
   vacant: number | null; reserved: number | null; occupied: number | null;
   occupied_reserved: number | null;
   updatedAt: number | null;
+  unit_type: string | null;
 }
 
 export interface PreSummary {
@@ -15,13 +16,24 @@ export interface PreSummary {
   total: number; wards: number; wardsDone: number; complete: boolean;
 }
 
-export async function wardsForBlock(blockId: number): Promise<WardView[]> {
+export async function wardsForFloor(floorId: number): Promise<WardView[]> {
   return db.prepare(
-    `SELECT w.id, w.name AS ward, w.total_beds AS total,
+    `SELECT w.id, w.name AS ward, w.total_beds AS total, w.unit_type,
             b.vacant, b.reserved, b.occupied, b.occupied_reserved, b.updated_at AS "updatedAt"
      FROM wards w JOIN beds b ON b.ward_id = w.id
-     WHERE w.block_id = ? ORDER BY w.name`
-  ).all<WardView>(blockId);
+     WHERE w.floor_id = ? ORDER BY w.name`
+  ).all<WardView>(floorId);
+}
+
+export async function wardsForPreBlock(preBlockId: number): Promise<WardView[]> {
+  return db.prepare(
+    `SELECT w.id, w.name AS ward, w.total_beds AS total, w.unit_type,
+            b.vacant, b.reserved, b.occupied, b.occupied_reserved, b.updated_at AS "updatedAt"
+     FROM pre_block_wards pbw
+     JOIN wards w ON w.id = pbw.ward_id
+     JOIN beds  b ON b.ward_id = w.id
+     WHERE pbw.pre_block_id = ? ORDER BY w.name`
+  ).all<WardView>(preBlockId);
 }
 
 export function summarize(wards: WardView[]): PreSummary {
@@ -47,8 +59,8 @@ export async function updateWard(
   userId: number
 ) {
   const ward = await db.prepare(
-    "SELECT id, name, total_beds AS total, block_id FROM wards WHERE id = ?"
-  ).get<{ id: number; name: string; total: number; block_id: number }>(wardId);
+    "SELECT id, name, total_beds AS total, floor_id FROM wards WHERE id = ?"
+  ).get<{ id: number; name: string; total: number; floor_id: number }>(wardId);
   if (!ward) throw new HttpError(404, "Ward not found");
 
   const vn = Math.max(0, Math.floor(vacantNone));
@@ -68,47 +80,65 @@ export async function updateWard(
     ).run(wardId, vn, vr, on_, or_, userId, now);
   });
 
-  const blockName = (await db.prepare("SELECT name FROM blocks WHERE id = ?")
-    .get<{ name: string }>(ward.block_id))?.name ?? String(ward.block_id);
-  await audit(userId, "ward_update", blockName, {
+  const floorLabel = ward.floor_id
+    ? (await db.prepare("SELECT name FROM floors WHERE id = ?")
+        .get<{ name: string }>(ward.floor_id))?.name ?? String(ward.floor_id)
+    : "unknown";
+  await audit(userId, "ward_update", floorLabel, {
     ward: ward.name, vacant_none: vn, vacant_reserved: vr,
     occupied_none: on_, occupied_reserved: or_,
   });
   return { ward: ward.name, vacant: vn, reserved: vr, occupied: on_, occupied_reserved: or_, total: ward.total };
 }
 
-interface BlockOverviewItem {
-  block_id: number; pre: string; floor: string; label: string;
-  wards: WardView[]; summary: PreSummary;
-  lastSubmittedAt: number | null; roundsToday: number;
+interface FloorOverviewItem {
+  floor_id: number;
+  building_block_id: number;
+  pre: string;          // display name used throughout (e.g. "A - Ground Floor")
+  floor: string;        // alias for pre
+  label: string;        // longer label
+  wards: WardView[];
+  summary: PreSummary;
+  lastSubmittedAt: number | null;
+  roundsToday: number;
   assignedUser: { id: number; name: string; shift: string } | null;
 }
 
 export async function orgOverview(): Promise<{
-  floors: { name: string; pres: BlockOverviewItem[] }[];
+  floors: { name: string; pres: FloorOverviewItem[] }[];
   totals: { v: number; r: number; o: number; or: number; total: number; presReporting: number; presTotal: number };
 }> {
-  const blocks = await db.prepare(
-    "SELECT id, name, label, sort_order FROM blocks ORDER BY sort_order, name"
+  const buildingBlocks = await db.prepare(
+    "SELECT id, name, label, sort_order FROM building_blocks ORDER BY sort_order, name"
   ).all<{ id: number; name: string; label: string | null; sort_order: number }>();
+
+  const allFloors = await db.prepare(
+    "SELECT id, name, building_block_id, sort_order FROM floors ORDER BY sort_order, name"
+  ).all<{ id: number; name: string; building_block_id: number; sort_order: number }>();
 
   const today = startOfDayIST();
 
-  const items: BlockOverviewItem[] = await Promise.all(blocks.map(async block => {
-    const wards = await wardsForBlock(block.id);
-    const last  = await db.prepare(
-      "SELECT submitted_at FROM pre_rounds WHERE block_id=? ORDER BY submitted_at DESC LIMIT 1"
-    ).get<{ submitted_at: number }>(block.id);
+  const floorItems: FloorOverviewItem[] = await Promise.all(allFloors.map(async floor => {
+    const bb = buildingBlocks.find(b => b.id === floor.building_block_id);
+    const displayName = bb ? `${bb.name} - ${floor.name}` : floor.name;
+    const wards = await wardsForFloor(floor.id);
+    const last = await db.prepare(
+      "SELECT submitted_at FROM pre_rounds WHERE floor_id=? ORDER BY submitted_at DESC LIMIT 1"
+    ).get<{ submitted_at: number }>(floor.id);
     const roundsRow = await db.prepare(
-      "SELECT COUNT(*) AS c FROM pre_rounds WHERE block_id=? AND submitted_at>=?"
-    ).get<{ c: number }>(block.id, today);
+      "SELECT COUNT(*) AS c FROM pre_rounds WHERE floor_id=? AND submitted_at>=?"
+    ).get<{ c: number }>(floor.id, today);
     const assignedUser = await db.prepare(
-      "SELECT id, name, shift FROM users WHERE block_id=? AND role='PRE' LIMIT 1"
-    ).get<{ id: number; name: string; shift: string }>(block.id) ?? null;
+      "SELECT id, name, shift FROM users WHERE floor_id=? AND role='PRE' LIMIT 1"
+    ).get<{ id: number; name: string; shift: string }>(floor.id) ?? null;
 
     return {
-      block_id: block.id, pre: block.name, floor: block.name,
-      label: block.label || block.name, wards,
+      floor_id: floor.id,
+      building_block_id: floor.building_block_id,
+      pre: displayName,
+      floor: displayName,
+      label: `${bb ? (bb.label || `Block ${bb.name}`) : ''} — ${floor.name}`,
+      wards,
       summary: summarize(wards),
       lastSubmittedAt: last?.submitted_at ?? null,
       roundsToday: roundsRow?.c ?? 0,
@@ -116,9 +146,14 @@ export async function orgOverview(): Promise<{
     };
   }));
 
-  const floors = items.map(item => ({ name: item.pre, pres: [item] }));
+  // Group floor items by building block
+  const grouped = buildingBlocks.map(bb => ({
+    name: bb.label || `Block ${bb.name}`,
+    pres: floorItems.filter(fi => fi.building_block_id === bb.id),
+  }));
+
   let v = 0, r = 0, o = 0, or_ = 0, total = 0, presReporting = 0, presTotal = 0;
-  for (const item of items) {
+  for (const item of floorItems) {
     v  += item.summary.v;
     r  += item.summary.r;
     o  += item.summary.o;
@@ -129,12 +164,11 @@ export async function orgOverview(): Promise<{
       if (item.summary.wardsDone > 0) presReporting++;
     }
   }
-  return { floors, totals: { v, r, o, or: or_, total, presReporting, presTotal } };
+  return { floors: grouped, totals: { v, r, o, or: or_, total, presReporting, presTotal } };
 }
 
 export async function snapshotOccupancy() {
   const { totals } = await orgOverview();
-  // vacant = all physically vacant (v+r), reserved = all with reservation (r+or), occupied = all physically occupied (o+or)
   await db.prepare(
     "INSERT INTO occupancy_snapshots (ts, total, vacant, reserved, occupied) VALUES (?,?,?,?,?)"
   ).run(Date.now(), totals.total, totals.v + totals.r, totals.r + totals.or, totals.o + totals.or);

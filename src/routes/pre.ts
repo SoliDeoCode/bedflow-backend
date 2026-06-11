@@ -2,7 +2,7 @@ import { Router } from "express";
 import { z } from "zod";
 import { authRequired, requireRole } from "../middleware/auth.js";
 import { asyncH, HttpError } from "../middleware/error.js";
-import { wardsForBlock, summarize, updateWard } from "../services/bedService.js";
+import { wardsForPreBlock, summarize, updateWard } from "../services/bedService.js";
 import { alarmState, setShift, userShift, submitRound } from "../services/roundService.js";
 import { listBeds, updateBedStatus } from "../services/bedDetailService.js";
 import { emitUpdate } from "../websocket/io.js";
@@ -11,30 +11,36 @@ import { db } from "../db/index.js";
 const router = Router();
 router.use(authRequired, requireRole("PRE"));
 
-/** Return the block_id + block_name for the authenticated PRE user. */
-async function myBlock(req: { user?: { id: number } }) {
-  const row = await db.prepare(
-    `SELECT u.block_id, b.name AS block_name
-     FROM users u
-     JOIN blocks b ON b.id = u.block_id
-     WHERE u.id = ?`
-  ).get<{ block_id: number; block_name: string }>(req.user!.id);
-  if (!row) throw new HttpError(400, "No block assigned to your account");
-  return row;
+/** Return the pre_block_id + display label for the authenticated PRE user. */
+async function myPreBlock(req: { user?: { id: number; pre_block_id?: number | null } }) {
+  const preBlockId =
+    req.user?.pre_block_id ??
+    (await db.prepare("SELECT pre_block_id FROM users WHERE id=?")
+      .get<{ pre_block_id: number | null }>(req.user!.id))?.pre_block_id;
+
+  if (!preBlockId) throw new HttpError(400, "No PRE Block assigned to your account");
+
+  const block = await db.prepare(
+    "SELECT id, name FROM pre_blocks WHERE id=?"
+  ).get<{ id: number; name: string }>(preBlockId);
+
+  if (!block) throw new HttpError(400, "Assigned PRE Block not found");
+  return block;
 }
 
 router.get("/me", asyncH(async (req, res) => {
-  const { block_id, block_name } = await myBlock(req);
-  const wards = await wardsForBlock(block_id);
+  const block = await myPreBlock(req);
+  const wards = await wardsForPreBlock(block.id);
   const shift = await userShift(req.user!.id);
   res.json({
-    block: block_name,
-    pre:   block_name,    // legacy alias for PREApp.jsx that reads data.pre
-    floor: block_name,    // legacy alias for PREApp.jsx that reads data.floor
+    preBlockId: block.id,
+    preBlockName: block.name,
+    pre:    block.name,
+    floor:  block.name,
+    label:  block.name,
     wards,
     summary: summarize(wards),
-    alarm:   await alarmState(block_name, shift),
-    label:   `Block ${block_name}`,
+    alarm:   await alarmState(block.id, shift),
   });
 }));
 
@@ -45,7 +51,7 @@ router.post("/shift", asyncH(async (req, res) => {
 }));
 
 router.post("/ward", asyncH(async (req, res) => {
-  const { block_id } = await myBlock(req);
+  const block = await myPreBlock(req);
   const { wardId, vacant_none, vacant_reserved, occupied_none, occupied_reserved } = z.object({
     wardId:            z.number().int(),
     vacant_none:       z.number().int().min(0),
@@ -54,38 +60,37 @@ router.post("/ward", asyncH(async (req, res) => {
     occupied_reserved: z.number().int().min(0),
   }).parse(req.body);
 
-  // Verify the ward belongs to this user's block
-  const owns = await db.prepare("SELECT 1 FROM wards WHERE id=? AND block_id=?").get(wardId, block_id);
-  if (!owns) throw new HttpError(403, "Ward not assigned to your block");
+  const owns = await db.prepare(
+    "SELECT 1 FROM pre_block_wards WHERE pre_block_id=? AND ward_id=?"
+  ).get(block.id, wardId);
+  if (!owns) throw new HttpError(403, "Ward not in your PRE Block");
 
   const result = await updateWard(wardId, vacant_none, vacant_reserved, occupied_none, occupied_reserved, req.user!.id);
-  const blockName = (await db.prepare("SELECT name FROM blocks WHERE id=?")
-    .get<{ name: string }>(block_id))?.name ?? "";
-  emitUpdate("bed:update", { block: blockName, ...result }, blockName);
+  emitUpdate("bed:update", { floor: block.name, ...result }, block.name);
   res.json({ ok: true, ...result });
 }));
 
 router.post("/submit", asyncH(async (req, res) => {
-  const { block_id, block_name } = await myBlock(req);
-  const result = await submitRound(block_id, req.user!.id);
-  emitUpdate("round:submit", { block: block_name }, block_name);
+  const block = await myPreBlock(req);
+  const result = await submitRound(block.id, req.user!.id);
+  emitUpdate("round:submit", { floor: block.name }, block.name);
   res.json(result);
 }));
 
-// ── bed-level tracking (PRE only) ─────────────────────────────────────────────
+// ── bed-level tracking ────────────────────────────────────────────────────────
 
 router.get("/wards/:id/beds", asyncH(async (req, res) => {
-  const { block_id } = await myBlock(req);
+  const block = await myPreBlock(req);
   const wardId = Number(req.params.id);
-  if (!await db.prepare("SELECT 1 FROM wards WHERE id=? AND block_id=?").get(wardId, block_id))
-    throw new HttpError(403, "Ward not in your block");
+  if (!await db.prepare("SELECT 1 FROM pre_block_wards WHERE pre_block_id=? AND ward_id=?").get(block.id, wardId))
+    throw new HttpError(403, "Ward not in your PRE Block");
   const physicalStatus    = req.query.physical_status    as string | undefined;
   const reservationStatus = req.query.reservation_status as string | undefined;
   res.json({ beds: await listBeds(wardId, physicalStatus, reservationStatus) });
 }));
 
 router.patch("/beds/:id/status", asyncH(async (req, res) => {
-  const { block_id, block_name } = await myBlock(req);
+  const block = await myPreBlock(req);
   const bedId = Number(req.params.id);
   const { physical_status, reservation_status } = z.object({
     physical_status:    z.enum(["VACANT", "OCCUPIED"]),
@@ -94,13 +99,16 @@ router.patch("/beds/:id/status", asyncH(async (req, res) => {
 
   const owns = await db.prepare(
     `SELECT bd.id FROM bed_details bd
-     JOIN wards w ON w.id = bd.ward_id
-     WHERE bd.id = ? AND w.block_id = ?`
-  ).get(bedId, block_id);
-  if (!owns) throw new HttpError(403, "Bed not in your block");
+     JOIN pre_block_wards pbw ON pbw.ward_id = bd.ward_id
+     WHERE bd.id = ? AND pbw.pre_block_id = ?`
+  ).get(bedId, block.id);
+  if (!owns) throw new HttpError(403, "Bed not in your PRE Block");
 
-  const result = await updateBedStatus({ bedId, physicalStatus: physical_status, reservationStatus: reservation_status, userId: req.user!.id });
-  emitUpdate("bed:update", { block: block_name }, block_name);
+  const result = await updateBedStatus({
+    bedId, physicalStatus: physical_status, reservationStatus: reservation_status,
+    userId: req.user!.id,
+  });
+  emitUpdate("bed:update", { floor: block.name }, block.name);
   res.json(result);
 }));
 

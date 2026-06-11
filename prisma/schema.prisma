@@ -75,6 +75,8 @@ model Ward {
   nursing_station String? @db.VarChar(100)
   unit_type       String? @db.VarChar(100)
   room_type       String? @db.VarChar(100)
+  bed_type        String  @default("Census")      @db.VarChar(20)
+  operational     Boolean @default(true)
 
   block              Block?            @relation(fields: [block_id], references: [id], onDelete: Restrict)
   floor              Floor?            @relation(fields: [floor_id], references: [id], onDelete: SetNull)

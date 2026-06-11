@@ -1,30 +1,24 @@
 import { Router } from "express";
 import { authRequired, requireRole } from "../middleware/auth.js";
-import { asyncH, HttpError } from "../middleware/error.js";
+import { asyncH } from "../middleware/error.js";
 import { z } from "zod";
 import { orgOverview } from "../services/bedService.js";
 import { alarmState, userShift } from "../services/roundService.js";
 import { recentAudit } from "../services/auditService.js";
 import { db } from "../db/index.js";
 import { COO_REMINDERS, hmToMin, minsNow, todayStr, startOfDayIST, PRE_INTERVAL_MIN, SHIFTS } from "../config/domain.js";
+import { HttpError } from "../middleware/error.js";
 
 const router = Router();
 router.use(authRequired, requireRole("COO", "MANAGER"));
 
 router.get("/overview", asyncH(async (_req, res) => {
   const base = await orgOverview();
-  const floors = await Promise.all(base.floors.map(async (f) => ({
-    ...f,
-    pres: await Promise.all(f.pres.map(async (p) => {
-      // Find the PRE user assigned to this block for alarm state
-      const block = await db.prepare("SELECT id FROM blocks WHERE name_key=?")
-        .get<{ id: number }>(p.pre.toUpperCase().trim());
-      const uid = block
-        ? await db.prepare("SELECT id FROM users WHERE block_id=? AND role='PRE'")
-            .get<{ id: number }>(block.id)
-        : null;
-      const shift = uid ? await userShift(uid.id) : "morning";
-      return { ...p, alarm: await alarmState(p.pre, shift) };
+  const floors = await Promise.all(base.floors.map(async (group) => ({
+    ...group,
+    pres: await Promise.all(group.pres.map(async (p) => {
+      const shift = p.assignedUser ? await userShift(p.assignedUser.id) : "morning";
+      return { ...p, alarm: await alarmState(p.floor_id, shift as "morning" | "night") };
     })),
   })));
   const mins = minsNow();
@@ -42,34 +36,37 @@ router.get("/compliance", asyncH(async (_req, res) => {
   const today = todayStr();
   const mins  = minsNow();
 
-  // All blocks that have at least one ward
-  const blocks = await db.prepare(
-    `SELECT b.id, b.name,
+  const floors = await db.prepare(
+    `SELECT f.id, f.name AS floor_name, bb.name AS block_name,
             u.id AS user_id, u.shift, u.name AS user_name
-     FROM blocks b
-     LEFT JOIN users u ON u.block_id = b.id AND u.role = 'PRE'
-     WHERE EXISTS (SELECT 1 FROM wards w WHERE w.block_id = b.id)
-     ORDER BY b.sort_order, b.name`
-  ).all<{ id: number; name: string; user_id: number | null; shift: string; user_name: string }>();
+     FROM floors f
+     LEFT JOIN building_blocks bb ON bb.id = f.building_block_id
+     LEFT JOIN users u ON u.floor_id = f.id AND u.role = 'PRE'
+     WHERE EXISTS (SELECT 1 FROM wards w WHERE w.floor_id = f.id)
+     ORDER BY bb.sort_order, bb.name, f.sort_order, f.name`
+  ).all<{ id: number; floor_name: string; block_name: string | null; user_id: number | null; shift: string; user_name: string }>();
 
-  const rows = await Promise.all(blocks.map(async block => {
-    const shift = (block.shift as keyof typeof SHIFTS) || "morning";
-    const s     = SHIFTS[shift];
-    const start = hmToMin(s.start);
-    let elapsed = mins - start; if (elapsed < 0) elapsed = 0;
+  const rows = await Promise.all(floors.map(async floor => {
+    const shift  = (floor.shift as keyof typeof SHIFTS) || "morning";
+    const s      = SHIFTS[shift];
+    const start  = hmToMin(s.start);
+    let elapsed  = mins - start; if (elapsed < 0) elapsed = 0;
     const expected = Math.max(0, Math.min(
       Math.floor(elapsed / PRE_INTERVAL_MIN) + 1,
       Math.floor((hmToMin(s.end) - start + 1440) % 1440 / PRE_INTERVAL_MIN)
     ));
     const submittedRow = await db.prepare(
-      "SELECT COUNT(*) AS c FROM pre_rounds WHERE block_id=? AND submitted_at>=?"
-    ).get<{ c: number }>(block.id, startOfDayIST());
+      "SELECT COUNT(*) AS c FROM pre_rounds WHERE floor_id=? AND submitted_at>=?"
+    ).get<{ c: number }>(floor.id, startOfDayIST());
     const submitted = submittedRow?.c ?? 0;
     const score = expected > 0
       ? Math.round((Math.min(submitted, expected) / expected) * 100)
       : 100;
-    return { blockId: block.id, block: block.name, name: block.user_name ?? block.name,
-             shift, expected, submitted, score };
+    const label = floor.block_name ? `${floor.block_name} - ${floor.floor_name}` : floor.floor_name;
+    return {
+      floorId: floor.id, floor: label,
+      name: floor.user_name ?? label, shift, expected, submitted, score,
+    };
   }));
   res.json({ date: today, compliance: rows });
 }));
@@ -91,15 +88,12 @@ interface SavedViewRow {
 
 function parseView(v: SavedViewRow, currentUserId: number) {
   return {
-    id: v.id,
-    name: v.name,
+    id: v.id, name: v.name,
     selected_wards: JSON.parse(v.selected_wards) as string[],
     is_shared: !!v.is_shared,
     is_system: !!v.is_system,
     mine: v.created_by === currentUserId,
-    created_at: v.created_at,
-    updated_at: v.updated_at,
-    // Note: created_by user ID intentionally omitted — frontend only needs `mine`.
+    created_at: v.created_at, updated_at: v.updated_at,
   };
 }
 
@@ -121,7 +115,6 @@ router.post("/views", asyncH(async (req, res) => {
     is_shared:      z.boolean().optional().default(false),
   }).parse(req.body);
   const now = Date.now();
-  // RETURNING id so lastInsertRowid works in PostgreSQL
   const r = await db.prepare(
     `INSERT INTO saved_views (name, created_by, selected_wards, is_shared, is_system, created_at, updated_at)
      VALUES (?,?,?,?,0,?,?) RETURNING id`

@@ -1,7 +1,7 @@
 import { db } from "../db/index.js";
 import { HttpError } from "../middleware/error.js";
 import { audit } from "./auditService.js";
-import { wardsForBlock } from "./bedService.js";
+import { wardsForFloor, wardsForPreBlock } from "./bedService.js";
 import {
   inShift, currentRound, roundKey, todayStr, minsNow, type ShiftKey,
 } from "../config/domain.js";
@@ -15,31 +15,28 @@ export async function setShift(userId: number, shift: ShiftKey) {
   await db.prepare("UPDATE users SET shift=?,updated_at=? WHERE id=?").run(shift, Date.now(), userId);
 }
 
-/** Alarm state for a block (looked up by block name). */
-export async function alarmState(blockName: string, shift: ShiftKey) {
+/** Alarm state for a PRE Block. */
+export async function alarmState(preBlockId: number, shift: ShiftKey) {
   const mins   = minsNow();
   const onDuty = inShift(shift, mins);
   const round  = currentRound(shift, mins);
 
-  const block = await db.prepare("SELECT id FROM blocks WHERE name_key = ?")
-    .get<{ id: number }>(blockName.toUpperCase().trim());
-  const wardCountRow = block
-    ? await db.prepare("SELECT COUNT(*) AS n FROM wards WHERE block_id=?")
-        .get<{ n: number }>(block.id)
-    : null;
+  const wardCountRow = await db.prepare(
+    "SELECT COUNT(*) AS n FROM pre_block_wards WHERE pre_block_id=?"
+  ).get<{ n: number }>(preBlockId);
   const hasWards = (wardCountRow?.n ?? 0) > 0;
 
-  const key       = roundKey(blockName, shift, todayStr(), round.startMin);
+  const key       = roundKey(`pb${preBlockId}`, shift, todayStr(), round.startMin);
   const submitted = !!(await db.prepare("SELECT 1 FROM pre_rounds WHERE round_key=?").get(key));
 
   return { shift, onDuty, round, key, submitted, hasWards,
            alarmActive: onDuty && hasWards && !submitted };
 }
 
-/** Submit a round for the block the user is assigned to. */
-export async function submitRound(blockId: number, userId: number) {
-  const wards = await wardsForBlock(blockId);
-  if (wards.length === 0) throw new HttpError(400, "No wards to submit");
+/** Submit a round for the PRE Block the PRE user is assigned to. */
+export async function submitRound(preBlockId: number, userId: number) {
+  const wards = await wardsForPreBlock(preBlockId);
+  if (wards.length === 0) throw new HttpError(400, "No wards assigned to this PRE Block");
 
   for (const w of wards) {
     if (w.vacant === null)
@@ -54,22 +51,18 @@ export async function submitRound(blockId: number, userId: number) {
     }
   }
 
-  const block = await db.prepare("SELECT name FROM blocks WHERE id=?")
-    .get<{ name: string }>(blockId);
-  if (!block) throw new HttpError(404, "Block not found");
-
-  const shift    = await userShift(userId);
-  const round    = currentRound(shift, minsNow());
-  const key      = roundKey(block.name, shift, todayStr(), round.startMin);
+  const shift = await userShift(userId);
+  const round = currentRound(shift, minsNow());
+  const key   = roundKey(`pb${preBlockId}`, shift, todayStr(), round.startMin);
 
   try {
     await db.prepare(
       `INSERT INTO pre_rounds
-         (pre_code, block_id, user_id, shift, round_key, start_min, submitted_at, snapshot)
+         (pre_code, pre_block_id, user_id, shift, round_key, start_min, submitted_at, snapshot)
        VALUES (?,?,?,?,?,?,?,?)`
-    ).run(block.name, blockId, userId, shift, key, round.startMin, Date.now(), JSON.stringify(wards));
+    ).run(`pb${preBlockId}`, preBlockId, userId, shift, key, round.startMin, Date.now(), JSON.stringify(wards));
   } catch { /* duplicate round key — idempotent */ }
 
-  await audit(userId, "round_submit", block.name, { roundKey: key });
+  await audit(userId, "round_submit", `pb${preBlockId}`, { roundKey: key });
   return { ok: true, roundKey: key };
 }

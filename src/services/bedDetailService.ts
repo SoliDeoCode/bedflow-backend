@@ -35,8 +35,9 @@ export async function _recalcWardTotals(wardId: number) {
 export async function generateBeds(opts: {
   wardId: number; bedNames: string[]; userId: number;
 }) {
-  if (!await db.prepare("SELECT id FROM wards WHERE id=?").get(opts.wardId))
-    throw new HttpError(404, "Ward not found");
+  const ward = await db.prepare("SELECT id, bed_type, operational FROM wards WHERE id=?")
+    .get<{ id: number; bed_type: string; operational: boolean }>(opts.wardId);
+  if (!ward) throw new HttpError(404, "Ward not found");
   if (opts.bedNames.length === 0)
     throw new HttpError(400, "At least one bed name required");
   if (opts.bedNames.length > 500)
@@ -44,14 +45,16 @@ export async function generateBeds(opts: {
 
   for (const n of opts.bedNames) validateBedName(n);
 
+  const bedType     = ward.bed_type    ?? "Census";
+  const operational = ward.operational ?? true;
   const now = Date.now();
   let inserted = 0;
   await db.transaction(async () => {
     for (const rawName of opts.bedNames) {
       const name = rawName.trim();
       const r = await db.prepare(
-        "INSERT INTO bed_details (ward_id, bed_name, physical_status, reservation_status, updated_at, updated_by) VALUES (?,?,'VACANT','NONE',?,?) ON CONFLICT (ward_id, bed_name) DO NOTHING"
-      ).run(opts.wardId, name, now, opts.userId);
+        "INSERT INTO bed_details (ward_id, bed_name, physical_status, reservation_status, bed_type, operational_status, updated_at, updated_by) VALUES (?,?,'VACANT','NONE',?,?,?,?) ON CONFLICT (ward_id, bed_name) DO NOTHING"
+      ).run(opts.wardId, name, bedType, operational, now, opts.userId);
       inserted += r.changes;
     }
     await _recalcWardTotals(opts.wardId);
@@ -65,10 +68,13 @@ export async function generateBeds(opts: {
 export async function addSingleBed(opts: {
   wardId: number; bedName: string; userId: number;
 }) {
-  if (!await db.prepare("SELECT id FROM wards WHERE id=?").get(opts.wardId))
-    throw new HttpError(404, "Ward not found");
+  const ward = await db.prepare("SELECT id, bed_type, operational FROM wards WHERE id=?")
+    .get<{ id: number; bed_type: string; operational: boolean }>(opts.wardId);
+  if (!ward) throw new HttpError(404, "Ward not found");
 
-  const trimmed = opts.bedName.trim();
+  const trimmed     = opts.bedName.trim();
+  const bedType     = ward.bed_type    ?? "Census";
+  const operational = ward.operational ?? true;
   validateBedName(trimmed);
 
   const now = Date.now();
@@ -80,8 +86,8 @@ export async function addSingleBed(opts: {
     if (existing) throw new HttpError(409, `Bed "${trimmed}" already exists in this ward`);
 
     const r = await db.prepare(
-      "INSERT INTO bed_details (ward_id, bed_name, physical_status, reservation_status, updated_at, updated_by) VALUES (?,?,'VACANT','NONE',?,?) RETURNING id"
-    ).run(opts.wardId, trimmed, now, opts.userId);
+      "INSERT INTO bed_details (ward_id, bed_name, physical_status, reservation_status, bed_type, operational_status, updated_at, updated_by) VALUES (?,?,'VACANT','NONE',?,?,?,?) RETURNING id"
+    ).run(opts.wardId, trimmed, bedType, operational, now, opts.userId);
     newId = Number(r.lastInsertRowid);
     await _recalcWardTotals(opts.wardId);
   });

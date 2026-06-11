@@ -3,7 +3,7 @@ import { HttpError } from "../middleware/error.js";
 import { audit } from "./auditService.js";
 import { startOfDayIST } from "../config/domain.js";
 export async function wardsForBlock(blockId) {
-    return db.prepare(`SELECT w.id, w.name AS ward, w.total_beds AS total,
+    return db.prepare(`SELECT w.id, w.name AS ward, w.total_beds AS total, w.unit_type,
             b.vacant, b.reserved, b.occupied, b.occupied_reserved, b.updated_at AS "updatedAt"
      FROM wards w JOIN beds b ON b.ward_id = w.id
      WHERE w.block_id = ? ORDER BY w.name`).all(blockId);

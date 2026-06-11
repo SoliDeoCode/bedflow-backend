@@ -3,7 +3,7 @@ import { alarmState, userShift } from "../services/roundService.js";
 import { pushToUser } from "../services/pushService.js";
 import { snapshotOccupancy } from "../services/bedService.js";
 import { emitUpdate } from "../websocket/io.js";
-import { COO_REMINDERS, hmToMin, minsNow, todayStr, startOfDayIST } from "../config/domain.js";
+import { COO_REMINDERS, hmToMin, minsNow, todayStr } from "../config/domain.js";
 
 const lastPush = new Map<string, number>();
 const REPUSH_MS = 5 * 60 * 1000;
@@ -11,32 +11,33 @@ const REPUSH_MS = 5 * 60 * 1000;
 async function tick() {
   const now = Date.now();
 
-  // PRE overdue → push (works whether or not they're logged in)
+  // PRE overdue → push
   const pres = await db.prepare("SELECT id, username FROM users WHERE role='PRE'")
     .all<{ id: number; username: string }>();
   for (const u of pres) {
-    // Look up assigned block directly from users.block_id
-    const blockRow = await db.prepare(
-      `SELECT b.id, b.name FROM users usr
-       JOIN blocks b ON b.id = usr.block_id
-       WHERE usr.id = ?`
-    ).get<{ id: number; name: string }>(u.id);
-    if (!blockRow) continue;
-    const wardCountRow = await db.prepare(
-      "SELECT COUNT(*) AS n FROM wards WHERE block_id = ?"
-    ).get<{ n: number }>(blockRow.id);
-    const wardCount = wardCountRow?.n ?? 0;
+    const row = await db.prepare(
+      `SELECT u.pre_block_id, pb.name AS block_name
+       FROM users u
+       LEFT JOIN pre_blocks pb ON pb.id = u.pre_block_id
+       WHERE u.id = ?`
+    ).get<{ pre_block_id: number | null; block_name: string | null }>(u.id);
+    if (!row?.pre_block_id) continue;
+
+    const wardCount = (await db.prepare(
+      "SELECT COUNT(*) AS n FROM pre_block_wards WHERE pre_block_id = ?"
+    ).get<{ n: number }>(row.pre_block_id))?.n ?? 0;
     if (wardCount === 0) continue;
 
     const shift = await userShift(u.id);
-    const st = await alarmState(blockRow.name, shift);
+    const st = await alarmState(row.pre_block_id, shift);
+    const label = row.block_name ?? `PRE Block ${row.pre_block_id}`;
     if (st.alarmActive) {
-      emitUpdate("alarm:active", { pre: blockRow.name }, blockRow.name);
+      emitUpdate("alarm:active", { floor: label }, label);
       const key = "pre:" + u.id;
       if (now - (lastPush.get(key) || 0) >= REPUSH_MS) {
         lastPush.set(key, now);
         void pushToUser(u.id, {
-          title: `⏰ Bed round due — ${blockRow.name}`,
+          title: `⏰ Bed round due — ${label}`,
           body: "Open BedFlow and submit your bed counts now.",
           tag: "pre-round", requireInteraction: true, alarm: true,
         });
@@ -61,10 +62,8 @@ async function tick() {
     }
   }
 
-  // hourly occupancy snapshot — use IST minutes so Render (UTC) fires at the right time
-  const india = new Date(
-    new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" })
-  );
+  // hourly occupancy snapshot
+  const india = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
   if (india.getMinutes() === 0) void snapshotOccupancy();
 }
 
