@@ -3,9 +3,12 @@ node_modules/
 
 # Environment secrets — set via Render dashboard, never commit
 .env
-.env.example
 
-# SQLite WAL/SHM journal files — ephemeral, not needed in git
+# Compiled output — build fresh on each deploy/clone
+dist/
+
+# SQLite database and journal files — not for source control
+database/*.db
 database/*.db-shm
 database/*.db-wal
 
