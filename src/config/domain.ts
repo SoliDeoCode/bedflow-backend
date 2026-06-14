@@ -56,3 +56,17 @@ export function currentRound(shift: ShiftKey, mins: number) {
 export function roundKey(blockName: string, shift: string, date: string, startMin: number): string {
   return `${blockName}|${shift}|${date}|${startMin}`;
 }
+
+/** Format "HH:MM" → "H:MM AM/PM" (e.g. "09:00" → "9:00 AM", "18:30" → "6:30 PM") */
+function fmtHHMM(hhmm: string): string {
+  const [h, m] = hhmm.split(":").map(Number);
+  const period = h < 12 ? "AM" : "PM";
+  const h12 = h % 12 === 0 ? 12 : h % 12;
+  return `${h12}:${String(m).padStart(2, "0")} ${period}`;
+}
+
+/** Human-readable shift window derived from SHIFTS config (e.g. "9:00 AM – 6:30 PM") */
+export function formatShiftWindow(shift: ShiftKey): string {
+  const { start, end } = SHIFTS[shift];
+  return `${fmtHHMM(start)} – ${fmtHHMM(end)}`;
+}

@@ -5,18 +5,18 @@ import { asyncH, HttpError } from "../middleware/error.js";
 import { wardsForPreBlock, summarize, updateWard } from "../services/bedService.js";
 import { alarmState, setShift, userShift, submitRound } from "../services/roundService.js";
 import { listBeds, updateBedStatus } from "../services/bedDetailService.js";
+import { listPayerTypes } from "../services/payerTypeService.js";
 import { emitUpdate } from "../websocket/io.js";
 import { db } from "../db/index.js";
 
 const router = Router();
 router.use(authRequired, requireRole("PRE"));
 
-/** Return the pre_block_id + display label for the authenticated PRE user. */
-async function myPreBlock(req: { user?: { id: number; pre_block_id?: number | null } }) {
-  const preBlockId =
-    req.user?.pre_block_id ??
-    (await db.prepare("SELECT pre_block_id FROM users WHERE id=?")
-      .get<{ pre_block_id: number | null }>(req.user!.id))?.pre_block_id;
+/** Return the pre_block_id + display label for the authenticated PRE user — always reads from DB so reassignments take effect immediately without waiting for JWT expiry. */
+async function myPreBlock(req: { user?: { id: number } }) {
+  const row = await db.prepare("SELECT pre_block_id FROM users WHERE id=?")
+    .get<{ pre_block_id: number | null }>(req.user!.id);
+  const preBlockId = row?.pre_block_id;
 
   if (!preBlockId) throw new HttpError(400, "No PRE Block assigned to your account");
 
@@ -57,7 +57,7 @@ router.post("/ward", asyncH(async (req, res) => {
     vacant_none:       z.number().int().min(0),
     vacant_reserved:   z.number().int().min(0),
     occupied_none:     z.number().int().min(0),
-    occupied_reserved: z.number().int().min(0),
+    occupied_reserved: z.number().int().min(0).default(0),
   }).parse(req.body);
 
   const owns = await db.prepare(
@@ -66,14 +66,14 @@ router.post("/ward", asyncH(async (req, res) => {
   if (!owns) throw new HttpError(403, "Ward not in your PRE Block");
 
   const result = await updateWard(wardId, vacant_none, vacant_reserved, occupied_none, occupied_reserved, req.user!.id);
-  emitUpdate("bed:update", { floor: block.name, ...result }, block.name);
+  emitUpdate("bed:update", { floor: block.name, ...result }, { pre: String(block.id) });
   res.json({ ok: true, ...result });
 }));
 
 router.post("/submit", asyncH(async (req, res) => {
   const block = await myPreBlock(req);
   const result = await submitRound(block.id, req.user!.id);
-  emitUpdate("round:submit", { floor: block.name }, block.name);
+  emitUpdate("round:submit", { floor: block.name }, { pre: String(block.id) });
   res.json(result);
 }));
 
@@ -89,12 +89,17 @@ router.get("/wards/:id/beds", asyncH(async (req, res) => {
   res.json({ beds: await listBeds(wardId, physicalStatus, reservationStatus) });
 }));
 
+router.get("/payer-types", asyncH(async (_req, res) => {
+  res.json({ payerTypes: await listPayerTypes(true) });
+}));
+
 router.patch("/beds/:id/status", asyncH(async (req, res) => {
   const block = await myPreBlock(req);
   const bedId = Number(req.params.id);
-  const { physical_status, reservation_status } = z.object({
+  const { physical_status, reservation_status, payer_type } = z.object({
     physical_status:    z.enum(["VACANT", "OCCUPIED"]),
     reservation_status: z.enum(["NONE", "RESERVED"]),
+    payer_type:         z.string().max(100).nullable().optional(),
   }).parse(req.body);
 
   const owns = await db.prepare(
@@ -106,9 +111,21 @@ router.patch("/beds/:id/status", asyncH(async (req, res) => {
 
   const result = await updateBedStatus({
     bedId, physicalStatus: physical_status, reservationStatus: reservation_status,
-    userId: req.user!.id,
+    payerType: payer_type, userId: req.user!.id,
   });
-  emitUpdate("bed:update", { floor: block.name }, block.name);
+
+  const stationRow = await db.prepare(
+    "SELECT station_id FROM wards WHERE id=?"
+  ).get<{ station_id: number | null }>(result.ward_id);
+
+  emitUpdate("bed:update", {
+    bedId, wardId: result.ward_id,
+    physicalStatus: physical_status, reservationStatus: reservation_status,
+    payerType: result.payer_type,
+  }, {
+    pre: String(block.id),
+    stationId: stationRow?.station_id ?? undefined,
+  });
   res.json(result);
 }));
 

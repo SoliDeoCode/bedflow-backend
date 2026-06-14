@@ -1,6 +1,7 @@
 import { Server as SocketServer } from "socket.io";
 import jwt from "jsonwebtoken";
 import { env } from "../config/env.js";
+import { db } from "../db/index.js";
 let io = null;
 export function initWebsocket(server) {
     io = new SocketServer(server, { cors: { origin: env.CORS_ORIGIN } });
@@ -18,21 +19,30 @@ export function initWebsocket(server) {
             next(new Error("Invalid token"));
         }
     });
-    io.on("connection", (socket) => {
+    io.on("connection", async (socket) => {
         const user = socket.data.user;
-        // COO + manager get all updates; PRE joins their own room
         if (user.role === "COO" || user.role === "MANAGER")
             socket.join("overview");
-        if (user.pre)
-            socket.join(`pre:${user.pre}`);
+        if (user.role === "PRE") {
+            const row = await db.prepare("SELECT pre_block_id FROM users WHERE id=?")
+                .get(user.id);
+            if (row?.pre_block_id)
+                socket.join(`pre:${row.pre_block_id}`);
+        }
+        if (user.role === "NURSE" && user.station_id)
+            socket.join(`station:${user.station_id}`);
     });
     return io;
 }
 // Broadcast a bed/round change so dashboards refresh live.
-export function emitUpdate(event, data, preCode) {
+// opts.pre  → also emit to PRE block room `pre:<code>`
+// opts.stationId → also emit to nurse station room `station:<id>`
+export function emitUpdate(event, data, opts) {
     if (!io)
         return;
     io.to("overview").emit(event, data);
-    if (preCode)
-        io.to(`pre:${preCode}`).emit(event, data);
+    if (opts?.pre)
+        io.to(`pre:${opts.pre}`).emit(event, data);
+    if (opts?.stationId)
+        io.to(`station:${opts.stationId}`).emit(event, data);
 }

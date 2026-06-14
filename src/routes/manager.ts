@@ -1,7 +1,7 @@
 import { Router } from "express";
 import { z } from "zod";
 import { authRequired, requireRole } from "../middleware/auth.js";
-import { asyncH } from "../middleware/error.js";
+import { asyncH, HttpError } from "../middleware/error.js";
 import { db } from "../db/index.js";
 import {
   listBuildingBlocks, createBuildingBlock, editBuildingBlock, deleteBuildingBlock,
@@ -11,6 +11,7 @@ import {
   createNurse, editNurse, deleteNurse,
   listNursingStations, createNursingStation, editNursingStation, deleteNursingStation, assignWardsToStation,
   availableDates, historyForDate,
+  listNurseAccess, createNurseAccess, editNurseAccess, deleteNurseAccess,
 } from "../services/managerService.js";
 import {
   listPreBlocks, getPreBlock, createPreBlock, editPreBlock,
@@ -19,6 +20,10 @@ import {
 import {
   generateBeds, addSingleBed, listBeds, renameBed, deleteBed, updateBedMaster,
 } from "../services/bedDetailService.js";
+import { midnightCensusFor } from "../services/bedService.js";
+import {
+  listPayerTypes, createPayerType, updatePayerType, reorderPayerType, deletePayerType,
+} from "../services/payerTypeService.js";
 
 const router = Router();
 router.use(authRequired, requireRole("MANAGER", "COO"));
@@ -29,7 +34,7 @@ router.get("/kpis", asyncH(async (_req, res) => {
   const row = await db.prepare(`
     SELECT
       COUNT(*)::int                                                            AS total,
-      COUNT(*) FILTER (WHERE w.bed_type = 'Census' OR w.bed_type IS NULL)::int AS census,
+      COUNT(*) FILTER (WHERE (w.bed_type = 'Census' OR w.bed_type IS NULL) AND bd.operational_status)::int AS census,
       COUNT(*) FILTER (WHERE w.bed_type = 'Non-Census')::int                  AS non_census,
       COUNT(*) FILTER (WHERE bd.operational_status)::int                      AS operational,
       COUNT(*) FILTER (WHERE NOT bd.operational_status)::int                  AS non_operational,
@@ -38,14 +43,11 @@ router.get("/kpis", asyncH(async (_req, res) => {
                          AND bd.operational_status)::int                      AS vacant,
       COUNT(*) FILTER (WHERE bd.physical_status = 'VACANT'
                          AND bd.reservation_status = 'RESERVED')::int         AS vacant_reserved,
-      COUNT(*) FILTER (WHERE bd.physical_status = 'OCCUPIED'
-                         AND bd.reservation_status = 'NONE')::int             AS occupied,
-      COUNT(*) FILTER (WHERE bd.physical_status = 'OCCUPIED'
-                         AND bd.reservation_status = 'RESERVED')::int         AS occupied_reserved
+      COUNT(*) FILTER (WHERE bd.physical_status = 'OCCUPIED')::int             AS occupied
     FROM bed_details bd
     JOIN wards w ON w.id = bd.ward_id
   `).get<Record<string, number>>();
-  const occupiedTotal = (row?.occupied ?? 0) + (row?.occupied_reserved ?? 0);
+  const occupiedTotal = row?.occupied ?? 0;
   const operational   = row?.operational ?? 0;
   res.json({
     ...row,
@@ -108,6 +110,13 @@ router.delete("/floors/:id", asyncH(async (req, res) => {
 }));
 
 // ── wards ─────────────────────────────────────────────────────────────────────
+
+router.get("/unit-types", asyncH(async (_req, res) => {
+  const rows = await db.prepare(
+    "SELECT DISTINCT unit_type FROM wards WHERE unit_type IS NOT NULL AND unit_type <> '' ORDER BY unit_type"
+  ).all<{ unit_type: string }>();
+  res.json({ unitTypes: rows.map((r) => r.unit_type) });
+}));
 
 router.get("/wards", asyncH(async (_req, res) => {
   const wards = await db.prepare(
@@ -179,9 +188,9 @@ router.get("/users", asyncH(async (_req, res) => {
 
 router.post("/pre", asyncH(async (req, res) => {
   const b = z.object({
-    username:    z.string().min(1).max(40),
-    password:    z.string().min(8).max(72),
-    name:        z.string().min(1).max(80),
+    username:    z.string().min(1, "Username is required.").max(40, "Username must be 40 characters or less."),
+    password:    z.string().min(8, "Password must be at least 8 characters.").max(72, "Password is too long."),
+    name:        z.string().min(1, "Display name is required.").max(80, "Display name is too long."),
     preBlockId:  z.number().int().nullable().optional(),
     shift:       z.enum(["morning", "night"]).optional(),
   }).parse(req.body);
@@ -190,8 +199,8 @@ router.post("/pre", asyncH(async (req, res) => {
 
 router.put("/pre/:id", asyncH(async (req, res) => {
   const b = z.object({
-    name:        z.string().min(1).max(80).optional(),
-    password:    z.string().min(8).max(72).optional(),
+    name:        z.string().min(1, "Display name is required.").max(80, "Display name is too long.").optional(),
+    password:    z.string().min(8, "Password must be at least 8 characters.").max(72, "Password is too long.").optional(),
     shift:       z.enum(["morning", "night"]).optional(),
     preBlockId:  z.number().int().nullable().optional(),
   }).parse(req.body);
@@ -209,21 +218,28 @@ router.delete("/pre/:id", asyncH(async (req, res) => {
 
 // ── Nurse In-Charge users ─────────────────────────────────────────────────────
 
+const nurseProfileFields = {
+  stationId:  z.number().int().positive().nullable().optional(),
+  employeeId: z.string().max(50).optional(),
+  phone:      z.string().max(30).optional(),
+  email:      z.string().max(120).optional(),
+};
+
 router.post("/nurses", asyncH(async (req, res) => {
   const b = z.object({
-    username:  z.string().min(1).max(40),
-    password:  z.string().min(8).max(72),
-    name:      z.string().min(1).max(80),
-    stationId: z.number().int(),
+    username: z.string().min(1, "Username is required.").max(40, "Username must be 40 characters or less."),
+    password: z.string().min(8, "Password must be at least 8 characters.").max(72, "Password is too long."),
+    name:     z.string().min(1, "Display name is required.").max(80, "Display name is too long."),
+    ...nurseProfileFields,
   }).parse(req.body);
   res.status(201).json(await createNurse({ ...b, managerId: req.user!.id }));
 }));
 
 router.put("/nurses/:id", asyncH(async (req, res) => {
   const b = z.object({
-    name:      z.string().min(1).max(80).optional(),
-    password:  z.string().min(8).max(72).optional(),
-    stationId: z.number().int().optional(),
+    name:     z.string().min(1, "Display name is required.").max(80, "Display name is too long.").optional(),
+    password: z.string().min(8, "Password must be at least 8 characters.").max(72, "Password is too long.").optional(),
+    ...nurseProfileFields,
   }).parse(req.body);
   res.json(await editNurse({ userId: Number(req.params.id), ...b, managerId: req.user!.id }));
 }));
@@ -242,18 +258,26 @@ router.get("/wards/:id/beds", asyncH(async (req, res) => {
 }));
 
 router.post("/wards/:id/generate-beds", asyncH(async (req, res) => {
-  const { bedNames } = z.object({
-    bedNames: z.array(z.string().min(1)).min(1).max(500),
+  const { bedNames, operationalStatus, bedType, acStatus } = z.object({
+    bedNames:          z.array(z.string().min(1)).min(1).max(500),
+    operationalStatus: z.boolean().optional(),
+    bedType:           z.enum(["Census", "Non-Census"]).optional(),
+    acStatus:          z.boolean().optional(),
   }).parse(req.body);
   res.status(201).json(
-    await generateBeds({ wardId: Number(req.params.id), bedNames, userId: req.user!.id })
+    await generateBeds({ wardId: Number(req.params.id), bedNames, operationalStatus, bedType, acStatus, userId: req.user!.id })
   );
 }));
 
 router.post("/wards/:id/beds", asyncH(async (req, res) => {
-  const { bedName } = z.object({ bedName: z.string().min(1) }).parse(req.body);
+  const { bedName, operationalStatus, bedType, acStatus } = z.object({
+    bedName:           z.string().min(1),
+    operationalStatus: z.boolean().optional(),
+    bedType:           z.enum(["Census", "Non-Census"]).optional(),
+    acStatus:          z.boolean().optional(),
+  }).parse(req.body);
   res.status(201).json(
-    await addSingleBed({ wardId: Number(req.params.id), bedName, userId: req.user!.id })
+    await addSingleBed({ wardId: Number(req.params.id), bedName, operationalStatus, bedType, acStatus, userId: req.user!.id })
   );
 }));
 
@@ -263,12 +287,13 @@ router.patch("/beds/:id/name", asyncH(async (req, res) => {
 }));
 
 router.patch("/beds/:id/master", asyncH(async (req, res) => {
-  const { bedType, operationalStatus } = z.object({
+  const { bedType, operationalStatus, acStatus } = z.object({
     bedType:           z.enum(["Census", "Non-Census"]).optional(),
     operationalStatus: z.boolean().optional(),
+    acStatus:          z.boolean().optional(),
   }).parse(req.body);
   res.json(await updateBedMaster({
-    bedId: Number(req.params.id), bedType, operationalStatus, userId: req.user!.id,
+    bedId: Number(req.params.id), bedType, operationalStatus, acStatus, userId: req.user!.id,
   }));
 }));
 
@@ -303,6 +328,129 @@ router.delete("/nursing-stations/:id", asyncH(async (req, res) => {
   res.json(await deleteNursingStation(Number(req.params.id), req.user!.id));
 }));
 
+router.get("/stations/:id/coverage", asyncH(async (req, res) => {
+  const stationId = Number(req.params.id);
+
+  // Wards assigned to this station
+  const wards = await db.prepare(
+    "SELECT w.id, w.name FROM wards w WHERE w.station_id=? ORDER BY w.name"
+  ).all<{ id: number; name: string }>(stationId);
+
+  // Nurses in this station
+  const nurses = await db.prepare(
+    `SELECT id, name, username, employee_id, phone, email
+     FROM users WHERE station_id=? AND role='NURSE' ORDER BY name`
+  ).all<{ id: number; name: string; username: string; employee_id: string | null; phone: string | null; email: string | null }>(stationId);
+
+  const nurseIds  = nurses.map(n => n.id);
+  const wardIds   = wards.map(w => w.id);
+
+  // Active assignments for station's nurses on station's wards
+  const assignments = nurseIds.length > 0 && wardIds.length > 0
+    ? await db.prepare(
+        `SELECT nurse_id, ward_id, access_type, bed_names
+         FROM nurse_access_assignments
+         WHERE nurse_id = ANY(?) AND ward_id = ANY(?) AND status='active'`
+      ).all<{ nurse_id: number; ward_id: number; access_type: string; bed_names: string }>(nurseIds, wardIds)
+    : [];
+
+  // Per-ward coverage
+  const wardCoverage = await Promise.all(wards.map(async (w) => {
+    const allBeds = (await db.prepare(
+      "SELECT bed_name FROM bed_details WHERE ward_id=?"
+    ).all<{ bed_name: string }>(w.id)).map(b => b.bed_name);
+
+    const wardAssignments = assignments.filter(a => a.ward_id === w.id);
+    const coveredSet = new Set<string>();
+    let hasFullAccess = false;
+
+    for (const a of wardAssignments) {
+      if (a.access_type === "FULL") {
+        hasFullAccess = true;
+        for (const b of allBeds) coveredSet.add(b);
+        break;
+      } else {
+        let beds: string[] = [];
+        try { beds = JSON.parse(a.bed_names || "[]"); } catch { /* skip */ }
+        for (const b of beds) coveredSet.add(b);
+      }
+    }
+
+    const unassigned = allBeds.filter(b => !coveredSet.has(b));
+    const total = allBeds.length;
+    const assigned = total - unassigned.length;
+    return {
+      ward_id: w.id, ward_name: w.name,
+      total_beds: total, assigned_beds: assigned,
+      unassigned_beds: unassigned,
+      has_full_access: hasFullAccess,
+      coverage_pct: total > 0 ? Math.round((assigned / total) * 100) : 0,
+    };
+  }));
+
+  // Nurse workload
+  const nurseWorkload = nurses.map(n => {
+    const myAssignments = assignments.filter(a => a.nurse_id === n.id);
+    let bedCount = 0;
+    for (const a of myAssignments) {
+      if (a.access_type === "FULL") {
+        const w = wardCoverage.find(wc => wc.ward_id === a.ward_id);
+        bedCount += w?.total_beds ?? 0;
+      } else {
+        try { bedCount += JSON.parse(a.bed_names || "[]").length; } catch { /* skip */ }
+      }
+    }
+    return {
+      ...n,
+      ward_count: myAssignments.length,
+      bed_count: bedCount,
+    };
+  });
+
+  res.json({ wards: wardCoverage, nurses: nurseWorkload });
+}));
+
+// ── Nurse Access Assignments ──────────────────────────────────────────────────
+
+function parseQueryId(val: unknown, name: string): number | undefined {
+  if (val === undefined) return undefined;
+  if (Array.isArray(val)) throw new HttpError(400, `${name} must be a single value`);
+  const n = Number(val);
+  if (!Number.isInteger(n) || n <= 0) throw new HttpError(400, `${name} must be a positive integer`);
+  return n;
+}
+
+router.get("/nurse-access", asyncH(async (req, res) => {
+  const nurseId = parseQueryId(req.query.nurseId, "nurseId");
+  const wardId  = parseQueryId(req.query.wardId, "wardId");
+  const status  = req.query.status ? String(req.query.status) : undefined;
+  res.json({ assignments: await listNurseAccess({ nurseId, wardId, status }) });
+}));
+
+router.post("/nurse-access", asyncH(async (req, res) => {
+  const body = z.object({
+    nurseId:    z.number().int().positive(),
+    wardId:     z.number().int().positive(),
+    accessType: z.enum(["FULL", "BEDS"]),
+    bedNames:   z.array(z.string()).optional().default([]),
+  }).parse(req.body);
+  res.status(201).json(await createNurseAccess({ ...body, managerId: req.user!.id }));
+}));
+
+router.put("/nurse-access/:id", asyncH(async (req, res) => {
+  const id = Number(req.params.id);
+  const body = z.object({
+    accessType: z.enum(["FULL", "BEDS"]).optional(),
+    bedNames:   z.array(z.string()).optional(),
+    status:     z.enum(["active", "inactive"]).optional(),
+  }).parse(req.body);
+  res.json(await editNurseAccess({ id, ...body, managerId: req.user!.id }));
+}));
+
+router.delete("/nurse-access/:id", asyncH(async (req, res) => {
+  res.json(await deleteNurseAccess(Number(req.params.id), req.user!.id));
+}));
+
 // ── history ───────────────────────────────────────────────────────────────────
 
 router.get("/history/dates", asyncH(async (_req, res) => {
@@ -310,10 +458,16 @@ router.get("/history/dates", asyncH(async (_req, res) => {
 }));
 
 router.get("/history", asyncH(async (req, res) => {
-  const date    = String(req.query.date || "");
-  const floorId = req.query.floorId ? Number(req.query.floorId) : undefined;
-  if (!date) return res.json({ rounds: [] });
-  res.json({ rounds: await historyForDate(date, floorId) });
+  const date = String(req.query.date || "");
+  // preBlockId is the current filter; floorId kept as a legacy alias
+  const preBlockId = req.query.preBlockId ? Number(req.query.preBlockId)
+                   : req.query.floorId    ? Number(req.query.floorId)
+                   : undefined;
+  if (!date) return res.json({ rounds: [], census: null });
+  res.json({
+    rounds: await historyForDate(date, preBlockId),
+    census: await midnightCensusFor(date),
+  });
 }));
 
 // ── PRE Blocks ────────────────────────────────────────────────────────────────
@@ -354,6 +508,33 @@ router.patch("/pre-blocks/:id/status", asyncH(async (req, res) => {
 
 router.delete("/pre-blocks/:id", asyncH(async (req, res) => {
   res.json(await deletePreBlock(Number(req.params.id), req.user!.id));
+}));
+
+// ── Payer Types ───────────────────────────────────────────────────────────────
+router.get("/payer-types", asyncH(async (_req, res) => {
+  res.json({ payerTypes: await listPayerTypes() });
+}));
+
+router.post("/payer-types", asyncH(async (req, res) => {
+  const { name } = z.object({ name: z.string().min(1).max(100) }).parse(req.body);
+  res.status(201).json(await createPayerType({ name, userId: req.user!.id }));
+}));
+
+router.put("/payer-types/:id", asyncH(async (req, res) => {
+  const { name, active } = z.object({
+    name:   z.string().min(1).max(100).optional(),
+    active: z.boolean().optional(),
+  }).parse(req.body);
+  res.json(await updatePayerType({ id: Number(req.params.id), name, active, userId: req.user!.id }));
+}));
+
+router.patch("/payer-types/:id/order", asyncH(async (req, res) => {
+  const { direction } = z.object({ direction: z.enum(["up", "down"]) }).parse(req.body);
+  res.json(await reorderPayerType({ id: Number(req.params.id), direction, userId: req.user!.id }));
+}));
+
+router.delete("/payer-types/:id", asyncH(async (req, res) => {
+  res.json(await deletePayerType({ id: Number(req.params.id), userId: req.user!.id }));
 }));
 
 export default router;

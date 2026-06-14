@@ -4,7 +4,8 @@ const MAX_DETAIL_BYTES = 2048;
 
 export async function audit(userId: number | null, action: string, entity: string | null, detail: unknown) {
   let json = JSON.stringify(detail ?? {});
-  if (json.length > MAX_DETAIL_BYTES) json = json.slice(0, MAX_DETAIL_BYTES) + '..."[truncated]"';
+  if (json.length > MAX_DETAIL_BYTES)
+    json = JSON.stringify({ _truncated: true, preview: json.slice(0, 200) });
   await db.prepare(
     "INSERT INTO audit_logs (ts, user_id, action, entity, detail) VALUES (?,?,?,?,?)"
   ).run(Date.now(), userId, action, entity, json);

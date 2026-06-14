@@ -189,6 +189,15 @@ model AuditLog {
   @@map("audit_logs")
 }
 
+model MidnightCensus {
+  id          Int    @id @default(autoincrement())
+  census_date String @unique @db.VarChar(10)
+  ts          BigInt
+  snapshot    String @db.Text
+
+  @@map("midnight_census")
+}
+
 model OccupancySnapshot {
   id       Int    @id @default(autoincrement())
   ts       BigInt

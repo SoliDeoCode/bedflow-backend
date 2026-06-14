@@ -182,7 +182,7 @@ async function run() {
     await db.prepare(
       `INSERT INTO users (username, password_hash, role, name, shift, block_id, created_at, updated_at)
        VALUES (?,?,?,?,?,NULL,?,?)`
-    ).run("coo", bcrypt.hashSync("coo123", 10), "COO", "Chief Operating Officer", "morning", now, now);
+    ).run("admin1", bcrypt.hashSync("admin123", 10), "COO", "Administrator", "morning", now, now);
 
     // ── 4. Shifts + reminders ─────────────────────────────────────────────────
     for (const [key, s] of Object.entries(SHIFTS)) {

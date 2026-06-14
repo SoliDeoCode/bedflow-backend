@@ -3,7 +3,7 @@ import { HttpError } from "../middleware/error.js";
 import { audit } from "./auditService.js";
 import { wardsForFloor, wardsForPreBlock } from "./bedService.js";
 import {
-  inShift, currentRound, roundKey, todayStr, minsNow, type ShiftKey,
+  inShift, currentRound, roundKey, todayStr, minsNow, formatShiftWindow, type ShiftKey,
 } from "../config/domain.js";
 
 export async function userShift(userId: number): Promise<ShiftKey> {
@@ -30,7 +30,8 @@ export async function alarmState(preBlockId: number, shift: ShiftKey) {
   const submitted = !!(await db.prepare("SELECT 1 FROM pre_rounds WHERE round_key=?").get(key));
 
   return { shift, onDuty, round, key, submitted, hasWards,
-           alarmActive: onDuty && hasWards && !submitted };
+           alarmActive: onDuty && hasWards && !submitted,
+           shiftWindow: formatShiftWindow(shift) };
 }
 
 /** Submit a round for the PRE Block the PRE user is assigned to. */
@@ -38,13 +39,16 @@ export async function submitRound(preBlockId: number, userId: number) {
   const wards = await wardsForPreBlock(preBlockId);
   if (wards.length === 0) throw new HttpError(400, "No wards assigned to this PRE Block");
 
+  const wardIds = wards.map(w => w.id);
+  const bedDetailRows = await db.prepare(
+    `SELECT DISTINCT ward_id FROM bed_details WHERE ward_id = ANY(?)`
+  ).all<{ ward_id: number }>(wardIds);
+  const wardHasBeds = new Set(bedDetailRows.map(r => Number(r.ward_id)));
+
   for (const w of wards) {
     if (w.vacant === null)
       throw new HttpError(400, `Enter all wards first (${w.ward} missing)`);
-    const hasBedDetails = !!(await db.prepare(
-      "SELECT 1 FROM bed_details WHERE ward_id=? LIMIT 1"
-    ).get(w.id));
-    if (!hasBedDetails) {
+    if (!wardHasBeds.has(w.id)) {
       const sum = w.vacant + (w.reserved || 0) + (w.occupied || 0);
       if (sum !== w.total)
         throw new HttpError(400, `${w.ward}: counts must total ${w.total}`);

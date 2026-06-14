@@ -41,8 +41,6 @@ export interface JwtPayload {
   username: string;
   role: Role;
   name: string;
-  /** PRE Block id — set for PRE role only (replaces floor_id) */
-  pre_block_id?: number | null;
   /** @deprecated physical floor id — kept so old tokens don't crash */
   floor_id?: number | null;
   /** @deprecated legacy block name kept so old PRE tokens don't crash */

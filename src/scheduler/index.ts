@@ -1,41 +1,60 @@
 import { db } from "../db/index.js";
-import { alarmState, userShift } from "../services/roundService.js";
 import { pushToUser } from "../services/pushService.js";
-import { snapshotOccupancy } from "../services/bedService.js";
+import { snapshotOccupancy, captureMidnightCensus } from "../services/bedService.js";
 import { emitUpdate } from "../websocket/io.js";
-import { COO_REMINDERS, hmToMin, minsNow, todayStr } from "../config/domain.js";
+import { COO_REMINDERS, hmToMin, minsNow, todayStr, currentRound, inShift, roundKey,
+         type ShiftKey } from "../config/domain.js";
 
 const lastPush = new Map<string, number>();
 const REPUSH_MS = 5 * 60 * 1000;
+let lastCaptureDate   = "";
+let lastSnapshotHour  = -1;
 
 async function tick() {
-  const now = Date.now();
+  const now  = Date.now();
+  const mins = minsNow();
+  const today = todayStr();
 
-  // PRE overdue → push
-  const pres = await db.prepare("SELECT id, username FROM users WHERE role='PRE'")
-    .all<{ id: number; username: string }>();
-  for (const u of pres) {
-    const row = await db.prepare(
-      `SELECT u.pre_block_id, pb.name AS block_name
-       FROM users u
-       LEFT JOIN pre_blocks pb ON pb.id = u.pre_block_id
-       WHERE u.id = ?`
-    ).get<{ pre_block_id: number | null; block_name: string | null }>(u.id);
-    if (!row?.pre_block_id) continue;
+  // Evict COO reminder flags from previous days — keys are "coo:YYYY-MM-DD:HH:MM"
+  for (const key of lastPush.keys())
+    if (key.startsWith("coo:") && !key.startsWith(`coo:${today}:`)) lastPush.delete(key);
 
-    const wardCount = (await db.prepare(
-      "SELECT COUNT(*) AS n FROM pre_block_wards WHERE pre_block_id = ?"
-    ).get<{ n: number }>(row.pre_block_id))?.n ?? 0;
-    if (wardCount === 0) continue;
+  // Single JOIN: PRE users that have a block with at least one ward assigned
+  const pres = await db.prepare(
+    `SELECT u.id, u.username, u.shift, u.pre_block_id, pb.name AS block_name
+     FROM users u
+     JOIN pre_blocks pb ON pb.id = u.pre_block_id
+     JOIN pre_block_wards pbw ON pbw.pre_block_id = u.pre_block_id
+     WHERE u.role = 'PRE'
+     GROUP BY u.id, u.username, u.shift, u.pre_block_id, pb.name`
+  ).all<{ id: number; username: string; shift: string; pre_block_id: number; block_name: string }>();
 
-    const shift = await userShift(u.id);
-    const st = await alarmState(row.pre_block_id, shift);
-    const label = row.block_name ?? `PRE Block ${row.pre_block_id}`;
-    if (st.alarmActive) {
-      emitUpdate("alarm:active", { floor: label }, label);
-      const key = "pre:" + u.id;
-      if (now - (lastPush.get(key) || 0) >= REPUSH_MS) {
-        lastPush.set(key, now);
+  if (pres.length > 0) {
+    // Compute round keys for all PRE users in JS — no DB call
+    const keyMeta = pres.map(u => {
+      const shift = (u.shift as ShiftKey) || "morning";
+      const round = currentRound(shift, mins);
+      const key   = roundKey(`pb${u.pre_block_id}`, shift, today, round.startMin);
+      return { u, shift, key };
+    });
+
+    // Batch: which of the current round keys have been submitted
+    const allKeys = keyMeta.map(m => m.key);
+    const submittedRows = await db.prepare(
+      `SELECT round_key FROM pre_rounds WHERE round_key = ANY(?)`
+    ).all<{ round_key: string }>(allKeys);
+    const submittedKeys = new Set(submittedRows.map(r => r.round_key));
+
+    for (const { u, shift, key } of keyMeta) {
+      if (!inShift(shift, mins)) continue;
+      if (submittedKeys.has(key)) continue;
+
+      const label = u.block_name ?? `PRE Block ${u.pre_block_id}`;
+      emitUpdate("alarm:active", { floor: label }, { pre: String(u.pre_block_id) });
+
+      const pushKey = "pre:" + u.id;
+      if (now - (lastPush.get(pushKey) || 0) >= REPUSH_MS) {
+        lastPush.set(pushKey, now);
         void pushToUser(u.id, {
           title: `⏰ Bed round due — ${label}`,
           body: "Open BedFlow and submit your bed counts now.",
@@ -46,7 +65,6 @@ async function tick() {
   }
 
   // COO reminders at the top of each 3-hour slot
-  const mins = minsNow();
   for (const r of COO_REMINDERS) {
     if (mins === hmToMin(r)) {
       const flag = "coo:" + todayStr() + ":" + r;
@@ -62,9 +80,20 @@ async function tick() {
     }
   }
 
-  // hourly occupancy snapshot
+  // hourly occupancy snapshot — guard against double-fire (30s tick hits minute=0 twice)
   const india = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
-  if (india.getMinutes() === 0) void snapshotOccupancy();
+  if (india.getMinutes() === 0 && india.getHours() !== lastSnapshotHour) {
+    lastSnapshotHour = india.getHours();
+    void snapshotOccupancy();
+  }
+
+  // midnight census: snapshot all ward counts at 00:00 IST; the capture is
+  // idempotent and the window is one hour so a restart around midnight still
+  // records it, while a snapshot is never taken late in the day.
+  if (mins < 60 && lastCaptureDate !== today) {
+    lastCaptureDate = today;
+    void captureMidnightCensus(today);
+  }
 }
 
 export function startScheduler() {

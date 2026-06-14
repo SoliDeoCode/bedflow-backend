@@ -46,7 +46,7 @@ export const db: Db = {
         const result = await getClient().query(pgSql, params as unknown[]);
         return {
           changes: result.rowCount ?? 0,
-          lastInsertRowid: (result.rows[0]?.id as number) ?? 0,
+          lastInsertRowid: (result.rows[0]?.id as number) ?? null,
         };
       },
       async get<T>(...params: unknown[]): Promise<T | undefined> {

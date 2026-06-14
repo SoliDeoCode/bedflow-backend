@@ -5,6 +5,10 @@ import { audit } from "./auditService.js";
 
 const now = () => Date.now();
 
+function isUniqueViolation(err: unknown): boolean {
+  return /unique/i.test(String((err as { message?: string })?.message ?? ""));
+}
+
 // ── BUILDING BLOCKS (Block A / Block B …) ────────────────────────────────────
 
 export async function listBuildingBlocks() {
@@ -24,17 +28,22 @@ export async function createBuildingBlock(opts: {
   const name = opts.name.trim().toUpperCase();
   if (!name) throw new HttpError(400, "Block name required");
   const t = now();
+  let r: { lastInsertRowid: number };
   try {
-    const r = await db.prepare(
-      "INSERT INTO building_blocks (name, label, sort_order, created_at, updated_at) VALUES (?,?,?,?,?) RETURNING id"
-    ).run(name, opts.label?.trim() || `Block ${name}`,
-          (await db.prepare("SELECT COALESCE(MAX(sort_order),0)+1 AS n FROM building_blocks").get<{n:number}>())!.n,
-          t, t);
-    await audit(opts.managerId, "building_block_create", name, {});
-    return { ok: true, id: Number(r.lastInsertRowid), name };
-  } catch {
-    throw new HttpError(409, `Block "${name}" already exists`);
+    r = await db.transaction(async () => {
+      const next = (await db.prepare(
+        "SELECT COALESCE(MAX(sort_order),0)+1 AS n FROM building_blocks"
+      ).get<{ n: number }>())!.n;
+      return db.prepare(
+        "INSERT INTO building_blocks (name, label, sort_order, created_at, updated_at) VALUES (?,?,?,?,?) RETURNING id"
+      ).run(name, opts.label?.trim() || `Block ${name}`, next, t, t);
+    });
+  } catch (err) {
+    if (isUniqueViolation(err)) throw new HttpError(409, `Block "${name}" already exists`);
+    throw err;
   }
+  await audit(opts.managerId, "building_block_create", name, {});
+  return { ok: true, id: Number(r.lastInsertRowid), name };
 }
 
 export async function editBuildingBlock(opts: {
@@ -46,7 +55,13 @@ export async function editBuildingBlock(opts: {
   const t = now();
   if (opts.name !== undefined) {
     const n = opts.name.trim().toUpperCase();
-    await db.prepare("UPDATE building_blocks SET name=?, updated_at=? WHERE id=?").run(n, t, opts.blockId);
+    try {
+      await db.prepare("UPDATE building_blocks SET name=?, updated_at=? WHERE id=?").run(n, t, opts.blockId);
+    } catch (err) {
+      if (isUniqueViolation(err)) throw new HttpError(409, `Block "${n}" already exists`);
+      throw err;
+    }
+    await db.prepare("UPDATE floors SET block_label=?, updated_at=? WHERE building_block_id=?").run(n, t, opts.blockId);
   }
   if (opts.label !== undefined)
     await db.prepare("UPDATE building_blocks SET label=?, updated_at=? WHERE id=?")
@@ -96,20 +111,23 @@ export async function createFloor(opts: {
   if (!bb) throw new HttpError(404, "Building block not found");
 
   const t = now();
-  const sortRow = await db.prepare(
-    "SELECT COALESCE(MAX(sort_order),0)+1 AS n FROM floors WHERE building_block_id=?"
-  ).get<{ n: number }>(opts.buildingBlockId);
-
+  let r: { lastInsertRowid: number };
   try {
-    const r = await db.prepare(
-      "INSERT INTO floors (name, code, block_label, building_block_id, sort_order, created_at, updated_at) VALUES (?,?,?,?,?,?,?) RETURNING id"
-    ).run(name, name.replace(/\s+/g, "").substring(0, 20).toUpperCase(),
-          bb.name, opts.buildingBlockId, sortRow!.n, t, t);
-    await audit(opts.managerId, "floor_create", `${bb.name}-${name}`, {});
-    return { ok: true, id: Number(r.lastInsertRowid), name };
-  } catch {
-    throw new HttpError(409, `A floor named "${name}" already exists in Block ${bb.name}`);
+    r = await db.transaction(async () => {
+      const next = (await db.prepare(
+        "SELECT COALESCE(MAX(sort_order),0)+1 AS n FROM floors WHERE building_block_id=?"
+      ).get<{ n: number }>(opts.buildingBlockId))!.n;
+      return db.prepare(
+        "INSERT INTO floors (name, code, block_label, building_block_id, sort_order, created_at, updated_at) VALUES (?,?,?,?,?,?,?) RETURNING id"
+      ).run(name, name.replace(/\s+/g, "").substring(0, 20).toUpperCase(),
+            bb.name, opts.buildingBlockId, next, t, t);
+    });
+  } catch (err) {
+    if (isUniqueViolation(err)) throw new HttpError(409, `A floor named "${name}" already exists in Block ${bb.name}`);
+    throw err;
   }
+  await audit(opts.managerId, "floor_create", `${bb.name}-${name}`, {});
+  return { ok: true, id: Number(r.lastInsertRowid), name };
 }
 
 export async function editFloor(opts: {
@@ -121,8 +139,13 @@ export async function editFloor(opts: {
   const name = opts.name.trim();
   if (!name) throw new HttpError(400, "Floor name required");
   const t = now();
-  await db.prepare("UPDATE floors SET name=?, code=?, updated_at=? WHERE id=?")
-    .run(name, name.replace(/\s+/g, "").substring(0, 20).toUpperCase(), t, opts.floorId);
+  try {
+    await db.prepare("UPDATE floors SET name=?, code=?, updated_at=? WHERE id=?")
+      .run(name, name.replace(/\s+/g, "").substring(0, 20).toUpperCase(), t, opts.floorId);
+  } catch (err) {
+    if (isUniqueViolation(err)) throw new HttpError(409, "A floor with a similar name already exists in this block");
+    throw err;
+  }
   await audit(opts.managerId, "floor_edit", name, { floorId: opts.floorId });
   return { ok: true };
 }
@@ -175,10 +198,12 @@ export async function createWard(opts: {
       wardId = Number(r.lastInsertRowid);
       await db.prepare("INSERT INTO beds (ward_id, total) VALUES (?,?)").run(wardId, total);
       if (total > 0) {
-        const ins = db.prepare(
-          "INSERT INTO bed_details (ward_id, bed_name, physical_status, reservation_status, bed_type, operational_status, updated_at, updated_by) VALUES (?,?,'VACANT','NONE',?,?,?,?)"
-        );
-        for (let i = 1; i <= total; i++) await ins.run(wardId, String(i), bedType, operational, t, opts.managerId);
+        const placeholders = Array.from({ length: total }, () => "(?,?,'VACANT','NONE',?,?,?,?)").join(",");
+        const values: unknown[] = [];
+        for (let i = 1; i <= total; i++) values.push(wardId, String(i), bedType, operational, t, opts.managerId);
+        await db.prepare(
+          `INSERT INTO bed_details (ward_id, bed_name, physical_status, reservation_status, bed_type, operational_status, updated_at, updated_by) VALUES ${placeholders}`
+        ).run(...values);
       }
     });
     await audit(opts.managerId, "ward_create", floor.name, { name: opts.name, totalBeds: total, bedType, operational });
@@ -199,15 +224,19 @@ export async function editWard(opts: {
   if (!ward) throw new HttpError(404, "Ward not found");
   const t = now();
 
+  // Validate totalBeds before entering the transaction so other fields aren't silently skipped
+  if (opts.totalBeds !== undefined) {
+    const actual = (await db.prepare("SELECT COUNT(*) AS c FROM bed_details WHERE ward_id=?")
+      .get<{c:number}>(opts.wardId))?.c ?? 0;
+    if (opts.totalBeds !== actual)
+      throw new HttpError(409, `Capacity is derived from beds (currently ${actual}). Add or delete beds to change it.`);
+  }
+
   await db.transaction(async () => {
     if (opts.name !== undefined)
       await db.prepare("UPDATE wards SET name=?, updated_at=? WHERE id=?")
         .run(opts.name.trim(), t, opts.wardId);
     if (opts.totalBeds !== undefined) {
-      const actual = (await db.prepare("SELECT COUNT(*) AS c FROM bed_details WHERE ward_id=?")
-        .get<{c:number}>(opts.wardId))?.c ?? 0;
-      if (opts.totalBeds !== actual)
-        throw new HttpError(409, `Capacity is derived from beds (currently ${actual}). Add or delete beds to change it.`);
       await db.prepare("UPDATE wards SET updated_at=? WHERE id=?").run(t, opts.wardId);
     }
     if (opts.floorId !== undefined) {
@@ -264,7 +293,7 @@ export async function createPre(opts: {
 }) {
   const username = opts.username.trim().toLowerCase();
   if (!/^[a-z0-9_]+$/.test(username))
-    throw new HttpError(400, "Username: letters, numbers, underscore only");
+    throw new HttpError(400, "Username can only contain letters, numbers, and underscores — no spaces or special characters.");
   if (await db.prepare("SELECT 1 FROM users WHERE username=?").get(username))
     throw new HttpError(409, "Username already taken");
 
@@ -340,30 +369,41 @@ export async function deletePre(userId: number, managerId: number) {
 
 export async function createNurse(opts: {
   username: string; password: string; name: string;
-  stationId: number; managerId: number;
+  stationId?: number | null; managerId: number;
+  employeeId?: string; phone?: string; email?: string;
 }) {
   const username = opts.username.trim().toLowerCase();
   if (!/^[a-z0-9_]+$/.test(username))
-    throw new HttpError(400, "Username: letters, numbers, underscore only");
+    throw new HttpError(400, "Username can only contain letters, numbers, and underscores — no spaces or special characters.");
   if (await db.prepare("SELECT 1 FROM users WHERE username=?").get(username))
     throw new HttpError(409, "Username already taken");
 
-  const ns = await db.prepare("SELECT name FROM nursing_stations WHERE id=?")
-    .get<{name: string}>(opts.stationId);
-  if (!ns) throw new HttpError(404, "Nursing station not found");
+  let stationName: string | null = null;
+  if (opts.stationId) {
+    const ns = await db.prepare("SELECT name FROM nursing_stations WHERE id=?")
+      .get<{name: string}>(opts.stationId);
+    if (!ns) throw new HttpError(404, "Nursing station not found");
+    stationName = ns.name;
+  }
 
   const t = now();
   const r = await db.prepare(
-    "INSERT INTO users (username,password_hash,role,name,shift,nursing_station,station_id,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?) RETURNING id"
+    `INSERT INTO users
+       (username,password_hash,role,name,shift,nursing_station,station_id,
+        employee_id,phone,email,created_at,updated_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id`
   ).run(username, bcrypt.hashSync(opts.password, 10), "NURSE", opts.name.trim(),
-        "morning", ns.name, opts.stationId, t, t);
-  await audit(opts.managerId, "nurse_create", ns.name, { username, name: opts.name });
+        "morning", stationName, opts.stationId ?? null,
+        opts.employeeId?.trim() || null, opts.phone?.trim() || null, opts.email?.trim() || null,
+        t, t);
+  await audit(opts.managerId, "nurse_create", stationName ?? "unassigned", { username, name: opts.name });
   return { ok: true, id: Number(r.lastInsertRowid), username };
 }
 
 export async function editNurse(opts: {
   userId: number; name?: string; password?: string;
-  stationId?: number; managerId: number;
+  stationId?: number | null; managerId: number;
+  employeeId?: string; phone?: string; email?: string;
 }) {
   const user = await db.prepare("SELECT id, role FROM users WHERE id=?")
     .get<{id: number; role: string}>(opts.userId);
@@ -377,12 +417,23 @@ export async function editNurse(opts: {
       await db.prepare("UPDATE users SET password_hash=?, updated_at=? WHERE id=?")
         .run(bcrypt.hashSync(opts.password, 10), t, opts.userId);
     if (opts.stationId !== undefined) {
-      const ns = await db.prepare("SELECT name FROM nursing_stations WHERE id=?")
-        .get<{name: string}>(opts.stationId);
-      if (!ns) throw new HttpError(404, "Nursing station not found");
-      await db.prepare("UPDATE users SET station_id=?, nursing_station=?, updated_at=? WHERE id=?")
-        .run(opts.stationId, ns.name, t, opts.userId);
+      if (opts.stationId === null) {
+        await db.prepare("UPDATE users SET station_id=NULL, nursing_station=NULL, updated_at=? WHERE id=?")
+          .run(t, opts.userId);
+      } else {
+        const ns = await db.prepare("SELECT name FROM nursing_stations WHERE id=?")
+          .get<{name: string}>(opts.stationId);
+        if (!ns) throw new HttpError(404, "Nursing station not found");
+        await db.prepare("UPDATE users SET station_id=?, nursing_station=?, updated_at=? WHERE id=?")
+          .run(opts.stationId, ns.name, t, opts.userId);
+      }
     }
+    if (opts.employeeId !== undefined)
+      await db.prepare("UPDATE users SET employee_id=?, updated_at=? WHERE id=?").run(opts.employeeId?.trim() || null, t, opts.userId);
+    if (opts.phone !== undefined)
+      await db.prepare("UPDATE users SET phone=?, updated_at=? WHERE id=?").run(opts.phone?.trim() || null, t, opts.userId);
+    if (opts.email !== undefined)
+      await db.prepare("UPDATE users SET email=?, updated_at=? WHERE id=?").run(opts.email?.trim() || null, t, opts.userId);
   });
   await audit(opts.managerId, "nurse_edit", null, { userId: opts.userId });
   return { ok: true };
@@ -392,6 +443,7 @@ export async function deleteNurse(userId: number, managerId: number) {
   const user = await db.prepare("SELECT id, role, name FROM users WHERE id=?")
     .get<{id: number; role: string; name: string}>(userId);
   if (!user || user.role !== "NURSE") throw new HttpError(404, "Nurse not found");
+  await db.prepare("DELETE FROM nurse_access_assignments WHERE nurse_id=?").run(userId);
   await db.prepare("DELETE FROM users WHERE id=?").run(userId);
   await audit(managerId, "nurse_delete", null, { userId, name: user.name });
   return { ok: true };
@@ -422,8 +474,9 @@ export async function createNursingStation(opts: { name: string; managerId: numb
     ).run(name, t, t);
     await audit(opts.managerId, "station_create", name, {});
     return { ok: true, id: Number(r.lastInsertRowid), name };
-  } catch {
-    throw new HttpError(409, `Station "${name}" already exists`);
+  } catch (err) {
+    if (isUniqueViolation(err)) throw new HttpError(409, `Station "${name}" already exists`);
+    throw err;
   }
 }
 
@@ -437,13 +490,14 @@ export async function editNursingStation(opts: {
   const t = now();
   try {
     await db.prepare("UPDATE nursing_stations SET name=?, updated_at=? WHERE id=?").run(name, t, opts.stationId);
-    await db.prepare("UPDATE wards SET nursing_station=? WHERE station_id=?").run(name, opts.stationId);
-    await db.prepare("UPDATE users SET nursing_station=? WHERE station_id=?").run(name, opts.stationId);
-    await audit(opts.managerId, "station_edit", name, { stationId: opts.stationId });
-    return { ok: true };
-  } catch {
-    throw new HttpError(409, `Station name "${name}" already taken`);
+  } catch (err) {
+    if (isUniqueViolation(err)) throw new HttpError(409, `Station name "${name}" already taken`);
+    throw err;
   }
+  await db.prepare("UPDATE wards SET nursing_station=? WHERE station_id=?").run(name, opts.stationId);
+  await db.prepare("UPDATE users SET nursing_station=? WHERE station_id=?").run(name, opts.stationId);
+  await audit(opts.managerId, "station_edit", name, { stationId: opts.stationId });
+  return { ok: true };
 }
 
 export async function assignWardsToStation(stationId: number, wardIds: number[], managerId: number) {
@@ -451,14 +505,45 @@ export async function assignWardsToStation(stationId: number, wardIds: number[],
     .get<{id: number; name: string}>(stationId);
   if (!s) throw new HttpError(404, "Station not found");
   const t = now();
-  // Clear all wards currently assigned to this station
-  await db.prepare("UPDATE wards SET station_id=NULL, nursing_station=NULL, updated_at=? WHERE station_id=?")
-    .run(t, stationId);
-  // Assign the selected wards (may move them away from another station)
-  for (const wardId of wardIds) {
-    await db.prepare("UPDATE wards SET station_id=?, nursing_station=?, updated_at=? WHERE id=?")
-      .run(stationId, s.name, t, wardId);
+
+  const currentWards = await db.prepare("SELECT id FROM wards WHERE station_id=?")
+    .all<{ id: number }>(stationId);
+  const currentWardIdSet = new Set(currentWards.map(w => w.id));
+  const newWardIdSet     = new Set(wardIds);
+
+  // Wards removed from this station → delete this station's nurses' access to them
+  for (const { id: wardId } of currentWards) {
+    if (!newWardIdSet.has(wardId)) {
+      await db.prepare(
+        `DELETE FROM nurse_access_assignments
+         WHERE ward_id=? AND nurse_id IN (SELECT id FROM users WHERE station_id=?)`
+      ).run(wardId, stationId);
+    }
   }
+
+  // Wards moved in from a different station → delete old station's nurses' access
+  for (const wardId of wardIds) {
+    if (!currentWardIdSet.has(wardId)) {
+      const ward = await db.prepare("SELECT station_id FROM wards WHERE id=?")
+        .get<{ station_id: number | null }>(wardId);
+      if (ward?.station_id && ward.station_id !== stationId) {
+        await db.prepare(
+          `DELETE FROM nurse_access_assignments
+           WHERE ward_id=? AND nurse_id IN (SELECT id FROM users WHERE station_id=?)`
+        ).run(wardId, ward.station_id);
+      }
+    }
+  }
+
+  // Clear and re-assign atomically so a mid-loop failure can't leave partial state
+  await db.transaction(async () => {
+    await db.prepare("UPDATE wards SET station_id=NULL, nursing_station=NULL, updated_at=? WHERE station_id=?")
+      .run(t, stationId);
+    for (const wardId of wardIds) {
+      await db.prepare("UPDATE wards SET station_id=?, nursing_station=?, updated_at=? WHERE id=?")
+        .run(stationId, s.name, t, wardId);
+    }
+  });
   await audit(managerId, "station_assign_wards", s.name, { stationId, wardIds });
   return { ok: true };
 }
@@ -468,7 +553,8 @@ export async function deleteNursingStation(stationId: number, managerId: number)
     .get<{id: number; name: string}>(stationId);
   if (!s) throw new HttpError(404, "Station not found");
   const t = now();
-  // Unassign all wards and nurses before deleting
+  // Unassign all wards and nurses before deleting; clean up their access assignments
+  await db.prepare("DELETE FROM nurse_access_assignments WHERE ward_id IN (SELECT id FROM wards WHERE station_id=?)").run(stationId);
   await db.prepare("UPDATE wards SET station_id=NULL, nursing_station=NULL, updated_at=? WHERE station_id=?").run(t, stationId);
   await db.prepare("UPDATE users SET station_id=NULL, nursing_station=NULL, updated_at=? WHERE station_id=?").run(t, stationId);
   await db.prepare("DELETE FROM nursing_stations WHERE id=?").run(stationId);
@@ -479,42 +565,162 @@ export async function deleteNursingStation(stationId: number, managerId: number)
 // ── history ───────────────────────────────────────────────────────────────────
 
 export async function availableDates(): Promise<string[]> {
-  const rows = await db.prepare(
-    "SELECT DISTINCT round_key FROM pre_rounds ORDER BY submitted_at DESC"
-  ).all<{round_key: string}>();
-  const dates = new Set<string>();
-  for (const r of rows) {
-    const parts = r.round_key.split("|");
-    if (parts[2]) dates.add(parts[2]);
-  }
-  return [...dates];
+  // Postgres rejects DISTINCT + ORDER BY on a non-selected column; round_key
+  // dates are YYYY-MM-DD so sorting them directly gives newest-first.
+  const [roundRows, censusRows] = await Promise.all([
+    db.prepare(
+      "SELECT DISTINCT SPLIT_PART(round_key, '|', 3) AS date FROM pre_rounds WHERE round_key LIKE '%|%|%|%'"
+    ).all<{ date: string }>(),
+    db.prepare("SELECT census_date FROM midnight_census").all<{ census_date: string }>(),
+  ]);
+  const dates = new Set<string>([
+    ...roundRows.map(r => r.date).filter(Boolean),
+    ...censusRows.map(c => c.census_date),
+  ]);
+  return [...dates].sort().reverse();
 }
 
-export async function historyForDate(date: string, floorId?: number) {
+// Rounds are submitted per PRE Block (pre_rounds.pre_block_id); floor_id is a
+// legacy column that is NULL on all new rows.
+export async function historyForDate(date: string, preBlockId?: number) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) throw new HttpError(400, "Invalid date format. Use YYYY-MM-DD.");
   let sql =
-    `SELECT pr.floor_id, f.name AS floor_name, bb.name AS block_name,
-            pr.shift, pr.start_min AS startMin, pr.submitted_at AS submittedAt, pr.snapshot
+    `SELECT pr.pre_block_id, pb.name AS block_name,
+            pr.shift, pr.start_min AS "startMin", pr.submitted_at AS "submittedAt", pr.snapshot
      FROM pre_rounds pr
-     LEFT JOIN floors f ON f.id = pr.floor_id
-     LEFT JOIN building_blocks bb ON bb.id = f.building_block_id
+     LEFT JOIN pre_blocks pb ON pb.id = pr.pre_block_id
      WHERE pr.round_key LIKE ?`;
   const params: unknown[] = [`%|${date}|%`];
-  if (floorId !== undefined) { sql += " AND pr.floor_id=?"; params.push(floorId); }
+  if (preBlockId !== undefined) { sql += " AND pr.pre_block_id=?"; params.push(preBlockId); }
   sql += " ORDER BY pr.submitted_at";
 
   const rows = await db.prepare(sql).all<{
-    floor_id: number; floor_name: string; block_name: string;
+    pre_block_id: number; block_name: string | null;
     shift: string; startMin: number; submittedAt: number; snapshot: string;
   }>(...params);
 
   return rows.map(r => ({
-    floorId:   r.floor_id,
-    floorCode: r.floor_name,
-    blockName: r.block_name,
-    floorName: r.block_name ? `${r.block_name} - ${r.floor_name}` : r.floor_name,
-    shift:     r.shift,
-    startMin:  r.startMin,
+    preBlockId: r.pre_block_id,
+    floorId:    r.pre_block_id,                       // legacy alias for older clients
+    floorCode:  r.block_name || `PB${r.pre_block_id}`,
+    blockName:  r.block_name,
+    floorName:  r.block_name || `PRE Block ${r.pre_block_id}`,
+    shift:      r.shift,
     submittedAt: r.submittedAt,
+    startMin:   r.startMin,
     wards: (() => { try { return JSON.parse(r.snapshot || "[]"); } catch { return []; } })(),
   }));
+}
+
+// ── Nurse Access Assignments ──────────────────────────────────────────────────
+
+interface NaaRow {
+  id: number; nurse_id: number; ward_id: number;
+  access_type: string; bed_names: string; status: string;
+  created_at: number; updated_at: number; created_by: number | null;
+  nurse_name: string; nurse_username: string; ward_name: string;
+}
+
+function parseNaa(r: NaaRow) {
+  let beds: string[] = [];
+  try { beds = JSON.parse(r.bed_names || "[]"); } catch { /* corrupt */ }
+  return { ...r, bed_names: beds };
+}
+
+export async function listNurseAccess(filters: {
+  nurseId?: number; wardId?: number; status?: string;
+} = {}) {
+  let sql = `
+    SELECT naa.id, naa.nurse_id, naa.ward_id, naa.access_type, naa.bed_names,
+           naa.status, naa.created_at, naa.updated_at, naa.created_by,
+           u.name AS nurse_name, u.username AS nurse_username, w.name AS ward_name
+    FROM nurse_access_assignments naa
+    JOIN users u ON u.id = naa.nurse_id
+    JOIN wards w ON w.id = naa.ward_id
+    WHERE 1=1`;
+  const params: unknown[] = [];
+  if (filters.nurseId !== undefined) { sql += " AND naa.nurse_id=?"; params.push(filters.nurseId); }
+  if (filters.wardId  !== undefined) { sql += " AND naa.ward_id=?";  params.push(filters.wardId); }
+  if (filters.status)                { sql += " AND naa.status=?";   params.push(filters.status); }
+  sql += " ORDER BY u.name, w.name";
+  const rows = await db.prepare(sql).all<NaaRow>(...params);
+  return rows.map(parseNaa);
+}
+
+export async function createNurseAccess(opts: {
+  nurseId: number; wardId: number; accessType: "FULL" | "BEDS";
+  bedNames?: string[]; managerId: number;
+}) {
+  const { nurseId, wardId, accessType, managerId } = opts;
+  const bedNames = [...new Set(opts.bedNames ?? [])];
+  if (accessType === "BEDS" && bedNames.length === 0)
+    throw new HttpError(400, "Select at least one bed for Selected Beds access");
+
+  const existing = await db.prepare(
+    "SELECT id, access_type FROM nurse_access_assignments WHERE nurse_id=? AND ward_id=?"
+  ).get<{ id: number; access_type: string }>(nurseId, wardId);
+
+  if (existing) {
+    if (existing.access_type === "FULL")
+      throw new HttpError(409, "This nurse already has Full Access to this ward");
+    // existing is BEDS; upgrade to FULL or update beds
+  }
+
+  const t = now();
+  const bedJson = JSON.stringify(accessType === "FULL" ? [] : bedNames);
+
+  if (existing) {
+    await db.prepare(
+      "UPDATE nurse_access_assignments SET access_type=?, bed_names=?, updated_at=?, created_by=? WHERE id=?"
+    ).run(accessType, bedJson, t, managerId, existing.id);
+    await audit(managerId, "nurse_access_update", null, { id: existing.id, nurseId, wardId, accessType });
+    return { ok: true, id: existing.id };
+  }
+
+  const r = await db.prepare(
+    `INSERT INTO nurse_access_assignments
+       (nurse_id, ward_id, access_type, bed_names, status, created_at, updated_at, created_by)
+     VALUES (?,?,?,?,'active',?,?,?) RETURNING id`
+  ).run(nurseId, wardId, accessType, bedJson, t, t, managerId);
+  const id = Number(r.lastInsertRowid);
+  await audit(managerId, "nurse_access_create", null, { id, nurseId, wardId, accessType });
+  return { ok: true, id };
+}
+
+export async function editNurseAccess(opts: {
+  id: number; accessType?: "FULL" | "BEDS";
+  bedNames?: string[]; status?: "active" | "inactive"; managerId: number;
+}) {
+  const row = await db.prepare(
+    "SELECT id, access_type, bed_names, status FROM nurse_access_assignments WHERE id=?"
+  ).get<{ id: number; access_type: string; bed_names: string; status: string }>(opts.id);
+  if (!row) throw new HttpError(404, "Assignment not found");
+
+  const accessType = (opts.accessType ?? row.access_type) as "FULL" | "BEDS";
+  let beds: string[];
+  if (opts.bedNames !== undefined) {
+    beds = [...new Set(opts.bedNames)];
+  } else {
+    try { beds = JSON.parse(row.bed_names || "[]"); } catch { beds = []; }
+  }
+  if (accessType === "BEDS" && beds.length === 0)
+    throw new HttpError(400, "Select at least one bed for Selected Beds access");
+
+  const status = opts.status ?? row.status;
+  const bedJson = JSON.stringify(accessType === "FULL" ? [] : beds);
+  await db.prepare(
+    "UPDATE nurse_access_assignments SET access_type=?, bed_names=?, status=?, updated_at=? WHERE id=?"
+  ).run(accessType, bedJson, status, now(), opts.id);
+  await audit(opts.managerId, "nurse_access_edit", null, { id: opts.id, accessType, status });
+  return { ok: true };
+}
+
+export async function deleteNurseAccess(id: number, managerId: number) {
+  const row = await db.prepare(
+    "SELECT id, nurse_id, ward_id FROM nurse_access_assignments WHERE id=?"
+  ).get<{ id: number; nurse_id: number; ward_id: number }>(id);
+  if (!row) throw new HttpError(404, "Assignment not found");
+  await db.prepare("DELETE FROM nurse_access_assignments WHERE id=?").run(id);
+  await audit(managerId, "nurse_access_delete", null, { id, nurseId: row.nurse_id, wardId: row.ward_id });
+  return { ok: true };
 }

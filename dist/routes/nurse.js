@@ -3,70 +3,154 @@ import { z } from "zod";
 import { authRequired, requireRole } from "../middleware/auth.js";
 import { asyncH, HttpError } from "../middleware/error.js";
 import { listBeds, updateBedStatus } from "../services/bedDetailService.js";
+import { listPayerTypes } from "../services/payerTypeService.js";
 import { emitUpdate } from "../websocket/io.js";
 import { db } from "../db/index.js";
+async function getNurseAssignments(nurseId) {
+    return db.prepare("SELECT id, ward_id, access_type, bed_names FROM nurse_access_assignments WHERE nurse_id=? AND status='active'").all(nurseId);
+}
+async function canNurseAccessBed(nurseId, bedId, stationId) {
+    const assignments = await getNurseAssignments(nurseId);
+    if (assignments.length === 0) {
+        // Station-based: bed must belong to nurse's station
+        const owns = await db.prepare("SELECT 1 FROM bed_details bd JOIN wards w ON w.id=bd.ward_id WHERE bd.id=? AND w.station_id=?").get(bedId, stationId);
+        return !!owns;
+    }
+    // Assignment-based: bed must be in an assigned ward, and allowed by access type
+    const bd = await db.prepare("SELECT bd.ward_id, bd.bed_name FROM bed_details bd WHERE bd.id=?").get(bedId);
+    if (!bd)
+        return false;
+    const asgn = assignments.find(a => a.ward_id === bd.ward_id);
+    if (!asgn)
+        return false;
+    if (asgn.access_type === "FULL")
+        return true;
+    let allowed = [];
+    try {
+        allowed = JSON.parse(asgn.bed_names || "[]");
+    }
+    catch { /* ignore */ }
+    return allowed.includes(bd.bed_name);
+}
 const router = Router();
 router.use(authRequired, requireRole("NURSE"));
-async function myStation(req) {
-    const station = req.user?.nursing_station;
-    if (!station)
+/** Resolve the nurse's current station directly from DB — always fresh, no JWT dependency. */
+async function getMyStation(req) {
+    const userId = req.user?.id;
+    if (!userId)
+        throw new HttpError(401, "Not authenticated");
+    const ns = await db.prepare(`SELECT ns.id, ns.name
+     FROM users u JOIN nursing_stations ns ON ns.id = u.station_id
+     WHERE u.id = ?`).get(userId);
+    if (!ns)
         throw new HttpError(400, "No nursing station assigned to your account. Contact your manager.");
-    return station;
+    return ns;
 }
+const BED_ORDER_SQL = `
+  ORDER BY
+    substring(bed_name from '^[^0-9]*') ASC,
+    NULLIF(substring(bed_name from '[0-9]+'), '')::bigint NULLS LAST,
+    bed_name ASC`;
 router.get("/me", asyncH(async (req, res) => {
-    const station = await myStation(req);
+    const station = await getMyStation(req);
+    const assignments = await getNurseAssignments(req.user.id);
+    if (assignments.length > 0) {
+        const wardRows = await db.prepare(`
+      SELECT w.id, w.name, w.station_id, w.unit_type, w.room_type, w.total_beds,
+             b.vacant, b.reserved, b.occupied,
+             bb.name AS block_name, bb.label AS block_label,
+             f.name AS floor_name
+      FROM wards w
+      LEFT JOIN beds b ON b.ward_id = w.id
+      LEFT JOIN floors f ON f.id = w.floor_id
+      LEFT JOIN building_blocks bb ON bb.id = f.building_block_id
+      WHERE w.id = ANY(?) AND w.operational = true
+      ORDER BY bb.sort_order NULLS LAST, bb.name NULLS LAST, f.sort_order NULLS LAST, w.name
+    `).all(assignments.map(a => a.ward_id));
+        // For BEDS-type access, exclude wards where no beds are assigned
+        const filtered = wardRows.filter(w => {
+            const asgn = assignments.find(a => a.ward_id === w.id);
+            if (asgn.access_type !== "BEDS")
+                return true;
+            let allowed = [];
+            try {
+                allowed = JSON.parse(asgn.bed_names || "[]");
+            }
+            catch { /* ignore */ }
+            return allowed.length > 0;
+        });
+        return res.json({ nursing_station: station.name, station_id: station.id, wards: filtered });
+    }
+    // Station-based fallback (no assignments configured)
     const wards = await db.prepare(`
-    SELECT w.id, w.name, w.nursing_station, w.unit_type, w.room_type,
-           b.name AS block_name, b.label AS block_label
+    SELECT w.id, w.name, w.station_id, w.unit_type, w.room_type, w.total_beds,
+           b.vacant, b.reserved, b.occupied,
+           bb.name AS block_name, bb.label AS block_label,
+           f.name AS floor_name
     FROM wards w
-    JOIN blocks b ON b.id = w.block_id
-    WHERE w.nursing_station = ?
-    ORDER BY b.sort_order, b.name, w.name
-  `).all(station);
-    const wardsWithBeds = await Promise.all(wards.map(async (w) => {
-        const beds = await db.prepare(`
-      SELECT id, bed_name, physical_status, reservation_status, bed_type, operational_status
-      FROM bed_details
-      WHERE ward_id = ?
-      ORDER BY
-        substring(bed_name from '^[^0-9]*') ASC,
-        NULLIF(substring(bed_name from '[0-9]+'), '')::bigint NULLS LAST,
-        bed_name ASC
-    `).all(w.id);
-        return { ...w, beds };
-    }));
-    res.json({ nursing_station: station, wards: wardsWithBeds });
+    LEFT JOIN beds b ON b.ward_id = w.id
+    JOIN floors f ON f.id = w.floor_id
+    JOIN building_blocks bb ON bb.id = f.building_block_id
+    WHERE w.station_id = ? AND w.operational = true
+    ORDER BY bb.sort_order, bb.name, f.sort_order, w.name
+  `).all(station.id);
+    res.json({ nursing_station: station.name, station_id: station.id, wards });
 }));
 router.get("/wards/:id/beds", asyncH(async (req, res) => {
-    const station = await myStation(req);
+    const station = await getMyStation(req);
     const wardId = Number(req.params.id);
-    const ward = await db.prepare("SELECT id FROM wards WHERE id=? AND nursing_station=?")
-        .get(wardId, station);
-    if (!ward)
-        throw new HttpError(403, "Ward not in your nursing station");
+    const assignments = await getNurseAssignments(req.user.id);
     const physicalStatus = req.query.physical_status;
     const reservationStatus = req.query.reservation_status;
+    if (assignments.length > 0) {
+        const asgn = assignments.find(a => a.ward_id === wardId);
+        if (!asgn)
+            throw new HttpError(403, "Ward not in your assignments");
+        const allBeds = await listBeds(wardId, physicalStatus, reservationStatus);
+        if (asgn.access_type === "BEDS") {
+            let allowed = [];
+            try {
+                allowed = JSON.parse(asgn.bed_names || "[]");
+            }
+            catch { /* ignore */ }
+            const allowedSet = new Set(allowed);
+            return res.json({ beds: allBeds.filter(b => allowedSet.has(b.bed_name)) });
+        }
+        return res.json({ beds: allBeds });
+    }
+    const ward = await db.prepare("SELECT id FROM wards WHERE id=? AND station_id=?")
+        .get(wardId, station.id);
+    if (!ward)
+        throw new HttpError(403, "Ward not in your nursing station");
     res.json({ beds: await listBeds(wardId, physicalStatus, reservationStatus) });
 }));
+router.get("/payer-types", asyncH(async (_req, res) => {
+    res.json({ payerTypes: await listPayerTypes(true) });
+}));
 router.patch("/beds/:id/status", asyncH(async (req, res) => {
-    const station = await myStation(req);
+    const station = await getMyStation(req);
     const bedId = Number(req.params.id);
-    const { physical_status, reservation_status } = z.object({
+    const { physical_status, reservation_status, payer_type } = z.object({
         physical_status: z.enum(["VACANT", "OCCUPIED"]),
         reservation_status: z.enum(["NONE", "RESERVED"]),
+        payer_type: z.string().max(100).nullable().optional(),
     }).parse(req.body);
-    const owns = await db.prepare(`
-    SELECT bd.id FROM bed_details bd
-    JOIN wards w ON w.id = bd.ward_id
-    WHERE bd.id = ? AND w.nursing_station = ?
-  `).get(bedId, station);
-    if (!owns)
-        throw new HttpError(403, "Bed not in your nursing station");
+    const allowed = await canNurseAccessBed(req.user.id, bedId, station.id);
+    if (!allowed)
+        throw new HttpError(403, "You do not have access to this bed");
     const result = await updateBedStatus({
         bedId, physicalStatus: physical_status, reservationStatus: reservation_status,
-        userId: req.user.id,
+        payerType: payer_type, userId: req.user.id,
     });
-    emitUpdate("bed:update", { station }, station);
+    const preBlockRow = await db.prepare("SELECT pre_block_id FROM pre_block_wards WHERE ward_id=?").get(result.ward_id);
+    emitUpdate("bed:update", {
+        bedId, wardId: result.ward_id, stationId: station.id,
+        physicalStatus: physical_status, reservationStatus: reservation_status,
+        payerType: result.payer_type,
+    }, {
+        stationId: station.id,
+        pre: preBlockRow ? String(preBlockRow.pre_block_id) : undefined,
+    });
     res.json(result);
 }));
 export default router;

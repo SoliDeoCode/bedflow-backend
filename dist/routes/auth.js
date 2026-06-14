@@ -1,16 +1,27 @@
 import { Router } from "express";
-import { z } from "zod";
+import { z, ZodError } from "zod";
 import { login } from "../services/authService.js";
-import { asyncH } from "../middleware/error.js";
+import { asyncH, HttpError } from "../middleware/error.js";
 import { audit } from "../services/auditService.js";
 const router = Router();
 const loginSchema = z.object({
-    username: z.string().min(1),
-    password: z.string().min(1),
+    username: z.string().min(1, "Please enter your username."),
+    password: z.string().min(1, "Please enter your password."),
     role: z.enum(["PRE", "MANAGER", "COO", "NURSE"]).optional(),
 });
 router.post("/login", asyncH(async (req, res) => {
-    const { username, password, role } = loginSchema.parse(req.body);
+    let body;
+    try {
+        body = loginSchema.parse(req.body);
+    }
+    catch (e) {
+        if (e instanceof ZodError) {
+            const msg = e.errors[0]?.message ?? "Please fill in all fields.";
+            throw new HttpError(400, msg);
+        }
+        throw e;
+    }
+    const { username, password, role } = body;
     try {
         const result = await login(username, password, role);
         await audit(result.user.id, "login", "user", { username });

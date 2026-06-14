@@ -37,7 +37,7 @@ export const db = {
                 const result = await getClient().query(pgSql, params);
                 return {
                     changes: result.rowCount ?? 0,
-                    lastInsertRowid: result.rows[0]?.id ?? 0,
+                    lastInsertRowid: result.rows[0]?.id ?? null,
                 };
             },
             async get(...params) {

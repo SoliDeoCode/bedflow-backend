@@ -33,10 +33,10 @@ export async function _recalcWardTotals(wardId: number) {
 
 /** Generate beds from an explicit list of names (frontend expands patterns). */
 export async function generateBeds(opts: {
-  wardId: number; bedNames: string[]; userId: number;
+  wardId: number; bedNames: string[]; userId: number; operationalStatus?: boolean; bedType?: string; acStatus?: boolean;
 }) {
-  const ward = await db.prepare("SELECT id, bed_type, operational FROM wards WHERE id=?")
-    .get<{ id: number; bed_type: string; operational: boolean }>(opts.wardId);
+  const ward = await db.prepare("SELECT id, bed_type, operational, ac FROM wards WHERE id=?")
+    .get<{ id: number; bed_type: string; operational: boolean; ac: boolean }>(opts.wardId);
   if (!ward) throw new HttpError(404, "Ward not found");
   if (opts.bedNames.length === 0)
     throw new HttpError(400, "At least one bed name required");
@@ -45,16 +45,17 @@ export async function generateBeds(opts: {
 
   for (const n of opts.bedNames) validateBedName(n);
 
-  const bedType     = ward.bed_type    ?? "Census";
-  const operational = ward.operational ?? true;
+  const bedType     = opts.bedType ?? ward.bed_type ?? "Census";
+  const operational = opts.operationalStatus ?? ward.operational ?? true;
+  const acStatus    = opts.acStatus ?? ward.ac ?? true;
   const now = Date.now();
   let inserted = 0;
   await db.transaction(async () => {
     for (const rawName of opts.bedNames) {
       const name = rawName.trim();
       const r = await db.prepare(
-        "INSERT INTO bed_details (ward_id, bed_name, physical_status, reservation_status, bed_type, operational_status, updated_at, updated_by) VALUES (?,?,'VACANT','NONE',?,?,?,?) ON CONFLICT (ward_id, bed_name) DO NOTHING"
-      ).run(opts.wardId, name, bedType, operational, now, opts.userId);
+        "INSERT INTO bed_details (ward_id, bed_name, physical_status, reservation_status, bed_type, operational_status, ac_status, updated_at, updated_by) VALUES (?,?,'VACANT','NONE',?,?,?,?,?) ON CONFLICT (ward_id, bed_name) DO NOTHING"
+      ).run(opts.wardId, name, bedType, operational, acStatus, now, opts.userId);
       inserted += r.changes;
     }
     await _recalcWardTotals(opts.wardId);
@@ -66,28 +67,25 @@ export async function generateBeds(opts: {
 }
 
 export async function addSingleBed(opts: {
-  wardId: number; bedName: string; userId: number;
+  wardId: number; bedName: string; userId: number; operationalStatus?: boolean; bedType?: string; acStatus?: boolean;
 }) {
-  const ward = await db.prepare("SELECT id, bed_type, operational FROM wards WHERE id=?")
-    .get<{ id: number; bed_type: string; operational: boolean }>(opts.wardId);
+  const ward = await db.prepare("SELECT id, bed_type, operational, ac FROM wards WHERE id=?")
+    .get<{ id: number; bed_type: string; operational: boolean; ac: boolean }>(opts.wardId);
   if (!ward) throw new HttpError(404, "Ward not found");
 
   const trimmed     = opts.bedName.trim();
-  const bedType     = ward.bed_type    ?? "Census";
-  const operational = ward.operational ?? true;
+  const bedType     = opts.bedType ?? ward.bed_type ?? "Census";
+  const operational = opts.operationalStatus ?? ward.operational ?? true;
+  const acStatus    = opts.acStatus ?? ward.ac ?? true;
   validateBedName(trimmed);
 
   const now = Date.now();
   let newId = 0;
   await db.transaction(async () => {
-    const existing = await db.prepare(
-      "SELECT id FROM bed_details WHERE ward_id=? AND bed_name=?"
-    ).get(opts.wardId, trimmed);
-    if (existing) throw new HttpError(409, `Bed "${trimmed}" already exists in this ward`);
-
     const r = await db.prepare(
-      "INSERT INTO bed_details (ward_id, bed_name, physical_status, reservation_status, bed_type, operational_status, updated_at, updated_by) VALUES (?,?,'VACANT','NONE',?,?,?,?) RETURNING id"
-    ).run(opts.wardId, trimmed, bedType, operational, now, opts.userId);
+      "INSERT INTO bed_details (ward_id, bed_name, physical_status, reservation_status, bed_type, operational_status, ac_status, updated_at, updated_by) VALUES (?,?,'VACANT','NONE',?,?,?,?,?) ON CONFLICT (ward_id, bed_name) DO NOTHING RETURNING id"
+    ).run(opts.wardId, trimmed, bedType, operational, acStatus, now, opts.userId);
+    if (r.changes === 0) throw new HttpError(409, `Bed "${trimmed}" already exists in this ward`);
     newId = Number(r.lastInsertRowid);
     await _recalcWardTotals(opts.wardId);
   });
@@ -99,13 +97,14 @@ export async function addSingleBed(opts: {
 export interface BedDetail {
   id: number; ward_id: number; bed_name: string;
   physical_status: string; reservation_status: string;
-  bed_type: string; operational_status: boolean;
+  bed_type: string; operational_status: boolean; ac_status: boolean;
+  payer_type: string | null;
   updated_at: number; updated_by: number | null;
 }
 
 export async function listBeds(wardId: number, physicalStatus?: string, reservationStatus?: string): Promise<BedDetail[]> {
   let sql = `SELECT id, ward_id, bed_name, physical_status, reservation_status,
-                    bed_type, operational_status, updated_at, updated_by
+                    bed_type, operational_status, ac_status, payer_type, updated_at, updated_by
              FROM bed_details WHERE ward_id=?`;
   const params: unknown[] = [wardId];
   if (physicalStatus) {
@@ -153,7 +152,7 @@ export async function renameBed(opts: {
 }
 
 export async function updateBedMaster(opts: {
-  bedId: number; bedType?: string; operationalStatus?: boolean; userId: number;
+  bedId: number; bedType?: string; operationalStatus?: boolean; acStatus?: boolean; userId: number;
 }) {
   const bed = await db.prepare(
     "SELECT id, ward_id FROM bed_details WHERE id=?"
@@ -172,9 +171,13 @@ export async function updateBedMaster(opts: {
     await db.prepare("UPDATE bed_details SET operational_status=?, updated_at=? WHERE id=?")
       .run(opts.operationalStatus, now, opts.bedId);
   }
+  if (opts.acStatus !== undefined) {
+    await db.prepare("UPDATE bed_details SET ac_status=?, updated_at=? WHERE id=?")
+      .run(opts.acStatus, now, opts.bedId);
+  }
 
   await audit(opts.userId, "bed_master_edit", String(opts.bedId),
-    { bedType: opts.bedType, operationalStatus: opts.operationalStatus });
+    { bedType: opts.bedType, operationalStatus: opts.operationalStatus, acStatus: opts.acStatus });
   return { ok: true };
 }
 
@@ -195,11 +198,12 @@ export async function deleteBed(opts: { bedId: number; userId: number }) {
 }
 
 export async function updateBedStatus(opts: {
-  bedId: number; physicalStatus: string; reservationStatus: string; userId: number;
+  bedId: number; physicalStatus: string; reservationStatus: string;
+  payerType?: string | null; userId: number;
 }) {
   const bed = await db.prepare(
-    "SELECT id, ward_id, physical_status, reservation_status FROM bed_details WHERE id=?"
-  ).get<{ id: number; ward_id: number; physical_status: string; reservation_status: string }>(opts.bedId);
+    "SELECT id, ward_id, physical_status, reservation_status, payer_type, updated_at FROM bed_details WHERE id=?"
+  ).get<{ id: number; ward_id: number; physical_status: string; reservation_status: string; payer_type: string | null; updated_at: number }>(opts.bedId);
   if (!bed) throw new HttpError(404, "Bed not found");
 
   if (!["VACANT", "OCCUPIED"].includes(opts.physicalStatus))
@@ -207,24 +211,41 @@ export async function updateBedStatus(opts: {
   if (!["NONE", "RESERVED"].includes(opts.reservationStatus))
     throw new HttpError(400, "Invalid reservation_status");
 
-  if (bed.physical_status === opts.physicalStatus && bed.reservation_status === opts.reservationStatus)
-    return { ok: true, physical_status: opts.physicalStatus, reservation_status: opts.reservationStatus };
+  // Determine new payer_type:
+  // - Going VACANT (any reservation): always clear to NULL
+  // - Going OCCUPIED: use provided payerType, fall back to existing if not provided
+  // - Going OCCUPIED+RESERVED (same patient to OT): keep existing unless explicitly changed
+  let newPayerType: string | null;
+  if (opts.physicalStatus === "VACANT") {
+    newPayerType = null;
+  } else {
+    // OCCUPIED or OCCUPIED+RESERVED
+    newPayerType = opts.payerType !== undefined ? (opts.payerType ?? null) : bed.payer_type;
+  }
+
+  const noStatusChange = bed.physical_status === opts.physicalStatus && bed.reservation_status === opts.reservationStatus;
+  const noPayerChange  = (newPayerType ?? null) === (bed.payer_type ?? null);
+  if (noStatusChange && noPayerChange)
+    return { ok: true, ward_id: bed.ward_id, physical_status: opts.physicalStatus, reservation_status: opts.reservationStatus, payer_type: newPayerType };
 
   const now = Date.now();
   await db.transaction(async () => {
+    // Optimistic lock: only update if nobody changed the row since we read it.
+    const r = await db.prepare(
+      "UPDATE bed_details SET physical_status=?, reservation_status=?, payer_type=?, updated_at=?, updated_by=? WHERE id=? AND updated_at=?"
+    ).run(opts.physicalStatus, opts.reservationStatus, newPayerType, now, opts.userId, opts.bedId, bed.updated_at);
+    if (r.changes === 0)
+      throw new HttpError(409, "This bed was just updated by someone else. Refresh to see the latest status.");
     await db.prepare(
-      "UPDATE bed_details SET physical_status=?, reservation_status=?, updated_at=?, updated_by=? WHERE id=?"
-    ).run(opts.physicalStatus, opts.reservationStatus, now, opts.userId, opts.bedId);
-    await db.prepare(
-      "INSERT INTO bed_movements (bed_id, old_physical, new_physical, old_reservation, new_reservation, changed_by, changed_at) VALUES (?,?,?,?,?,?,?)"
-    ).run(opts.bedId, bed.physical_status, opts.physicalStatus, bed.reservation_status, opts.reservationStatus, opts.userId, now);
+      "INSERT INTO bed_movements (bed_id, old_physical, new_physical, old_reservation, new_reservation, payer_type, changed_by, changed_at) VALUES (?,?,?,?,?,?,?,?)"
+    ).run(opts.bedId, bed.physical_status, opts.physicalStatus, bed.reservation_status, opts.reservationStatus, newPayerType, opts.userId, now);
     await _recalcWardTotals(bed.ward_id);
   });
 
   await audit(opts.userId, "bed_status_update", String(opts.bedId), {
-    old: { physical: bed.physical_status, reservation: bed.reservation_status },
-    new: { physical: opts.physicalStatus, reservation: opts.reservationStatus },
+    old: { physical: bed.physical_status, reservation: bed.reservation_status, payer: bed.payer_type },
+    new: { physical: opts.physicalStatus,  reservation: opts.reservationStatus,  payer: newPayerType },
     wardId: bed.ward_id,
   });
-  return { ok: true, physical_status: opts.physicalStatus, reservation_status: opts.reservationStatus };
+  return { ok: true, ward_id: bed.ward_id, physical_status: opts.physicalStatus, reservation_status: opts.reservationStatus, payer_type: newPayerType };
 }
