@@ -219,8 +219,8 @@ export async function editWard(opts: {
   stationId?: number | null; unitType?: string | null; roomType?: string | null;
   bedType?: string | null; operational?: boolean | null;
 }) {
-  const ward = await db.prepare("SELECT id, floor_id FROM wards WHERE id=?")
-    .get<{ id: number; floor_id: number }>(opts.wardId);
+  const ward = await db.prepare("SELECT id, floor_id, operational FROM wards WHERE id=?")
+    .get<{ id: number; floor_id: number; operational: boolean }>(opts.wardId);
   if (!ward) throw new HttpError(404, "Ward not found");
   const t = now();
 
@@ -264,9 +264,14 @@ export async function editWard(opts: {
     if (opts.bedType != null)
       await db.prepare("UPDATE wards SET bed_type=?, updated_at=? WHERE id=?")
         .run(opts.bedType, t, opts.wardId);
-    if (opts.operational != null)
+    if (opts.operational != null) {
       await db.prepare("UPDATE wards SET operational=?, updated_at=? WHERE id=?")
         .run(opts.operational, t, opts.wardId);
+      await db.prepare(
+        `INSERT INTO ward_operational_log (ward_id, changed_by, changed_at, old_value, new_value)
+         VALUES (?,?,?,?,?)`
+      ).run(opts.wardId, opts.managerId, t, ward.operational, opts.operational);
+    }
   });
 
   const floorName = ward.floor_id

@@ -172,8 +172,8 @@ export async function updateBedMaster(opts: {
   bedId: number; bedType?: string; operationalStatus?: boolean; acStatus?: boolean; userId: number;
 }) {
   const bed = await db.prepare(
-    "SELECT id, ward_id FROM bed_details WHERE id=?"
-  ).get<{ id: number; ward_id: number }>(opts.bedId);
+    "SELECT id, ward_id, operational_status FROM bed_details WHERE id=?"
+  ).get<{ id: number; ward_id: number; operational_status: boolean }>(opts.bedId);
   if (!bed) throw new HttpError(404, "Bed not found");
 
   const now = Date.now();
@@ -187,6 +187,10 @@ export async function updateBedMaster(opts: {
   if (opts.operationalStatus !== undefined) {
     await db.prepare("UPDATE bed_details SET operational_status=?, updated_at=? WHERE id=?")
       .run(opts.operationalStatus, now, opts.bedId);
+    await db.prepare(
+      `INSERT INTO bed_operational_log (bed_id, ward_id, changed_by, changed_at, old_value, new_value, forced_vacant)
+       VALUES (?,?,?,?,?,?,?)`
+    ).run(opts.bedId, bed.ward_id, opts.userId, now, bed.operational_status, opts.operationalStatus, false);
   }
   if (opts.acStatus !== undefined) {
     await db.prepare("UPDATE bed_details SET ac_status=?, updated_at=? WHERE id=?")
