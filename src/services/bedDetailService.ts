@@ -205,6 +205,16 @@ export async function deleteBed(opts: { bedId: number; userId: number }) {
   if (!bed) throw new HttpError(404, "Bed not found");
 
   await db.transaction(async () => {
+    // Tombstone before DELETE — bed_id becomes NULL via SET NULL FK after row is gone,
+    // but bed_name/ward_id remain so history stays queryable.
+    await db.prepare(
+      `INSERT INTO bed_movements
+         (bed_id, bed_name, ward_id, old_physical, new_physical, old_reservation, new_reservation, payer_type, changed_by, changed_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?)`
+    ).run(opts.bedId, bed.bed_name, bed.ward_id,
+          bed.physical_status, "DELETED",
+          bed.reservation_status, "DELETED",
+          bed.payer_type, opts.userId, Date.now());
     await db.prepare("DELETE FROM bed_details WHERE id=?").run(opts.bedId);
     await _recalcWardTotals(bed.ward_id);
   });
@@ -226,14 +236,14 @@ export async function updateBedStatus(opts: {
   payerType?: string | null; userId: number;
 }) {
   const bed = await db.prepare(
-    `SELECT bd.id, bd.ward_id, bd.physical_status, bd.reservation_status,
+    `SELECT bd.id, bd.ward_id, bd.bed_name, bd.physical_status, bd.reservation_status,
             bd.payer_type, bd.updated_at, bd.operational_status,
             w.operational AS ward_operational
      FROM bed_details bd
      JOIN wards w ON w.id = bd.ward_id
      WHERE bd.id = ?`
   ).get<{
-    id: number; ward_id: number; physical_status: string; reservation_status: string;
+    id: number; ward_id: number; bed_name: string; physical_status: string; reservation_status: string;
     payer_type: string | null; updated_at: number;
     operational_status: boolean; ward_operational: boolean;
   }>(opts.bedId);
@@ -275,8 +285,13 @@ export async function updateBedStatus(opts: {
     if (r.changes === 0)
       throw new HttpError(409, "This bed was just updated by someone else. Refresh to see the latest status.");
     await db.prepare(
-      "INSERT INTO bed_movements (bed_id, old_physical, new_physical, old_reservation, new_reservation, payer_type, changed_by, changed_at) VALUES (?,?,?,?,?,?,?,?)"
-    ).run(opts.bedId, bed.physical_status, opts.physicalStatus, bed.reservation_status, opts.reservationStatus, newPayerType, opts.userId, now);
+      `INSERT INTO bed_movements
+         (bed_id, bed_name, ward_id, old_physical, new_physical, old_reservation, new_reservation, payer_type, changed_by, changed_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?)`
+    ).run(opts.bedId, bed.bed_name, bed.ward_id,
+          bed.physical_status, opts.physicalStatus,
+          bed.reservation_status, opts.reservationStatus,
+          newPayerType, opts.userId, now);
     await _recalcWardTotals(bed.ward_id);
   });
 
