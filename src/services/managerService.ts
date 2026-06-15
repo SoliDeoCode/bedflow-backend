@@ -196,7 +196,7 @@ export async function createWard(opts: {
             opts.stationId ?? null, opts.unitType?.trim() || null,
             opts.roomType?.trim() || null, bedType, operational, t, t);
       wardId = Number(r.lastInsertRowid);
-      await db.prepare("INSERT INTO beds (ward_id, total) VALUES (?,?)").run(wardId, total);
+      await db.prepare("INSERT INTO beds (ward_id, total, vacant, reserved, occupied, occupied_reserved) VALUES (?,?,?,0,0,0)").run(wardId, total, total);
       if (total > 0) {
         const placeholders = Array.from({ length: total }, () => "(?,?,'VACANT','NONE',?,?,?,?)").join(",");
         const values: unknown[] = [];
