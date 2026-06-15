@@ -77,13 +77,17 @@ router.get("/me", asyncH(async (req, res) => {
       ORDER BY bb.sort_order NULLS LAST, bb.name NULLS LAST, f.sort_order NULLS LAST, w.name
     `).all(assignments.map(a => a.ward_id)) as Array<Record<string, unknown>>;
 
-    // For BEDS-type access, exclude wards where no beds are assigned
-    const filtered = wardRows.filter(w => {
+    // For BEDS-type access, mark wards where bed_names is empty rather than
+    // silently dropping them — nurse sees the card with a warning instead of
+    // the ward disappearing with no explanation.
+    const filtered = wardRows.map(w => {
       const asgn = assignments.find(a => a.ward_id === w.id)!;
-      if (asgn.access_type !== "BEDS") return true;
+      if (asgn.access_type !== "BEDS") return w;
       let allowed: string[] = [];
       try { allowed = JSON.parse(asgn.bed_names || "[]"); } catch { /* ignore */ }
-      return allowed.length > 0;
+      if (allowed.length === 0)
+        return { ...w, beds_warning: "No beds assigned to your account for this ward. Contact your manager." };
+      return w;
     });
 
     return res.json({ nursing_station: station.name, station_id: station.id, wards: filtered });
