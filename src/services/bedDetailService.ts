@@ -21,14 +21,25 @@ export async function _recalcWardTotals(wardId: number) {
     FROM bed_details WHERE ward_id = ?
   `).get<{ total: number; vacant: number; reserved: number; occupied: number; occupied_reserved: number }>(wardId);
   if (!counts) return;
-  const total = Math.max(0, counts.total || 0);
+  const total  = Math.max(0, counts.total || 0);
+  const vacant = counts.vacant || 0;
+  const reserved = counts.reserved || 0;
+  const occupied = counts.occupied || 0;
+  const occupiedReserved = counts.occupied_reserved || 0;
   const now = Date.now();
-  await db.prepare(
-    "UPDATE beds SET total=?, vacant=?, reserved=?, occupied=?, occupied_reserved=?, updated_at=? WHERE ward_id=?"
-  ).run(total, counts.vacant || 0, counts.reserved || 0, counts.occupied || 0, counts.occupied_reserved || 0, now, wardId);
-  await db.prepare(
-    "UPDATE wards SET total_beds=?, updated_at=? WHERE id=?"
-  ).run(total, now, wardId);
+  // UPSERT: creates the beds row if it was never inserted (e.g. ward added via
+  // migration or direct SQL), preventing the silent no-op of a plain UPDATE.
+  await db.prepare(`
+    INSERT INTO beds (ward_id, total, vacant, reserved, occupied, occupied_reserved, updated_at)
+    VALUES (?,?,?,?,?,?,?)
+    ON CONFLICT (ward_id) DO UPDATE SET
+      total             = EXCLUDED.total,
+      vacant            = EXCLUDED.vacant,
+      reserved          = EXCLUDED.reserved,
+      occupied          = EXCLUDED.occupied,
+      occupied_reserved = EXCLUDED.occupied_reserved,
+      updated_at        = EXCLUDED.updated_at
+  `).run(wardId, total, vacant, reserved, occupied, occupiedReserved, now);
 }
 
 /** Generate beds from an explicit list of names (frontend expands patterns). */
