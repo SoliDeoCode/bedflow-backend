@@ -102,11 +102,17 @@ export interface BedDetail {
   updated_at: number; updated_by: number | null;
 }
 
-export async function listBeds(wardId: number, physicalStatus?: string, reservationStatus?: string): Promise<BedDetail[]> {
+export async function listBeds(
+  wardId: number,
+  physicalStatus?: string,
+  reservationStatus?: string,
+  operationalOnly = false,
+): Promise<BedDetail[]> {
   let sql = `SELECT id, ward_id, bed_name, physical_status, reservation_status,
                     bed_type, operational_status, ac_status, payer_type, updated_at, updated_by
              FROM bed_details WHERE ward_id=?`;
   const params: unknown[] = [wardId];
+  if (operationalOnly) sql += " AND operational_status = true";
   if (physicalStatus) {
     if (!["VACANT", "OCCUPIED"].includes(physicalStatus.toUpperCase()))
       throw new HttpError(400, "Invalid physical_status filter");
@@ -209,9 +215,23 @@ export async function updateBedStatus(opts: {
   payerType?: string | null; userId: number;
 }) {
   const bed = await db.prepare(
-    "SELECT id, ward_id, physical_status, reservation_status, payer_type, updated_at FROM bed_details WHERE id=?"
-  ).get<{ id: number; ward_id: number; physical_status: string; reservation_status: string; payer_type: string | null; updated_at: number }>(opts.bedId);
+    `SELECT bd.id, bd.ward_id, bd.physical_status, bd.reservation_status,
+            bd.payer_type, bd.updated_at, bd.operational_status,
+            w.operational AS ward_operational
+     FROM bed_details bd
+     JOIN wards w ON w.id = bd.ward_id
+     WHERE bd.id = ?`
+  ).get<{
+    id: number; ward_id: number; physical_status: string; reservation_status: string;
+    payer_type: string | null; updated_at: number;
+    operational_status: boolean; ward_operational: boolean;
+  }>(opts.bedId);
   if (!bed) throw new HttpError(404, "Bed not found");
+
+  if (!bed.ward_operational)
+    throw new HttpError(409, "This ward is currently non-operational. Contact your manager.");
+  if (!bed.operational_status)
+    throw new HttpError(409, "This bed is non-operational. Contact your manager.");
 
   if (!["VACANT", "OCCUPIED"].includes(opts.physicalStatus))
     throw new HttpError(400, "Invalid physical_status");

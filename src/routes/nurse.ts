@@ -117,7 +117,7 @@ router.get("/wards/:id/beds", asyncH(async (req, res) => {
     const asgn = assignments.find(a => a.ward_id === wardId);
     if (!asgn) throw new HttpError(403, "Ward not in your assignments");
 
-    const allBeds = await listBeds(wardId, physicalStatus, reservationStatus);
+    const allBeds = await listBeds(wardId, physicalStatus, reservationStatus, true);
     if (asgn.access_type === "BEDS") {
       let allowed: string[] = [];
       try { allowed = JSON.parse(asgn.bed_names || "[]"); } catch { /* ignore */ }
@@ -130,7 +130,7 @@ router.get("/wards/:id/beds", asyncH(async (req, res) => {
   const ward = await db.prepare("SELECT id FROM wards WHERE id=? AND station_id=?")
     .get(wardId, station.id);
   if (!ward) throw new HttpError(403, "Ward not in your nursing station");
-  res.json({ beds: await listBeds(wardId, physicalStatus, reservationStatus) });
+  res.json({ beds: await listBeds(wardId, physicalStatus, reservationStatus, true) });
 }));
 
 router.get("/payer-types", asyncH(async (_req, res) => {
