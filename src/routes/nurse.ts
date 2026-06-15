@@ -73,7 +73,7 @@ router.get("/me", asyncH(async (req, res) => {
       LEFT JOIN beds b ON b.ward_id = w.id
       LEFT JOIN floors f ON f.id = w.floor_id
       LEFT JOIN building_blocks bb ON bb.id = f.building_block_id
-      WHERE w.id = ANY(?) AND w.operational = true
+      WHERE w.id = ANY(?)
       ORDER BY bb.sort_order NULLS LAST, bb.name NULLS LAST, f.sort_order NULLS LAST, w.name
     `).all(assignments.map(a => a.ward_id)) as Array<Record<string, unknown>>;
 
@@ -103,7 +103,7 @@ router.get("/me", asyncH(async (req, res) => {
     LEFT JOIN beds b ON b.ward_id = w.id
     JOIN floors f ON f.id = w.floor_id
     JOIN building_blocks bb ON bb.id = f.building_block_id
-    WHERE w.station_id = ? AND w.operational = true
+    WHERE w.station_id = ? ORDER BY w.operational DESC, w.name
     ORDER BY bb.sort_order, bb.name, f.sort_order, w.name
   `).all(station.id);
 
@@ -121,7 +121,7 @@ router.get("/wards/:id/beds", asyncH(async (req, res) => {
     const asgn = assignments.find(a => a.ward_id === wardId);
     if (!asgn) throw new HttpError(403, "Ward not in your assignments");
 
-    const allBeds = await listBeds(wardId, physicalStatus, reservationStatus, true);
+    const allBeds = await listBeds(wardId, physicalStatus, reservationStatus, false);
     if (asgn.access_type === "BEDS") {
       let allowed: string[] = [];
       try { allowed = JSON.parse(asgn.bed_names || "[]"); } catch { /* ignore */ }
@@ -134,7 +134,7 @@ router.get("/wards/:id/beds", asyncH(async (req, res) => {
   const ward = await db.prepare("SELECT id FROM wards WHERE id=? AND station_id=?")
     .get(wardId, station.id);
   if (!ward) throw new HttpError(403, "Ward not in your nursing station");
-  res.json({ beds: await listBeds(wardId, physicalStatus, reservationStatus, true) });
+  res.json({ beds: await listBeds(wardId, physicalStatus, reservationStatus, false) });
 }));
 
 router.get("/payer-types", asyncH(async (_req, res) => {

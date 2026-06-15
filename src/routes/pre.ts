@@ -86,7 +86,7 @@ router.get("/wards/:id/beds", asyncH(async (req, res) => {
     throw new HttpError(403, "Ward not in your PRE Block");
   const physicalStatus    = req.query.physical_status    as string | undefined;
   const reservationStatus = req.query.reservation_status as string | undefined;
-  res.json({ beds: await listBeds(wardId, physicalStatus, reservationStatus, true) });
+  res.json({ beds: await listBeds(wardId, physicalStatus, reservationStatus, false) });
 }));
 
 router.get("/payer-types", asyncH(async (_req, res) => {

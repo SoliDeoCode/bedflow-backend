@@ -11,6 +11,7 @@ export interface WardView {
   unit_type: string | null;
   station_id: number | null;
   nursing_station: string | null;
+  operational: boolean;
 }
 
 export interface PreSummary {
@@ -29,18 +30,20 @@ export async function wardsForFloor(floorId: number): Promise<WardView[]> {
 
 export async function wardsForPreBlock(preBlockId: number): Promise<WardView[]> {
   return db.prepare(
-    `SELECT w.id, w.name AS ward, w.total_beds AS total, w.unit_type,
+    `SELECT w.id, w.name AS ward, w.total_beds AS total, w.unit_type, w.operational,
             b.vacant, b.reserved, b.occupied, b.occupied_reserved, b.updated_at AS "updatedAt"
      FROM pre_block_wards pbw
      JOIN wards w ON w.id = pbw.ward_id
      JOIN beds  b ON b.ward_id = w.id
-     WHERE pbw.pre_block_id = ? AND w.operational = true ORDER BY w.name`
+     WHERE pbw.pre_block_id = ? ORDER BY w.operational DESC, w.name`
   ).all<WardView>(preBlockId);
 }
 
 export function summarize(wards: WardView[]): PreSummary {
   let v = 0, r = 0, o = 0, or_ = 0, total = 0, wardsDone = 0;
-  for (const w of wards) {
+  // Non-operational wards are shown to PRE but excluded from round counts
+  const opWards = wards.filter(w => w.operational !== false);
+  for (const w of opWards) {
     total += w.total;
     if (w.vacant !== null) {
       wardsDone++;
@@ -50,8 +53,8 @@ export function summarize(wards: WardView[]): PreSummary {
       or_ += w.occupied_reserved || 0;
     }
   }
-  return { v, r, o, or: or_, total, wards: wards.length, wardsDone,
-           complete: wards.length > 0 && wardsDone === wards.length };
+  return { v, r, o, or: or_, total, wards: opWards.length, wardsDone,
+           complete: opWards.length > 0 && wardsDone === opWards.length };
 }
 
 export async function updateWard(
