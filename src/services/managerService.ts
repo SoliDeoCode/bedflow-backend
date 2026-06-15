@@ -224,6 +224,17 @@ export async function editWard(opts: {
   if (!ward) throw new HttpError(404, "Ward not found");
   const t = now();
 
+  // Prevent marking a ward non-operational while it belongs to an active PRE block
+  if (opts.operational === false) {
+    const inBlock = await db.prepare(
+      `SELECT pb.name FROM pre_block_wards pbw
+       JOIN pre_blocks pb ON pb.id = pbw.pre_block_id
+       WHERE pbw.ward_id = ?`
+    ).get<{ name: string }>(opts.wardId);
+    if (inBlock)
+      throw new HttpError(409, `Remove this ward from PRE Block "${inBlock.name}" before marking it non-operational.`);
+  }
+
   // Validate totalBeds before entering the transaction so other fields aren't silently skipped
   if (opts.totalBeds !== undefined) {
     const actual = (await db.prepare("SELECT COUNT(*) AS c FROM bed_details WHERE ward_id=?")

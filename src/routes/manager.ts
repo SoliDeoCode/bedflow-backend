@@ -3,6 +3,7 @@ import { z } from "zod";
 import { authRequired, requireRole } from "../middleware/auth.js";
 import { asyncH, HttpError } from "../middleware/error.js";
 import { db } from "../db/index.js";
+import { emitUpdate } from "../websocket/io.js";
 import {
   listBuildingBlocks, createBuildingBlock, editBuildingBlock, deleteBuildingBlock,
   listFloors, createFloor, editFloor, deleteFloor,
@@ -161,7 +162,17 @@ router.put("/wards/:id", asyncH(async (req, res) => {
     bedType:     z.enum(["Census", "Non-Census"]).nullable().optional(),
     operational: z.boolean().nullable().optional(),
   }).parse(req.body);
-  res.json(await editWard({ wardId: Number(req.params.id), ...b, managerId: req.user!.id }));
+  const wardId = Number(req.params.id);
+  const result = await editWard({ wardId, ...b, managerId: req.user!.id });
+  if (b.operational != null) {
+    const blocks = await db.prepare(
+      "SELECT pre_block_id FROM pre_block_wards WHERE ward_id=?"
+    ).all<{ pre_block_id: number }>(wardId);
+    emitUpdate("ward:operational", { wardId, operational: b.operational }, {
+      pre: blocks.map(r => String(r.pre_block_id)),
+    });
+  }
+  res.json(result);
 }));
 
 router.delete("/wards/:id", asyncH(async (req, res) => {

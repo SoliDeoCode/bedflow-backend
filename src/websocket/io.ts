@@ -36,15 +36,18 @@ export function initWebsocket(server: HttpServer) {
 }
 
 // Broadcast a bed/round change so dashboards refresh live.
-// opts.pre  → also emit to PRE block room `pre:<code>`
-// opts.stationId → also emit to nurse station room `station:<id>`
+// opts.pre      → emit to one or more PRE block rooms `pre:<id>`
+// opts.stationId → emit to nurse station room `station:<id>`
 export function emitUpdate(
   event: string,
   data: unknown,
-  opts?: { pre?: string; stationId?: number },
+  opts?: { pre?: string | string[]; stationId?: number },
 ) {
   if (!io) return;
   io.to("overview").emit(event, data);
-  if (opts?.pre)       io.to(`pre:${opts.pre}`).emit(event, data);
+  if (opts?.pre) {
+    const rooms = Array.isArray(opts.pre) ? opts.pre : [opts.pre];
+    for (const r of rooms) io.to(`pre:${r}`).emit(event, data);
+  }
   if (opts?.stationId) io.to(`station:${opts.stationId}`).emit(event, data);
 }
