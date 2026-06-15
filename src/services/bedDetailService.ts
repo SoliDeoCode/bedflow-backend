@@ -183,8 +183,8 @@ export async function updateBedMaster(opts: {
 
 export async function deleteBed(opts: { bedId: number; userId: number }) {
   const bed = await db.prepare(
-    "SELECT id, ward_id, bed_name FROM bed_details WHERE id=?"
-  ).get<{ id: number; ward_id: number; bed_name: string }>(opts.bedId);
+    "SELECT id, ward_id, bed_name, physical_status, reservation_status, payer_type FROM bed_details WHERE id=?"
+  ).get<{ id: number; ward_id: number; bed_name: string; physical_status: string; reservation_status: string; payer_type: string | null }>(opts.bedId);
   if (!bed) throw new HttpError(404, "Bed not found");
 
   await db.transaction(async () => {
@@ -192,8 +192,15 @@ export async function deleteBed(opts: { bedId: number; userId: number }) {
     await _recalcWardTotals(bed.ward_id);
   });
 
-  await audit(opts.userId, "bed_delete", String(opts.bedId),
-    { bedName: bed.bed_name, wardId: bed.ward_id });
+  await audit(opts.userId, "bed_delete", String(opts.bedId), {
+    bedName: bed.bed_name,
+    wardId: bed.ward_id,
+    lastStatus: {
+      physical: bed.physical_status,
+      reservation: bed.reservation_status,
+      payer: bed.payer_type,
+    },
+  });
   return { ok: true };
 }
 
