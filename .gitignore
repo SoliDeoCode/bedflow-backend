@@ -3,6 +3,9 @@ node_modules/
 
 # Environment secrets — set via Render dashboard, never commit
 .env
+.env.development
+.env.production
+.env.*.local
 
 # Compiled output — build fresh on each deploy/clone
 dist/

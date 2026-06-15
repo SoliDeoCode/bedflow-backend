@@ -1,4 +1,8 @@
-import "dotenv/config";
+import dotenv from "dotenv";
+// Load env-specific file first (.env.development or .env.production),
+// then fall back to .env for anything not covered.
+dotenv.config({ path: `.env.${process.env.NODE_ENV ?? "development"}` });
+dotenv.config();
 import pg from "pg";
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { Db, DbStatement } from "./adapter.js";
