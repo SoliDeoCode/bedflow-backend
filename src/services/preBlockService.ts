@@ -72,11 +72,13 @@ export async function createPreBlock(opts: {
     blockId = Number(r.lastInsertRowid);
 
     for (const wardId of opts.wardIds) {
-      const ward = await db.prepare("SELECT id, name, operational FROM wards WHERE id=?")
-        .get<{ id: number; name: string; operational: boolean }>(wardId);
+      const ward = await db.prepare("SELECT id, name, operational, total_beds FROM wards WHERE id=?")
+        .get<{ id: number; name: string; operational: boolean; total_beds: number }>(wardId);
       if (!ward) throw new HttpError(404, `Ward ${wardId} not found`);
       if (!ward.operational)
         throw new HttpError(400, `Ward "${ward.name}" is non-operational. Reactivate it before adding it to a PRE block.`);
+      if (ward.total_beds === 0)
+        throw new HttpError(400, `Ward "${ward.name}" has no beds. Add beds to this ward before assigning it to a PRE block.`);
       await db.prepare(
         "INSERT INTO pre_block_wards (pre_block_id, ward_id, created_at) VALUES (?,?,?)"
       ).run(blockId, wardId, t);
@@ -115,11 +117,13 @@ export async function editPreBlock(opts: {
     if (opts.wardIds !== undefined) {
       await db.prepare("DELETE FROM pre_block_wards WHERE pre_block_id=?").run(opts.blockId);
       for (const wardId of opts.wardIds) {
-        const ward = await db.prepare("SELECT id, name, operational FROM wards WHERE id=?")
-          .get<{ id: number; name: string; operational: boolean }>(wardId);
+        const ward = await db.prepare("SELECT id, name, operational, total_beds FROM wards WHERE id=?")
+          .get<{ id: number; name: string; operational: boolean; total_beds: number }>(wardId);
         if (!ward) throw new HttpError(404, `Ward ${wardId} not found`);
         if (!ward.operational)
           throw new HttpError(400, `Ward "${ward.name}" is non-operational. Reactivate it before adding it to a PRE block.`);
+        if (ward.total_beds === 0)
+          throw new HttpError(400, `Ward "${ward.name}" has no beds. Add beds to this ward before assigning it to a PRE block.`);
         await db.prepare(
           "INSERT INTO pre_block_wards (pre_block_id, ward_id, created_at) VALUES (?,?,?)"
         ).run(opts.blockId, wardId, t);
