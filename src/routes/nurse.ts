@@ -65,7 +65,7 @@ router.get("/me", asyncH(async (req, res) => {
 
   if (assignments.length > 0) {
     const wardRows = await db.prepare(`
-      SELECT w.id, w.name, w.station_id, w.unit_type, w.room_type, w.total_beds,
+      SELECT w.id, w.name, w.station_id, w.unit_type, w.room_type, w.total_beds, w.operational,
              b.vacant, b.reserved, b.occupied,
              bb.name AS block_name, bb.label AS block_label,
              f.name AS floor_name
@@ -95,7 +95,7 @@ router.get("/me", asyncH(async (req, res) => {
 
   // Station-based fallback (no assignments configured)
   const wards = await db.prepare(`
-    SELECT w.id, w.name, w.station_id, w.unit_type, w.room_type, w.total_beds,
+    SELECT w.id, w.name, w.station_id, w.unit_type, w.room_type, w.total_beds, w.operational,
            b.vacant, b.reserved, b.occupied,
            bb.name AS block_name, bb.label AS block_label,
            f.name AS floor_name
@@ -103,8 +103,8 @@ router.get("/me", asyncH(async (req, res) => {
     LEFT JOIN beds b ON b.ward_id = w.id
     JOIN floors f ON f.id = w.floor_id
     JOIN building_blocks bb ON bb.id = f.building_block_id
-    WHERE w.station_id = ? ORDER BY w.operational DESC, w.name
-    ORDER BY bb.sort_order, bb.name, f.sort_order, w.name
+    WHERE w.station_id = ?
+    ORDER BY w.operational DESC, bb.sort_order, bb.name, f.sort_order, w.name
   `).all(station.id);
 
   res.json({ nursing_station: station.name, station_id: station.id, wards });

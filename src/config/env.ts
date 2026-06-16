@@ -1,4 +1,5 @@
-import "dotenv/config";
+import dotenv from "dotenv";
+dotenv.config({ path: new URL(`../../.env.${process.env.NODE_ENV || "development"}`, import.meta.url) });
 
 function required(name: string, fallback?: string): string {
   const v = process.env[name] ?? fallback;
