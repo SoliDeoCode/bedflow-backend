@@ -11,7 +11,7 @@ import {
   createPre, editPre, setPreShift, deletePre,
   createNurse, editNurse, deleteNurse,
   listNursingStations, createNursingStation, editNursingStation, deleteNursingStation, assignWardsToStation,
-  availableDates, historyForDate,
+  availableDates, censusDates, historyForDate,
   listNurseAccess, createNurseAccess, editNurseAccess, deleteNurseAccess,
 } from "../services/managerService.js";
 import {
@@ -28,6 +28,26 @@ import {
 
 const router = Router();
 router.use(authRequired, requireRole("MANAGER", "COO"));
+
+// Nurses only join the `station:<id>` socket room, not `overview` — these
+// helpers let mutation routes target the right nurse station(s) so a manager's
+// edit is visible on the nurse's dashboard too, not just COO/Manager's.
+async function stationIdForWard(wardId: number): Promise<number | undefined> {
+  const row = await db.prepare("SELECT station_id FROM wards WHERE id=?")
+    .get<{ station_id: number | null }>(wardId);
+  return row?.station_id ?? undefined;
+}
+async function stationIdForBed(bedId: number): Promise<number | undefined> {
+  const row = await db.prepare(
+    "SELECT w.station_id FROM bed_details bd JOIN wards w ON w.id=bd.ward_id WHERE bd.id=?"
+  ).get<{ station_id: number | null }>(bedId);
+  return row?.station_id ?? undefined;
+}
+async function stationIdForNurse(nurseId: number): Promise<number | undefined> {
+  const row = await db.prepare("SELECT station_id FROM users WHERE id=?")
+    .get<{ station_id: number | null }>(nurseId);
+  return row?.station_id ?? undefined;
+}
 
 // ── KPIs ──────────────────────────────────────────────────────────────────────
 
@@ -69,7 +89,9 @@ router.post("/building-blocks", asyncH(async (req, res) => {
     name:  z.string().min(1).max(10),
     label: z.string().optional(),
   }).parse(req.body);
-  res.status(201).json(await createBuildingBlock({ name, label, managerId: req.user!.id }));
+  const result = await createBuildingBlock({ name, label, managerId: req.user!.id });
+  emitUpdate("bed:update", { blockId: result.id });
+  res.status(201).json(result);
 }));
 
 router.put("/building-blocks/:id", asyncH(async (req, res) => {
@@ -78,13 +100,19 @@ router.put("/building-blocks/:id", asyncH(async (req, res) => {
     label:     z.string().nullable().optional(),
     sortOrder: z.number().int().optional(),
   }).parse(req.body);
-  res.json(await editBuildingBlock({
-    blockId: Number(req.params.id), name, label: label ?? undefined, sortOrder, managerId: req.user!.id,
-  }));
+  const blockId = Number(req.params.id);
+  const result = await editBuildingBlock({
+    blockId, name, label: label ?? undefined, sortOrder, managerId: req.user!.id,
+  });
+  emitUpdate("bed:update", { blockId });
+  res.json(result);
 }));
 
 router.delete("/building-blocks/:id", asyncH(async (req, res) => {
-  res.json(await deleteBuildingBlock(Number(req.params.id), req.user!.id));
+  const blockId = Number(req.params.id);
+  const result = await deleteBuildingBlock(blockId, req.user!.id);
+  emitUpdate("bed:update", { blockId });
+  res.json(result);
 }));
 
 // ── floors ────────────────────────────────────────────────────────────────────
@@ -98,16 +126,24 @@ router.post("/floors", asyncH(async (req, res) => {
     name:            z.string().min(1).max(60),
     buildingBlockId: z.number().int(),
   }).parse(req.body);
-  res.status(201).json(await createFloor({ name, buildingBlockId, managerId: req.user!.id }));
+  const result = await createFloor({ name, buildingBlockId, managerId: req.user!.id });
+  emitUpdate("bed:update", { floorId: result.id });
+  res.status(201).json(result);
 }));
 
 router.put("/floors/:id", asyncH(async (req, res) => {
   const { name } = z.object({ name: z.string().min(1).max(60) }).parse(req.body);
-  res.json(await editFloor({ floorId: Number(req.params.id), name, managerId: req.user!.id }));
+  const floorId = Number(req.params.id);
+  const result = await editFloor({ floorId, name, managerId: req.user!.id });
+  emitUpdate("bed:update", { floorId });
+  res.json(result);
 }));
 
 router.delete("/floors/:id", asyncH(async (req, res) => {
-  res.json(await deleteFloor(Number(req.params.id), req.user!.id));
+  const floorId = Number(req.params.id);
+  const result = await deleteFloor(floorId, req.user!.id);
+  emitUpdate("bed:update", { floorId });
+  res.json(result);
 }));
 
 // ── wards ─────────────────────────────────────────────────────────────────────
@@ -141,14 +177,16 @@ router.post("/wards", asyncH(async (req, res) => {
   const b = z.object({
     name:        z.string().min(1),
     floorId:     z.number().int(),
-    totalBeds:   z.number().int().min(0),
+    totalBeds:   z.number().int().min(0).max(500, "A ward can have at most 500 beds. Create it, then add more beds individually."),
     stationId:   z.number().int().nullable().optional(),
     unitType:    z.string().optional(),
     roomType:    z.string().optional(),
     bedType:     z.enum(["Census", "Non-Census"]).optional(),
     operational: z.boolean().optional(),
   }).parse(req.body);
-  res.status(201).json(await createWard({ ...b, managerId: req.user!.id }));
+  const result = await createWard({ ...b, managerId: req.user!.id });
+  emitUpdate("bed:update", { wardId: result.id }, b.stationId ? { stationId: b.stationId } : undefined);
+  res.status(201).json(result);
 }));
 
 router.put("/wards/:id", asyncH(async (req, res) => {
@@ -163,7 +201,11 @@ router.put("/wards/:id", asyncH(async (req, res) => {
     operational: z.boolean().nullable().optional(),
   }).parse(req.body);
   const wardId = Number(req.params.id);
+  const prevStationId = await stationIdForWard(wardId);
   const result = await editWard({ wardId, ...b, managerId: req.user!.id });
+  const newStationId = b.stationId !== undefined ? (b.stationId ?? undefined) : prevStationId;
+  const stationIds = [...new Set([prevStationId, newStationId].filter((v): v is number => v != null))];
+  emitUpdate("bed:update", { wardId }, stationIds.length ? { stationId: stationIds } : undefined);
   if (b.operational != null) {
     const blocks = await db.prepare(
       "SELECT pre_block_id FROM pre_block_wards WHERE ward_id=?"
@@ -176,7 +218,11 @@ router.put("/wards/:id", asyncH(async (req, res) => {
 }));
 
 router.delete("/wards/:id", asyncH(async (req, res) => {
-  res.json(await deleteWard(Number(req.params.id), req.user!.id));
+  const wardId = Number(req.params.id);
+  const stationId = await stationIdForWard(wardId);
+  const result = await deleteWard(wardId, req.user!.id);
+  emitUpdate("bed:update", { wardId }, stationId ? { stationId } : undefined);
+  res.json(result);
 }));
 
 // ── users list ────────────────────────────────────────────────────────────────
@@ -275,9 +321,11 @@ router.post("/wards/:id/generate-beds", asyncH(async (req, res) => {
     bedType:           z.enum(["Census", "Non-Census"]).optional(),
     acStatus:          z.boolean().optional(),
   }).parse(req.body);
-  res.status(201).json(
-    await generateBeds({ wardId: Number(req.params.id), bedNames, operationalStatus, bedType, acStatus, userId: req.user!.id })
-  );
+  const wardId = Number(req.params.id);
+  const result = await generateBeds({ wardId, bedNames, operationalStatus, bedType, acStatus, userId: req.user!.id });
+  const stationId = await stationIdForWard(wardId);
+  emitUpdate("bed:update", { wardId }, stationId ? { stationId } : undefined);
+  res.status(201).json(result);
 }));
 
 router.post("/wards/:id/beds", asyncH(async (req, res) => {
@@ -287,9 +335,11 @@ router.post("/wards/:id/beds", asyncH(async (req, res) => {
     bedType:           z.enum(["Census", "Non-Census"]).optional(),
     acStatus:          z.boolean().optional(),
   }).parse(req.body);
-  res.status(201).json(
-    await addSingleBed({ wardId: Number(req.params.id), bedName, operationalStatus, bedType, acStatus, userId: req.user!.id })
-  );
+  const wardId = Number(req.params.id);
+  const result = await addSingleBed({ wardId, bedName, operationalStatus, bedType, acStatus, userId: req.user!.id });
+  const stationId = await stationIdForWard(wardId);
+  emitUpdate("bed:update", { wardId }, stationId ? { stationId } : undefined);
+  res.status(201).json(result);
 }));
 
 router.patch("/beds/:id/name", asyncH(async (req, res) => {
@@ -303,13 +353,21 @@ router.patch("/beds/:id/master", asyncH(async (req, res) => {
     operationalStatus: z.boolean().optional(),
     acStatus:          z.boolean().optional(),
   }).parse(req.body);
-  res.json(await updateBedMaster({
-    bedId: Number(req.params.id), bedType, operationalStatus, acStatus, userId: req.user!.id,
-  }));
+  const bedId = Number(req.params.id);
+  const stationId = await stationIdForBed(bedId);
+  const result = await updateBedMaster({
+    bedId, bedType, operationalStatus, acStatus, userId: req.user!.id,
+  });
+  emitUpdate("bed:update", { bedId }, stationId ? { stationId } : undefined);
+  res.json(result);
 }));
 
 router.delete("/beds/:id", asyncH(async (req, res) => {
-  res.json(await deleteBed({ bedId: Number(req.params.id), userId: req.user!.id }));
+  const bedId = Number(req.params.id);
+  const stationId = await stationIdForBed(bedId);
+  const result = await deleteBed({ bedId, userId: req.user!.id });
+  emitUpdate("bed:update", { bedId }, stationId ? { stationId } : undefined);
+  res.json(result);
 }));
 
 // ── nursing stations ──────────────────────────────────────────────────────────
@@ -320,23 +378,32 @@ router.get("/nursing-stations", asyncH(async (_req, res) => {
 
 router.post("/nursing-stations", asyncH(async (req, res) => {
   const { name } = z.object({ name: z.string().min(1).max(100) }).parse(req.body);
-  res.status(201).json(await createNursingStation({ name, managerId: req.user!.id }));
+  const result = await createNursingStation({ name, managerId: req.user!.id });
+  emitUpdate("bed:update", { stationId: result.id });
+  res.status(201).json(result);
 }));
 
 router.put("/nursing-stations/:id", asyncH(async (req, res) => {
   const { name } = z.object({ name: z.string().min(1).max(100) }).parse(req.body);
-  res.json(await editNursingStation({
-    stationId: Number(req.params.id), name, managerId: req.user!.id,
-  }));
+  const stationId = Number(req.params.id);
+  const result = await editNursingStation({ stationId, name, managerId: req.user!.id });
+  emitUpdate("bed:update", { stationId }, { stationId });
+  res.json(result);
 }));
 
 router.put("/nursing-stations/:id/wards", asyncH(async (req, res) => {
   const { wardIds } = z.object({ wardIds: z.array(z.number().int()).min(0) }).parse(req.body);
-  res.json(await assignWardsToStation(Number(req.params.id), wardIds, req.user!.id));
+  const stationId = Number(req.params.id);
+  const result = await assignWardsToStation(stationId, wardIds, req.user!.id);
+  emitUpdate("bed:update", { stationId }, { stationId });
+  res.json(result);
 }));
 
 router.delete("/nursing-stations/:id", asyncH(async (req, res) => {
-  res.json(await deleteNursingStation(Number(req.params.id), req.user!.id));
+  const stationId = Number(req.params.id);
+  const result = await deleteNursingStation(stationId, req.user!.id);
+  emitUpdate("bed:update", { stationId }, { stationId });
+  res.json(result);
 }));
 
 router.get("/stations/:id/coverage", asyncH(async (req, res) => {
@@ -445,7 +512,10 @@ router.post("/nurse-access", asyncH(async (req, res) => {
     accessType: z.enum(["FULL", "BEDS"]),
     bedNames:   z.array(z.string()).optional().default([]),
   }).parse(req.body);
-  res.status(201).json(await createNurseAccess({ ...body, managerId: req.user!.id }));
+  const result = await createNurseAccess({ ...body, managerId: req.user!.id });
+  const stationId = await stationIdForNurse(body.nurseId);
+  emitUpdate("bed:update", { nurseId: body.nurseId, wardId: body.wardId }, stationId ? { stationId } : undefined);
+  res.status(201).json(result);
 }));
 
 router.put("/nurse-access/:id", asyncH(async (req, res) => {
@@ -455,17 +525,32 @@ router.put("/nurse-access/:id", asyncH(async (req, res) => {
     bedNames:   z.array(z.string()).optional(),
     status:     z.enum(["active", "inactive"]).optional(),
   }).parse(req.body);
-  res.json(await editNurseAccess({ id, ...body, managerId: req.user!.id }));
+  const row = await db.prepare("SELECT nurse_id, ward_id FROM nurse_access_assignments WHERE id=?")
+    .get<{ nurse_id: number; ward_id: number }>(id);
+  const result = await editNurseAccess({ id, ...body, managerId: req.user!.id });
+  const stationId = row ? await stationIdForNurse(row.nurse_id) : undefined;
+  emitUpdate("bed:update", { nurseId: row?.nurse_id, wardId: row?.ward_id }, stationId ? { stationId } : undefined);
+  res.json(result);
 }));
 
 router.delete("/nurse-access/:id", asyncH(async (req, res) => {
-  res.json(await deleteNurseAccess(Number(req.params.id), req.user!.id));
+  const id = Number(req.params.id);
+  const row = await db.prepare("SELECT nurse_id, ward_id FROM nurse_access_assignments WHERE id=?")
+    .get<{ nurse_id: number; ward_id: number }>(id);
+  const result = await deleteNurseAccess(id, req.user!.id);
+  const stationId = row ? await stationIdForNurse(row.nurse_id) : undefined;
+  emitUpdate("bed:update", { nurseId: row?.nurse_id, wardId: row?.ward_id }, stationId ? { stationId } : undefined);
+  res.json(result);
 }));
 
 // ── history ───────────────────────────────────────────────────────────────────
 
 router.get("/history/dates", asyncH(async (_req, res) => {
   res.json({ dates: await availableDates() });
+}));
+
+router.get("/history/census-dates", asyncH(async (_req, res) => {
+  res.json({ dates: await censusDates() });
 }));
 
 router.get("/history", asyncH(async (req, res) => {
@@ -497,7 +582,9 @@ router.post("/pre-blocks", asyncH(async (req, res) => {
     description: z.string().max(500).optional(),
     wardIds:     z.array(z.number().int()).min(1),
   }).parse(req.body);
-  res.status(201).json(await createPreBlock({ name, description, wardIds, managerId: req.user!.id }));
+  const result = await createPreBlock({ name, description, wardIds, managerId: req.user!.id });
+  emitUpdate("bed:update", { preBlockId: result.id }, { pre: String(result.id) });
+  res.status(201).json(result);
 }));
 
 router.put("/pre-blocks/:id", asyncH(async (req, res) => {
@@ -506,19 +593,28 @@ router.put("/pre-blocks/:id", asyncH(async (req, res) => {
     description: z.string().max(500).nullable().optional(),
     wardIds:     z.array(z.number().int()).min(1).optional(),
   }).parse(req.body);
-  res.json(await editPreBlock({
-    blockId: Number(req.params.id), name,
+  const blockId = Number(req.params.id);
+  const result = await editPreBlock({
+    blockId, name,
     description: description ?? undefined, wardIds, managerId: req.user!.id,
-  }));
+  });
+  emitUpdate("bed:update", { preBlockId: blockId }, { pre: String(blockId) });
+  res.json(result);
 }));
 
 router.patch("/pre-blocks/:id/status", asyncH(async (req, res) => {
   const { status } = z.object({ status: z.enum(["active", "inactive"]) }).parse(req.body);
-  res.json(await setPreBlockStatus(Number(req.params.id), status, req.user!.id));
+  const blockId = Number(req.params.id);
+  const result = await setPreBlockStatus(blockId, status, req.user!.id);
+  emitUpdate("bed:update", { preBlockId: blockId, status }, { pre: String(blockId) });
+  res.json(result);
 }));
 
 router.delete("/pre-blocks/:id", asyncH(async (req, res) => {
-  res.json(await deletePreBlock(Number(req.params.id), req.user!.id));
+  const blockId = Number(req.params.id);
+  const result = await deletePreBlock(blockId, req.user!.id);
+  emitUpdate("bed:update", { preBlockId: blockId }, { pre: String(blockId) });
+  res.json(result);
 }));
 
 // ── Payer Types ───────────────────────────────────────────────────────────────
@@ -528,7 +624,9 @@ router.get("/payer-types", asyncH(async (_req, res) => {
 
 router.post("/payer-types", asyncH(async (req, res) => {
   const { name } = z.object({ name: z.string().min(1).max(100) }).parse(req.body);
-  res.status(201).json(await createPayerType({ name, userId: req.user!.id }));
+  const result = await createPayerType({ name, userId: req.user!.id });
+  emitUpdate("bed:update", { payerTypeId: result.id });
+  res.status(201).json(result);
 }));
 
 router.put("/payer-types/:id", asyncH(async (req, res) => {
@@ -536,16 +634,25 @@ router.put("/payer-types/:id", asyncH(async (req, res) => {
     name:   z.string().min(1).max(100).optional(),
     active: z.boolean().optional(),
   }).parse(req.body);
-  res.json(await updatePayerType({ id: Number(req.params.id), name, active, userId: req.user!.id }));
+  const id = Number(req.params.id);
+  const result = await updatePayerType({ id, name, active, userId: req.user!.id });
+  emitUpdate("bed:update", { payerTypeId: id });
+  res.json(result);
 }));
 
 router.patch("/payer-types/:id/order", asyncH(async (req, res) => {
   const { direction } = z.object({ direction: z.enum(["up", "down"]) }).parse(req.body);
-  res.json(await reorderPayerType({ id: Number(req.params.id), direction, userId: req.user!.id }));
+  const id = Number(req.params.id);
+  const result = await reorderPayerType({ id, direction, userId: req.user!.id });
+  emitUpdate("bed:update", { payerTypeId: id });
+  res.json(result);
 }));
 
 router.delete("/payer-types/:id", asyncH(async (req, res) => {
-  res.json(await deletePayerType({ id: Number(req.params.id), userId: req.user!.id }));
+  const id = Number(req.params.id);
+  const result = await deletePayerType({ id, userId: req.user!.id });
+  emitUpdate("bed:update", { payerTypeId: id });
+  res.json(result);
 }));
 
 export default router;

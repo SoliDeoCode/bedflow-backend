@@ -66,7 +66,13 @@ router.post("/ward", asyncH(async (req, res) => {
   if (!owns) throw new HttpError(403, "Ward not in your PRE Block");
 
   const result = await updateWard(wardId, vacant_none, vacant_reserved, occupied_none, occupied_reserved, req.user!.id);
-  emitUpdate("bed:update", { floor: block.name, ...result }, { pre: String(block.id) });
+  const stationRow = await db.prepare(
+    "SELECT station_id FROM wards WHERE id=?"
+  ).get<{ station_id: number | null }>(wardId);
+  emitUpdate("bed:update", { floor: block.name, wardId, ...result }, {
+    pre: String(block.id),
+    stationId: stationRow?.station_id ?? undefined,
+  });
   res.json({ ok: true, ...result });
 }));
 

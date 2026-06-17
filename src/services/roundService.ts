@@ -2,6 +2,7 @@ import { db } from "../db/index.js";
 import { HttpError } from "../middleware/error.js";
 import { audit } from "./auditService.js";
 import { wardsForFloor, wardsForPreBlock } from "./bedService.js";
+import { calculateWardTotals } from "./wardTotals.js";
 import {
   inShift, currentRound, roundKey, todayStr, minsNow, formatShiftWindow, type ShiftKey,
 } from "../config/domain.js";
@@ -49,7 +50,8 @@ export async function submitRound(preBlockId: number, userId: number) {
     if (w.vacant === null)
       throw new HttpError(400, `Enter all wards first (${w.ward} missing)`);
     if (!wardHasBeds.has(w.id)) {
-      const sum = w.vacant + (w.reserved || 0) + (w.occupied || 0);
+      // Categorized total across all four disjoint buckets (incl. occupied_reserved).
+      const sum = calculateWardTotals(w).totalBeds;
       if (sum !== w.total)
         throw new HttpError(400, `${w.ward}: counts must total ${w.total}`);
     }

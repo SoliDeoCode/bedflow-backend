@@ -1,0 +1,2 @@
+ALTER TABLE saved_views
+  ADD COLUMN IF NOT EXISTS source VARCHAR(20) NOT NULL DEFAULT 'matrix';

@@ -214,13 +214,29 @@ export async function createWard(opts: {
   }
 }
 
+// saved_views.selected_wards stores ward NAMES (JSON array), not ids — a rename
+// would otherwise silently drop the ward out of every saved view that lists it.
+async function renameWardInSavedViews(oldName: string, newName: string) {
+  const rows = await db.prepare(
+    "SELECT id, selected_wards FROM saved_views WHERE selected_wards LIKE ?"
+  ).all<{ id: number; selected_wards: string }>(`%${oldName}%`);
+  for (const row of rows) {
+    let wards: unknown;
+    try { wards = JSON.parse(row.selected_wards || "[]"); } catch { continue; }
+    if (!Array.isArray(wards) || !wards.includes(oldName)) continue;
+    const updated = wards.map((w) => (w === oldName ? newName : w));
+    await db.prepare("UPDATE saved_views SET selected_wards=? WHERE id=?")
+      .run(JSON.stringify(updated), row.id);
+  }
+}
+
 export async function editWard(opts: {
   wardId: number; name?: string; totalBeds?: number; floorId?: number; managerId: number;
   stationId?: number | null; unitType?: string | null; roomType?: string | null;
   bedType?: string | null; operational?: boolean | null;
 }) {
-  const ward = await db.prepare("SELECT id, floor_id, operational FROM wards WHERE id=?")
-    .get<{ id: number; floor_id: number; operational: boolean }>(opts.wardId);
+  const ward = await db.prepare("SELECT id, name, floor_id, operational FROM wards WHERE id=?")
+    .get<{ id: number; name: string; floor_id: number; operational: boolean }>(opts.wardId);
   if (!ward) throw new HttpError(404, "Ward not found");
   const t = now();
 
@@ -244,9 +260,12 @@ export async function editWard(opts: {
   }
 
   await db.transaction(async () => {
-    if (opts.name !== undefined)
+    if (opts.name !== undefined) {
+      const trimmedName = opts.name.trim();
       await db.prepare("UPDATE wards SET name=?, updated_at=? WHERE id=?")
-        .run(opts.name.trim(), t, opts.wardId);
+        .run(trimmedName, t, opts.wardId);
+      if (trimmedName !== ward.name) await renameWardInSavedViews(ward.name, trimmedName);
+    }
     if (opts.totalBeds !== undefined) {
       await db.prepare("UPDATE wards SET updated_at=? WHERE id=?").run(t, opts.wardId);
     }
@@ -262,6 +281,16 @@ export async function editWard(opts: {
           .get<{name:string}>(opts.stationId);
         if (!ns) throw new HttpError(404, "Nursing station not found");
         sName = ns.name;
+      }
+      const prevStation = await db.prepare("SELECT station_id FROM wards WHERE id=?")
+        .get<{ station_id: number | null }>(opts.wardId);
+      // Ward is leaving its old station — drop that station's nurses' access to it,
+      // otherwise nurse_access_assignments keeps pointing at a ward they no longer cover.
+      if (prevStation?.station_id && prevStation.station_id !== opts.stationId) {
+        await db.prepare(
+          `DELETE FROM nurse_access_assignments
+           WHERE ward_id=? AND nurse_id IN (SELECT id FROM users WHERE station_id=?)`
+        ).run(opts.wardId, prevStation.station_id);
       }
       await db.prepare("UPDATE wards SET station_id=?, nursing_station=?, updated_at=? WHERE id=?")
         .run(opts.stationId, sName, t, opts.wardId);
@@ -594,6 +623,13 @@ export async function availableDates(): Promise<string[]> {
     ...censusRows.map(c => c.census_date),
   ]);
   return [...dates].sort().reverse();
+}
+
+export async function censusDates(): Promise<string[]> {
+  const rows = await db.prepare(
+    "SELECT census_date FROM midnight_census ORDER BY census_date DESC"
+  ).all<{ census_date: string }>();
+  return rows.map(r => r.census_date);
 }
 
 // Rounds are submitted per PRE Block (pre_rounds.pre_block_id); floor_id is a

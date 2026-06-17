@@ -303,7 +303,7 @@ export async function captureMidnightCensus(date: string): Promise<boolean> {
 
   const wards = await db.prepare(
     `SELECT w.id, w.name AS ward, w.total_beds AS total, w.unit_type, w.bed_type,
-            b.vacant, b.reserved, b.occupied, b.updated_at AS "updatedAt"
+            b.vacant, b.reserved, b.occupied, b.occupied_reserved, b.updated_at AS "updatedAt"
      FROM wards w JOIN beds b ON b.ward_id = w.id ORDER BY w.name`
   ).all<WardView & { bed_type: string }>();
 

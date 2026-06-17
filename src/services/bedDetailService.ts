@@ -10,7 +10,7 @@ function validateBedName(name: string) {
     throw new HttpError(400, `Bed name "${name}" contains invalid characters. Only letters, numbers, spaces, and hyphens are allowed.`);
 }
 
-export async function _recalcWardTotals(wardId: number) {
+export async function _recalcWardTotals(wardId: number, actorId: number) {
   const counts = await db.prepare(`
     SELECT
       COUNT(*) AS total,
@@ -29,17 +29,26 @@ export async function _recalcWardTotals(wardId: number) {
   const now = Date.now();
   // UPSERT: creates the beds row if it was never inserted (e.g. ward added via
   // migration or direct SQL), preventing the silent no-op of a plain UPDATE.
+  // updated_by must be stamped here too — otherwise a nurse's bed-level edit
+  // (which lands here) leaves the ward's attribution pointing at whoever last
+  // ran a PRE round, even though updated_at correctly moved.
   await db.prepare(`
-    INSERT INTO beds (ward_id, total, vacant, reserved, occupied, occupied_reserved, updated_at)
-    VALUES (?,?,?,?,?,?,?)
+    INSERT INTO beds (ward_id, total, vacant, reserved, occupied, occupied_reserved, updated_at, updated_by)
+    VALUES (?,?,?,?,?,?,?,?)
     ON CONFLICT (ward_id) DO UPDATE SET
       total             = EXCLUDED.total,
       vacant            = EXCLUDED.vacant,
       reserved          = EXCLUDED.reserved,
       occupied          = EXCLUDED.occupied,
       occupied_reserved = EXCLUDED.occupied_reserved,
-      updated_at        = EXCLUDED.updated_at
-  `).run(wardId, total, vacant, reserved, occupied, occupiedReserved, now);
+      updated_at        = EXCLUDED.updated_at,
+      updated_by        = EXCLUDED.updated_by
+  `).run(wardId, total, vacant, reserved, occupied, occupiedReserved, now, actorId);
+
+  // wards.total_beds is a denormalized copy read by every dashboard/round/census
+  // query — keep it locked to the real bed_details count so it can't drift
+  // whenever an individual bed is added or deleted.
+  await db.prepare("UPDATE wards SET total_beds=? WHERE id=?").run(total, wardId);
 }
 
 /** Generate beds from an explicit list of names (frontend expands patterns). */
@@ -69,7 +78,7 @@ export async function generateBeds(opts: {
       ).run(opts.wardId, name, bedType, operational, acStatus, now, opts.userId);
       inserted += r.changes;
     }
-    await _recalcWardTotals(opts.wardId);
+    await _recalcWardTotals(opts.wardId, opts.userId);
   });
 
   await audit(opts.userId, "beds_generate", String(opts.wardId),
@@ -98,7 +107,7 @@ export async function addSingleBed(opts: {
     ).run(opts.wardId, trimmed, bedType, operational, acStatus, now, opts.userId);
     if (r.changes === 0) throw new HttpError(409, `Bed "${trimmed}" already exists in this ward`);
     newId = Number(r.lastInsertRowid);
-    await _recalcWardTotals(opts.wardId);
+    await _recalcWardTotals(opts.wardId, opts.userId);
   });
 
   await audit(opts.userId, "bed_add", String(opts.wardId), { bedName: trimmed });
@@ -143,6 +152,22 @@ export async function listBeds(
   return db.prepare(sql).all<BedDetail>(...params);
 }
 
+// nurse_access_assignments.bed_names stores bed NAMES (JSON array), not ids —
+// a rename would otherwise silently revoke that nurse's access to the bed.
+async function renameBedInNurseAccess(wardId: number, oldName: string, newName: string) {
+  const rows = await db.prepare(
+    "SELECT id, bed_names FROM nurse_access_assignments WHERE ward_id=? AND access_type='BEDS' AND bed_names LIKE ?"
+  ).all<{ id: number; bed_names: string }>(wardId, `%${oldName}%`);
+  for (const row of rows) {
+    let beds: unknown;
+    try { beds = JSON.parse(row.bed_names || "[]"); } catch { continue; }
+    if (!Array.isArray(beds) || !beds.includes(oldName)) continue;
+    const updated = beds.map((b) => (b === oldName ? newName : b));
+    await db.prepare("UPDATE nurse_access_assignments SET bed_names=?, updated_at=? WHERE id=?")
+      .run(JSON.stringify(updated), Date.now(), row.id);
+  }
+}
+
 export async function renameBed(opts: {
   bedId: number; newBedName: string; userId: number;
 }) {
@@ -162,6 +187,7 @@ export async function renameBed(opts: {
 
   await db.prepare("UPDATE bed_details SET bed_name=?, updated_at=? WHERE id=?")
     .run(trimmed, Date.now(), opts.bedId);
+  await renameBedInNurseAccess(bed.ward_id, bed.bed_name, trimmed);
 
   await audit(opts.userId, "bed_rename", String(opts.bedId),
     { from: bed.bed_name, to: trimmed });
@@ -220,7 +246,7 @@ export async function deleteBed(opts: { bedId: number; userId: number }) {
           bed.reservation_status, "DELETED",
           bed.payer_type, opts.userId, Date.now());
     await db.prepare("DELETE FROM bed_details WHERE id=?").run(opts.bedId);
-    await _recalcWardTotals(bed.ward_id);
+    await _recalcWardTotals(bed.ward_id, opts.userId);
   });
 
   await audit(opts.userId, "bed_delete", String(opts.bedId), {
@@ -296,7 +322,7 @@ export async function updateBedStatus(opts: {
           bed.physical_status, opts.physicalStatus,
           bed.reservation_status, opts.reservationStatus,
           newPayerType, opts.userId, now);
-    await _recalcWardTotals(bed.ward_id);
+    await _recalcWardTotals(bed.ward_id, opts.userId);
   });
 
   await audit(opts.userId, "bed_status_update", String(opts.bedId), {

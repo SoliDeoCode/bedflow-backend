@@ -5,7 +5,7 @@ import { z } from "zod";
 import { orgOverview, allWardsLive } from "../services/bedService.js";
 import { COO_REMINDERS, hmToMin, minsNow, todayStr, startOfDayIST, PRE_INTERVAL_MIN, SHIFTS,
          currentRound, inShift, roundKey, type ShiftKey } from "../config/domain.js";
-import { recentAudit } from "../services/auditService.js";
+import { recentAudit, queryActivity } from "../services/auditService.js";
 import { db } from "../db/index.js";
 import { HttpError } from "../middleware/error.js";
 
@@ -77,6 +77,32 @@ router.get("/live-wards", asyncH(async (_req, res) => {
 
 router.get("/audit", asyncH(async (_req, res) => {
   res.json({ logs: await recentAudit(150) });
+}));
+
+// Unified, filterable, keyset-paginated activity history (PRE + Nurse + all roles).
+router.get("/activity", asyncH(async (req, res) => {
+  const q = z.object({
+    from:       z.coerce.number().int().optional(),
+    to:         z.coerce.number().int().optional(),
+    roles:      z.string().optional(),       // CSV: PRE,NURSE,MANAGER,COO
+    userId:     z.coerce.number().int().positive().optional(),
+    categories: z.string().optional(),       // CSV: bed,round,config,login
+    q:          z.string().max(100).optional(),
+    page:       z.coerce.number().int().min(1).optional(),
+    limit:      z.coerce.number().int().min(1).max(200).optional(),
+  }).parse(req.query);
+
+  const splitCsv = (s?: string) =>
+    s ? s.split(",").map(x => x.trim()).filter(Boolean) : undefined;
+
+  res.json(await queryActivity({
+    from: q.from, to: q.to,
+    roles: splitCsv(q.roles),
+    userId: q.userId,
+    categories: splitCsv(q.categories),
+    q: q.q,
+    page: q.page, limit: q.limit,
+  }));
 }));
 
 // Rounds are submitted per PRE Block — compliance is scored per active PRE
@@ -273,9 +299,11 @@ router.get("/snapshots", asyncH(async (_req, res) => {
 
 interface SavedViewRow {
   id: number; name: string; created_by: number | null;
-  selected_wards: string; is_shared: number; is_system: number;
+  selected_wards: string; is_shared: number; is_system: number; source: string;
   created_at: number; updated_at: number;
 }
+
+const VIEW_SOURCES = ["matrix", "midnight_census"] as const;
 
 function parseView(v: SavedViewRow, currentUserId: number) {
   return {
@@ -283,6 +311,7 @@ function parseView(v: SavedViewRow, currentUserId: number) {
     selected_wards: JSON.parse(v.selected_wards) as string[],
     is_shared: !!v.is_shared,
     is_system: !!v.is_system,
+    source: v.source,
     mine: v.created_by === currentUserId,
     created_at: v.created_at, updated_at: v.updated_at,
   };
@@ -290,26 +319,28 @@ function parseView(v: SavedViewRow, currentUserId: number) {
 
 router.get("/views", asyncH(async (req, res) => {
   const userId = req.user!.id;
+  const source = VIEW_SOURCES.includes(req.query.source as any) ? String(req.query.source) : "matrix";
   const rows = await db.prepare(`
-    SELECT id, name, created_by, selected_wards, is_shared, is_system, created_at, updated_at
+    SELECT id, name, created_by, selected_wards, is_shared, is_system, source, created_at, updated_at
     FROM saved_views
-    WHERE is_system = 1 OR is_shared = 1 OR created_by = ?
+    WHERE (is_system = 1 OR is_shared = 1 OR created_by = ?) AND source = ?
     ORDER BY is_system DESC, name ASC
-  `).all<SavedViewRow>(userId);
+  `).all<SavedViewRow>(userId, source);
   res.json({ views: rows.map(r => parseView(r, userId)) });
 }));
 
 router.post("/views", asyncH(async (req, res) => {
-  const { name, selected_wards, is_shared } = z.object({
+  const { name, selected_wards, is_shared, source } = z.object({
     name:           z.string().min(1).max(60),
     selected_wards: z.array(z.string()),
     is_shared:      z.boolean().optional().default(false),
+    source:         z.enum(VIEW_SOURCES).optional().default("matrix"),
   }).parse(req.body);
   const now = Date.now();
   const r = await db.prepare(
-    `INSERT INTO saved_views (name, created_by, selected_wards, is_shared, is_system, created_at, updated_at)
-     VALUES (?,?,?,?,0,?,?) RETURNING id`
-  ).run(name, req.user!.id, JSON.stringify(selected_wards), is_shared ? 1 : 0, now, now);
+    `INSERT INTO saved_views (name, created_by, selected_wards, is_shared, is_system, source, created_at, updated_at)
+     VALUES (?,?,?,?,0,?,?,?) RETURNING id`
+  ).run(name, req.user!.id, JSON.stringify(selected_wards), is_shared ? 1 : 0, source, now, now);
   res.status(201).json({ ok: true, id: r.lastInsertRowid });
 }));
 
