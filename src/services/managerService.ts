@@ -489,9 +489,36 @@ export async function deletePre(userId: number, managerId: number) {
 
 // ── Nurse In-Charge lifecycle ─────────────────────────────────────────────────
 
+async function validateStationIds(stationIds: number[]): Promise<Map<number, string>> {
+  if (stationIds.length === 0) return new Map();
+  const rows = await db.prepare("SELECT id, name FROM nursing_stations WHERE id = ANY(?)")
+    .all<{ id: number; name: string }>(stationIds);
+  const map = new Map(rows.map(r => [r.id, r.name]));
+  const missing = stationIds.filter(id => !map.has(id));
+  if (missing.length) throw new HttpError(404, `Nursing station not found: ${missing.join(", ")}`);
+  return map;
+}
+
+/** Replace-all: a nurse's full set of stations becomes exactly stationIds. Also
+ *  refreshes the legacy single station_id/nursing_station "primary" columns
+ *  (first id in the list, or NULL) so old display code keeps working. */
+async function setNurseStations(nurseId: number, stationIds: number[], t: number) {
+  const nameById = await validateStationIds(stationIds);
+  await db.prepare("DELETE FROM nurse_stations WHERE nurse_id=?").run(nurseId);
+  for (const id of stationIds) {
+    await db.prepare("INSERT INTO nurse_stations (nurse_id, station_id, created_at) VALUES (?,?,?)")
+      .run(nurseId, id, t);
+  }
+  const primaryId   = stationIds[0] ?? null;
+  const primaryName = primaryId != null ? nameById.get(primaryId)! : null;
+  await db.prepare("UPDATE users SET station_id=?, nursing_station=?, updated_at=? WHERE id=?")
+    .run(primaryId, primaryName, t, nurseId);
+  return nameById;
+}
+
 export async function createNurse(opts: {
   username: string; password: string; name: string;
-  stationId?: number | null; managerId: number;
+  stationIds?: number[]; managerId: number;
   employeeId?: string; phone?: string; email?: string;
 }) {
   const username = opts.username.trim().toLowerCase();
@@ -500,13 +527,10 @@ export async function createNurse(opts: {
   if (await db.prepare("SELECT 1 FROM users WHERE username=?").get(username))
     throw new HttpError(409, "Username already taken");
 
-  let stationName: string | null = null;
-  if (opts.stationId) {
-    const ns = await db.prepare("SELECT name FROM nursing_stations WHERE id=?")
-      .get<{name: string}>(opts.stationId);
-    if (!ns) throw new HttpError(404, "Nursing station not found");
-    stationName = ns.name;
-  }
+  const stationIds = opts.stationIds ?? [];
+  const nameById = await validateStationIds(stationIds);
+  const primaryId   = stationIds[0] ?? null;
+  const primaryName = primaryId != null ? nameById.get(primaryId)! : null;
 
   const t = now();
   const r = await db.prepare(
@@ -515,16 +539,24 @@ export async function createNurse(opts: {
         employee_id,phone,email,created_at,updated_at)
      VALUES (?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id`
   ).run(username, bcrypt.hashSync(opts.password, 10), "NURSE", opts.name.trim(),
-        "morning", stationName, opts.stationId ?? null,
+        "morning", primaryName, primaryId,
         opts.employeeId?.trim() || null, opts.phone?.trim() || null, opts.email?.trim() || null,
         t, t);
-  await audit(opts.managerId, "nurse_create", stationName ?? "unassigned", { username, name: opts.name });
-  return { ok: true, id: Number(r.lastInsertRowid), username };
+  const nurseId = Number(r.lastInsertRowid);
+  for (const id of stationIds) {
+    await db.prepare("INSERT INTO nurse_stations (nurse_id, station_id, created_at) VALUES (?,?,?)")
+      .run(nurseId, id, t);
+  }
+  const stationLabel = stationIds.length
+    ? stationIds.map(id => nameById.get(id)).join(", ")
+    : "unassigned";
+  await audit(opts.managerId, "nurse_create", stationLabel, { username, name: opts.name });
+  return { ok: true, id: nurseId, username };
 }
 
 export async function editNurse(opts: {
   userId: number; name?: string; password?: string;
-  stationId?: number | null; managerId: number;
+  stationIds?: number[]; managerId: number;
   employeeId?: string; phone?: string; email?: string;
 }) {
   const user = await db.prepare("SELECT id, role FROM users WHERE id=?")
@@ -538,18 +570,8 @@ export async function editNurse(opts: {
     if (opts.password)
       await db.prepare("UPDATE users SET password_hash=?, updated_at=? WHERE id=?")
         .run(bcrypt.hashSync(opts.password, 10), t, opts.userId);
-    if (opts.stationId !== undefined) {
-      if (opts.stationId === null) {
-        await db.prepare("UPDATE users SET station_id=NULL, nursing_station=NULL, updated_at=? WHERE id=?")
-          .run(t, opts.userId);
-      } else {
-        const ns = await db.prepare("SELECT name FROM nursing_stations WHERE id=?")
-          .get<{name: string}>(opts.stationId);
-        if (!ns) throw new HttpError(404, "Nursing station not found");
-        await db.prepare("UPDATE users SET station_id=?, nursing_station=?, updated_at=? WHERE id=?")
-          .run(opts.stationId, ns.name, t, opts.userId);
-      }
-    }
+    if (opts.stationIds !== undefined)
+      await setNurseStations(opts.userId, opts.stationIds, t);
     if (opts.employeeId !== undefined)
       await db.prepare("UPDATE users SET employee_id=?, updated_at=? WHERE id=?").run(opts.employeeId?.trim() || null, t, opts.userId);
     if (opts.phone !== undefined)
@@ -561,11 +583,55 @@ export async function editNurse(opts: {
   return { ok: true };
 }
 
+/** Add one station to a nurse's existing set, without disturbing the others
+ *  (used when assigning an existing nurse to a station from that station's page). */
+export async function addNurseStation(nurseId: number, stationId: number, managerId: number) {
+  const user = await db.prepare("SELECT id, role, station_id FROM users WHERE id=?")
+    .get<{id: number; role: string; station_id: number | null}>(nurseId);
+  if (!user || user.role !== "NURSE") throw new HttpError(404, "Nurse not found");
+  const ns = await db.prepare("SELECT name FROM nursing_stations WHERE id=?")
+    .get<{name: string}>(stationId);
+  if (!ns) throw new HttpError(404, "Nursing station not found");
+
+  const t = now();
+  await db.prepare(
+    "INSERT INTO nurse_stations (nurse_id, station_id, created_at) VALUES (?,?,?) ON CONFLICT DO NOTHING"
+  ).run(nurseId, stationId, t);
+  // First station ever assigned becomes the legacy "primary" column.
+  if (user.station_id == null)
+    await db.prepare("UPDATE users SET station_id=?, nursing_station=?, updated_at=? WHERE id=?")
+      .run(stationId, ns.name, t, nurseId);
+  await audit(managerId, "nurse_station_add", ns.name, { nurseId, stationId });
+  return { ok: true };
+}
+
+/** Remove one station from a nurse's set, leaving any others untouched. */
+export async function removeNurseStation(nurseId: number, stationId: number, managerId: number) {
+  const user = await db.prepare("SELECT id, role, station_id FROM users WHERE id=?")
+    .get<{id: number; role: string; station_id: number | null}>(nurseId);
+  if (!user || user.role !== "NURSE") throw new HttpError(404, "Nurse not found");
+
+  const t = now();
+  await db.prepare("DELETE FROM nurse_stations WHERE nurse_id=? AND station_id=?").run(nurseId, stationId);
+  if (user.station_id === stationId) {
+    const next = await db.prepare(
+      `SELECT ns2.station_id, ns.name FROM nurse_stations ns2
+       JOIN nursing_stations ns ON ns.id = ns2.station_id
+       WHERE ns2.nurse_id=? ORDER BY ns2.station_id LIMIT 1`
+    ).get<{ station_id: number; name: string }>(nurseId);
+    await db.prepare("UPDATE users SET station_id=?, nursing_station=?, updated_at=? WHERE id=?")
+      .run(next?.station_id ?? null, next?.name ?? null, t, nurseId);
+  }
+  await audit(managerId, "nurse_station_remove", null, { nurseId, stationId });
+  return { ok: true };
+}
+
 export async function deleteNurse(userId: number, managerId: number) {
   const user = await db.prepare("SELECT id, role, name FROM users WHERE id=?")
     .get<{id: number; role: string; name: string}>(userId);
   if (!user || user.role !== "NURSE") throw new HttpError(404, "Nurse not found");
   await db.prepare("DELETE FROM nurse_access_assignments WHERE nurse_id=?").run(userId);
+  await db.prepare("DELETE FROM nurse_stations WHERE nurse_id=?").run(userId);
   await db.prepare("DELETE FROM users WHERE id=?").run(userId);
   await audit(managerId, "nurse_delete", null, { userId, name: user.name });
   return { ok: true };
@@ -635,11 +701,11 @@ export async function deleteDoctor(userId: number, adminId: number) {
 export async function listNursingStations() {
   return db.prepare(
     `SELECT ns.id, ns.name,
-            COUNT(DISTINCT w.id)::int  AS ward_count,
-            COUNT(DISTINCT u.id)::int  AS nurse_count
+            COUNT(DISTINCT w.id)::int   AS ward_count,
+            COUNT(DISTINCT nst.nurse_id)::int AS nurse_count
      FROM nursing_stations ns
      LEFT JOIN wards w ON w.station_id = ns.id
-     LEFT JOIN users u ON u.station_id = ns.id AND u.role = 'NURSE'
+     LEFT JOIN nurse_stations nst ON nst.station_id = ns.id
      GROUP BY ns.id, ns.name
      ORDER BY ns.name`
   ).all<{id: number; name: string; ward_count: number; nurse_count: number}>();
@@ -697,7 +763,7 @@ export async function assignWardsToStation(stationId: number, wardIds: number[],
     if (!newWardIdSet.has(wardId)) {
       await db.prepare(
         `DELETE FROM nurse_access_assignments
-         WHERE ward_id=? AND nurse_id IN (SELECT id FROM users WHERE station_id=?)`
+         WHERE ward_id=? AND nurse_id IN (SELECT nurse_id FROM nurse_stations WHERE station_id=?)`
       ).run(wardId, stationId);
     }
   }
@@ -710,7 +776,7 @@ export async function assignWardsToStation(stationId: number, wardIds: number[],
       if (ward?.station_id && ward.station_id !== stationId) {
         await db.prepare(
           `DELETE FROM nurse_access_assignments
-           WHERE ward_id=? AND nurse_id IN (SELECT id FROM users WHERE station_id=?)`
+           WHERE ward_id=? AND nurse_id IN (SELECT nurse_id FROM nurse_stations WHERE station_id=?)`
         ).run(wardId, ward.station_id);
       }
     }
@@ -747,7 +813,9 @@ export async function deleteNursingStation(stationId: number, managerId: number)
     blockers.push(`${wards.length} ward${wards.length > 1 ? "s" : ""} (${quoteList(wards.map(w => w.name))})`);
 
   const nurses = await db.prepare(
-    "SELECT name FROM users WHERE station_id=? AND role='NURSE' ORDER BY name"
+    `SELECT DISTINCT u.name FROM nurse_stations nst
+     JOIN users u ON u.id = nst.nurse_id
+     WHERE nst.station_id=? ORDER BY u.name`
   ).all<{ name: string }>(stationId);
   if (nurses.length)
     blockers.push(`${nurses.length} nurse${nurses.length > 1 ? "s" : ""} (${quoteList(nurses.map(n => n.name))})`);
@@ -825,6 +893,7 @@ interface NaaRow {
   access_type: string; bed_names: string; status: string;
   created_at: number; updated_at: number; created_by: number | null;
   nurse_name: string; nurse_username: string; ward_name: string;
+  ward_station_id: number | null; ward_operational: boolean;
 }
 
 function parseNaa(r: NaaRow) {
@@ -839,7 +908,8 @@ export async function listNurseAccess(filters: {
   let sql = `
     SELECT naa.id, naa.nurse_id, naa.ward_id, naa.access_type, naa.bed_names,
            naa.status, naa.created_at, naa.updated_at, naa.created_by,
-           u.name AS nurse_name, u.username AS nurse_username, w.name AS ward_name
+           u.name AS nurse_name, u.username AS nurse_username, w.name AS ward_name,
+           w.station_id AS ward_station_id, w.operational AS ward_operational
     FROM nurse_access_assignments naa
     JOIN users u ON u.id = naa.nurse_id
     JOIN wards w ON w.id = naa.ward_id

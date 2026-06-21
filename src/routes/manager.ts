@@ -9,7 +9,7 @@ import {
   listFloors, createFloor, editFloor, deleteFloor,
   createWard, editWard, deleteWard,
   createPre, editPre, setPreShift, deletePre,
-  createNurse, editNurse, deleteNurse,
+  createNurse, editNurse, deleteNurse, addNurseStation, removeNurseStation,
   createDoctor, editDoctor, deleteDoctor,
   listNursingStations, createNursingStation, editNursingStation, deleteNursingStation, assignWardsToStation,
   availableDates, censusDates, historyForDate,
@@ -51,10 +51,10 @@ async function stationIdForBed(bedId: number): Promise<number | undefined> {
   ).get<{ station_id: number | null }>(bedId);
   return row?.station_id ?? undefined;
 }
-async function stationIdForNurse(nurseId: number): Promise<number | undefined> {
-  const row = await db.prepare("SELECT station_id FROM users WHERE id=?")
-    .get<{ station_id: number | null }>(nurseId);
-  return row?.station_id ?? undefined;
+async function stationIdsForNurse(nurseId: number): Promise<number[] | undefined> {
+  const rows = await db.prepare("SELECT station_id FROM nurse_stations WHERE nurse_id=?")
+    .all<{ station_id: number }>(nurseId);
+  return rows.length ? rows.map(r => r.station_id) : undefined;
 }
 
 // ── KPIs ──────────────────────────────────────────────────────────────────────
@@ -171,11 +171,14 @@ router.get("/wards", asyncH(async (_req, res) => {
             ns.name  AS station_name,
             f.name AS floor_name,
             bb.id    AS block_id,    bb.name AS block_name,
+            dbw.doctor_block_id AS doctor_block_id, db.name AS doctor_block_name,
             (SELECT COUNT(*)::int FROM bed_details bd WHERE bd.ward_id = w.id) AS bed_count
      FROM wards w
      LEFT JOIN floors f ON f.id = w.floor_id
      LEFT JOIN building_blocks bb ON bb.id = f.building_block_id
      LEFT JOIN nursing_stations ns ON ns.id = w.station_id
+     LEFT JOIN doctor_block_wards dbw ON dbw.ward_id = w.id
+     LEFT JOIN doctor_blocks db ON db.id = dbw.doctor_block_id
      ORDER BY bb.sort_order, bb.name, f.sort_order, f.name, w.name`
   ).all();
   res.json({ wards });
@@ -240,10 +243,19 @@ router.get("/users", asyncH(async (_req, res) => {
     `SELECT u.id, u.username, u.role, u.name, u.shift, u.status, u.remarks,
             u.pre_block_id, u.station_id, u.nursing_station,
             pb.name AS pre_block_name,
-            ns.name AS station_name
+            ns.name AS station_name,
+            COALESCE(st.station_ids,   ARRAY[]::int[])  AS station_ids,
+            COALESCE(st.station_names, ARRAY[]::text[]) AS station_names
      FROM users u
      LEFT JOIN pre_blocks pb ON pb.id = u.pre_block_id
      LEFT JOIN nursing_stations ns ON ns.id = u.station_id
+     LEFT JOIN LATERAL (
+       SELECT array_agg(nst.station_id ORDER BY ns2.name) AS station_ids,
+              array_agg(ns2.name      ORDER BY ns2.name) AS station_names
+       FROM nurse_stations nst
+       JOIN nursing_stations ns2 ON ns2.id = nst.station_id
+       WHERE nst.nurse_id = u.id
+     ) st ON true
      ORDER BY u.role, u.username`
   ).all();
   res.json({ users });
@@ -284,7 +296,7 @@ router.delete("/pre/:id", asyncH(async (req, res) => {
 // ── Nurse In-Charge users ─────────────────────────────────────────────────────
 
 const nurseProfileFields = {
-  stationId:  z.number().int().positive().nullable().optional(),
+  stationIds: z.array(z.number().int().positive()).optional(),
   employeeId: z.string().max(50).optional(),
   phone:      z.string().max(30).optional(),
   email:      z.string().max(120).optional(),
@@ -313,18 +325,29 @@ router.delete("/nurses/:id", asyncH(async (req, res) => {
   res.json(await deleteNurse(Number(req.params.id), req.user!.id));
 }));
 
+router.post("/nurses/:id/stations", asyncH(async (req, res) => {
+  const { stationId } = z.object({ stationId: z.number().int().positive() }).parse(req.body);
+  const result = await addNurseStation(Number(req.params.id), stationId, req.user!.id);
+  emitUpdate("bed:update", { nurseId: Number(req.params.id) }, { stationId });
+  res.status(201).json(result);
+}));
+
+router.delete("/nurses/:id/stations/:stationId", asyncH(async (req, res) => {
+  const result = await removeNurseStation(Number(req.params.id), Number(req.params.stationId), req.user!.id);
+  emitUpdate("bed:update", { nurseId: Number(req.params.id) }, { stationId: Number(req.params.stationId) });
+  res.json(result);
+}));
+
 // ── Doctor users ──────────────────────────────────────────────────────────────
-// Strong password: ≥8 chars with at least one letter and one number.
-const strongPassword = z.string()
+// Same rule as every other role: just a minimum length, no forced letter/number/symbol mix.
+const doctorPassword = z.string()
   .min(8, "Password must be at least 8 characters.")
-  .max(72, "Password is too long.")
-  .regex(/[A-Za-z]/, "Password must contain at least one letter.")
-  .regex(/[0-9]/, "Password must contain at least one number.");
+  .max(72, "Password is too long.");
 
 router.post("/doctors", asyncH(async (req, res) => {
   const b = z.object({
     username: z.string().min(1, "Username is required.").max(40, "Username must be 40 characters or less."),
-    password: strongPassword,
+    password: doctorPassword,
     name:     z.string().min(1, "Display name is required.").max(80, "Display name is too long."),
     status:   z.enum(["active", "inactive"]).optional(),
     remarks:  z.string().max(500).optional(),
@@ -335,7 +358,7 @@ router.post("/doctors", asyncH(async (req, res) => {
 router.put("/doctors/:id", asyncH(async (req, res) => {
   const b = z.object({
     name:     z.string().min(1, "Display name is required.").max(80, "Display name is too long.").optional(),
-    password: strongPassword.optional(),
+    password: doctorPassword.optional(),
     status:   z.enum(["active", "inactive"]).optional(),
     remarks:  z.string().max(500).nullable().optional(),
   }).parse(req.body);
@@ -455,10 +478,12 @@ router.get("/stations/:id/coverage", asyncH(async (req, res) => {
     "SELECT w.id, w.name FROM wards w WHERE w.station_id=? ORDER BY w.name"
   ).all<{ id: number; name: string }>(stationId);
 
-  // Nurses in this station
+  // Nurses in this station (via the multi-station membership table)
   const nurses = await db.prepare(
-    `SELECT id, name, username, employee_id, phone, email
-     FROM users WHERE station_id=? AND role='NURSE' ORDER BY name`
+    `SELECT u.id, u.name, u.username, u.employee_id, u.phone, u.email
+     FROM nurse_stations nst
+     JOIN users u ON u.id = nst.nurse_id
+     WHERE nst.station_id=? AND u.role='NURSE' ORDER BY u.name`
   ).all<{ id: number; name: string; username: string; employee_id: string | null; phone: string | null; email: string | null }>(stationId);
 
   const nurseIds  = nurses.map(n => n.id);
@@ -554,7 +579,7 @@ router.post("/nurse-access", asyncH(async (req, res) => {
     bedNames:   z.array(z.string()).optional().default([]),
   }).parse(req.body);
   const result = await createNurseAccess({ ...body, managerId: req.user!.id });
-  const stationId = await stationIdForNurse(body.nurseId);
+  const stationId = await stationIdsForNurse(body.nurseId);
   emitUpdate("bed:update", { nurseId: body.nurseId, wardId: body.wardId }, stationId ? { stationId } : undefined);
   res.status(201).json(result);
 }));
@@ -569,7 +594,7 @@ router.put("/nurse-access/:id", asyncH(async (req, res) => {
   const row = await db.prepare("SELECT nurse_id, ward_id FROM nurse_access_assignments WHERE id=?")
     .get<{ nurse_id: number; ward_id: number }>(id);
   const result = await editNurseAccess({ id, ...body, managerId: req.user!.id });
-  const stationId = row ? await stationIdForNurse(row.nurse_id) : undefined;
+  const stationId = row ? await stationIdsForNurse(row.nurse_id) : undefined;
   emitUpdate("bed:update", { nurseId: row?.nurse_id, wardId: row?.ward_id }, stationId ? { stationId } : undefined);
   res.json(result);
 }));
@@ -579,7 +604,7 @@ router.delete("/nurse-access/:id", asyncH(async (req, res) => {
   const row = await db.prepare("SELECT nurse_id, ward_id FROM nurse_access_assignments WHERE id=?")
     .get<{ nurse_id: number; ward_id: number }>(id);
   const result = await deleteNurseAccess(id, req.user!.id);
-  const stationId = row ? await stationIdForNurse(row.nurse_id) : undefined;
+  const stationId = row ? await stationIdsForNurse(row.nurse_id) : undefined;
   emitUpdate("bed:update", { nurseId: row?.nurse_id, wardId: row?.ward_id }, stationId ? { stationId } : undefined);
   res.json(result);
 }));

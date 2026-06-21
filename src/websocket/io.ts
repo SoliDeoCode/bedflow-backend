@@ -29,7 +29,11 @@ export function initWebsocket(server: HttpServer) {
         .get<{ pre_block_id: number | null }>(user.id);
       if (row?.pre_block_id) socket.join(`pre:${row.pre_block_id}`);
     }
-    if (user.role === "NURSE" && user.station_id) socket.join(`station:${user.station_id}`);
+    if (user.role === "NURSE") {
+      const rows = await db.prepare("SELECT station_id FROM nurse_stations WHERE nurse_id=?")
+        .all<{ station_id: number }>(user.id);
+      for (const r of rows) socket.join(`station:${r.station_id}`);
+    }
     if (user.role === "DOCTOR") {
       // Join a room per ward the doctor can currently reach (active blocks only).
       // This makes a bed change from ANY role (nurse/PRE/admin/doctor) land on
