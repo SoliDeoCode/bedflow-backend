@@ -118,7 +118,7 @@ export interface BedDetail {
   id: number; ward_id: number; bed_name: string;
   physical_status: string; reservation_status: string;
   bed_type: string; operational_status: boolean; ac_status: boolean;
-  payer_type: string | null;
+  payer_type: string | null; destination: string | null; reservation_note: string | null;
   updated_at: number; updated_by: number | null;
 }
 
@@ -129,7 +129,7 @@ export async function listBeds(
   operationalOnly = false,
 ): Promise<BedDetail[]> {
   let sql = `SELECT id, ward_id, bed_name, physical_status, reservation_status,
-                    bed_type, operational_status, ac_status, payer_type, updated_at, updated_by
+                    bed_type, operational_status, ac_status, payer_type, destination, reservation_note, updated_at, updated_by
              FROM bed_details WHERE ward_id=?`;
   const params: unknown[] = [wardId];
   if (operationalOnly) sql += " AND operational_status = true";
@@ -230,21 +230,22 @@ export async function updateBedMaster(opts: {
 
 export async function deleteBed(opts: { bedId: number; userId: number }) {
   const bed = await db.prepare(
-    "SELECT id, ward_id, bed_name, physical_status, reservation_status, payer_type FROM bed_details WHERE id=?"
-  ).get<{ id: number; ward_id: number; bed_name: string; physical_status: string; reservation_status: string; payer_type: string | null }>(opts.bedId);
+    "SELECT id, ward_id, bed_name, physical_status, reservation_status, payer_type, destination, reservation_note FROM bed_details WHERE id=?"
+  ).get<{ id: number; ward_id: number; bed_name: string; physical_status: string; reservation_status: string; payer_type: string | null; destination: string | null; reservation_note: string | null }>(opts.bedId);
   if (!bed) throw new HttpError(404, "Bed not found");
 
   await db.transaction(async () => {
     // Tombstone before DELETE — bed_id becomes NULL via SET NULL FK after row is gone,
-    // but bed_name/ward_id remain so history stays queryable.
+    // but bed_name/ward_id remain so history stays queryable. Deleting a bed never
+    // deletes its bed_movements rows or audit_logs entries — only this row.
     await db.prepare(
       `INSERT INTO bed_movements
-         (bed_id, bed_name, ward_id, old_physical, new_physical, old_reservation, new_reservation, payer_type, changed_by, changed_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?)`
+         (bed_id, bed_name, ward_id, old_physical, new_physical, old_reservation, new_reservation, payer_type, destination, reservation_note, changed_by, changed_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`
     ).run(opts.bedId, bed.bed_name, bed.ward_id,
           bed.physical_status, "DELETED",
           bed.reservation_status, "DELETED",
-          bed.payer_type, opts.userId, Date.now());
+          bed.payer_type, bed.destination, bed.reservation_note, opts.userId, Date.now());
     await db.prepare("DELETE FROM bed_details WHERE id=?").run(opts.bedId);
     await _recalcWardTotals(bed.ward_id, opts.userId);
   });
@@ -256,6 +257,8 @@ export async function deleteBed(opts: { bedId: number; userId: number }) {
       physical: bed.physical_status,
       reservation: bed.reservation_status,
       payer: bed.payer_type,
+      destination: bed.destination,
+      reservationNote: bed.reservation_note,
     },
   });
   return { ok: true };
@@ -263,18 +266,18 @@ export async function deleteBed(opts: { bedId: number; userId: number }) {
 
 export async function updateBedStatus(opts: {
   bedId: number; physicalStatus: string; reservationStatus: string;
-  payerType?: string | null; userId: number;
+  payerType?: string | null; destination?: string | null; reservationNote?: string | null; userId: number;
 }) {
   const bed = await db.prepare(
     `SELECT bd.id, bd.ward_id, bd.bed_name, bd.physical_status, bd.reservation_status,
-            bd.payer_type, bd.updated_at, bd.operational_status,
+            bd.payer_type, bd.destination, bd.reservation_note, bd.updated_at, bd.operational_status,
             w.operational AS ward_operational
      FROM bed_details bd
      JOIN wards w ON w.id = bd.ward_id
      WHERE bd.id = ?`
   ).get<{
     id: number; ward_id: number; bed_name: string; physical_status: string; reservation_status: string;
-    payer_type: string | null; updated_at: number;
+    payer_type: string | null; destination: string | null; reservation_note: string | null; updated_at: number;
     operational_status: boolean; ward_operational: boolean;
   }>(opts.bedId);
   if (!bed) throw new HttpError(404, "Bed not found");
@@ -301,34 +304,80 @@ export async function updateBedStatus(opts: {
     newPayerType = opts.payerType !== undefined ? (opts.payerType ?? null) : bed.payer_type;
   }
 
-  const noStatusChange = bed.physical_status === opts.physicalStatus && bed.reservation_status === opts.reservationStatus;
-  const noPayerChange  = (newPayerType ?? null) === (bed.payer_type ?? null);
-  if (noStatusChange && noPayerChange)
-    return { ok: true, ward_id: bed.ward_id, physical_status: opts.physicalStatus, reservation_status: opts.reservationStatus, payer_type: newPayerType };
+  // OCCUPIED+RESERVED means "patient is temporarily away at a destination
+  // (e.g. OT, Scanning) but the bed is held for them". Destination is required
+  // whenever the bed is entering or staying in that state, and is dropped
+  // automatically the moment it leaves (returns to plain OCCUPIED = patient
+  // came back; goes VACANT = patient did not come back). The bed_movements
+  // row for that leaving transition still carries the destination the patient
+  // had been sent to, so history reads as a complete story even though
+  // bed_details.destination itself is cleared.
+  const enteringOrStayingOccRes = opts.physicalStatus === "OCCUPIED" && opts.reservationStatus === "RESERVED";
+  const wasOccRes = bed.physical_status === "OCCUPIED" && bed.reservation_status === "RESERVED";
+
+  let newDestination: string | null;
+  if (enteringOrStayingOccRes) {
+    const dest = (opts.destination ?? "").toString().trim();
+    if (!dest) throw new HttpError(400, "Destination is required when a bed is Occupied + Reserved (e.g. OT, Scanning)");
+    newDestination = dest;
+  } else {
+    newDestination = null;
+  }
+  // What to record on the bed_movements row itself: the destination being set
+  // (entering/staying OCC+RES) or, when leaving OCC+RES, the destination the
+  // patient had been sent to — never silently dropped from history.
+  const movementDestination = enteringOrStayingOccRes ? newDestination : (wasOccRes ? bed.destination : null);
+
+  // VACANT+RESERVED means "bed held for an incoming patient" (e.g. transfer,
+  // scheduled admission). A note describing why is required, same as
+  // destination is required for OCC+RES.
+  const enteringOrStayingVacRes = opts.physicalStatus === "VACANT" && opts.reservationStatus === "RESERVED";
+  const wasVacRes = bed.physical_status === "VACANT" && bed.reservation_status === "RESERVED";
+
+  let newReservationNote: string | null;
+  if (enteringOrStayingVacRes) {
+    const note = opts.reservationNote !== undefined
+      ? (opts.reservationNote ?? "").toString().trim()
+      : (bed.reservation_note ?? "").trim();
+    if (!note) throw new HttpError(400, "A note is required when a bed is Vacant + Reserved (why is it being held?)");
+    newReservationNote = note;
+  } else {
+    newReservationNote = null;
+  }
+  const movementReservationNote = enteringOrStayingVacRes ? newReservationNote : (wasVacRes ? bed.reservation_note : null);
+
+  const noStatusChange      = bed.physical_status === opts.physicalStatus && bed.reservation_status === opts.reservationStatus;
+  const noPayerChange       = (newPayerType ?? null) === (bed.payer_type ?? null);
+  const noDestinationChange = (newDestination ?? null) === (bed.destination ?? null);
+  const noNoteChange        = (newReservationNote ?? null) === (bed.reservation_note ?? null);
+  if (noStatusChange && noPayerChange && noDestinationChange && noNoteChange)
+    return { ok: true, ward_id: bed.ward_id, physical_status: opts.physicalStatus, reservation_status: opts.reservationStatus, payer_type: newPayerType, destination: newDestination, reservation_note: newReservationNote };
 
   const now = Date.now();
   await db.transaction(async () => {
     // Optimistic lock: only update if nobody changed the row since we read it.
     const r = await db.prepare(
-      "UPDATE bed_details SET physical_status=?, reservation_status=?, payer_type=?, updated_at=?, updated_by=? WHERE id=? AND updated_at=?"
-    ).run(opts.physicalStatus, opts.reservationStatus, newPayerType, now, opts.userId, opts.bedId, bed.updated_at);
+      "UPDATE bed_details SET physical_status=?, reservation_status=?, payer_type=?, destination=?, reservation_note=?, updated_at=?, updated_by=? WHERE id=? AND updated_at=?"
+    ).run(opts.physicalStatus, opts.reservationStatus, newPayerType, newDestination, newReservationNote, now, opts.userId, opts.bedId, bed.updated_at);
     if (r.changes === 0)
       throw new HttpError(409, "This bed was just updated by someone else. Refresh to see the latest status.");
+    // bed_movements is an append-only audit trail — rows here are never
+    // updated or deleted, only ever inserted.
     await db.prepare(
       `INSERT INTO bed_movements
-         (bed_id, bed_name, ward_id, old_physical, new_physical, old_reservation, new_reservation, payer_type, changed_by, changed_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?)`
+         (bed_id, bed_name, ward_id, old_physical, new_physical, old_reservation, new_reservation, payer_type, destination, reservation_note, changed_by, changed_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`
     ).run(opts.bedId, bed.bed_name, bed.ward_id,
           bed.physical_status, opts.physicalStatus,
           bed.reservation_status, opts.reservationStatus,
-          newPayerType, opts.userId, now);
+          newPayerType, movementDestination, movementReservationNote, opts.userId, now);
     await _recalcWardTotals(bed.ward_id, opts.userId);
   });
 
   await audit(opts.userId, "bed_status_update", String(opts.bedId), {
-    old: { physical: bed.physical_status, reservation: bed.reservation_status, payer: bed.payer_type },
-    new: { physical: opts.physicalStatus,  reservation: opts.reservationStatus,  payer: newPayerType },
+    old: { physical: bed.physical_status, reservation: bed.reservation_status, payer: bed.payer_type, destination: bed.destination, note: bed.reservation_note },
+    new: { physical: opts.physicalStatus,  reservation: opts.reservationStatus,  payer: newPayerType,  destination: movementDestination, note: movementReservationNote },
     wardId: bed.ward_id,
   });
-  return { ok: true, ward_id: bed.ward_id, physical_status: opts.physicalStatus, reservation_status: opts.reservationStatus, payer_type: newPayerType };
+  return { ok: true, ward_id: bed.ward_id, physical_status: opts.physicalStatus, reservation_status: opts.reservationStatus, payer_type: newPayerType, destination: newDestination, reservation_note: newReservationNote };
 }

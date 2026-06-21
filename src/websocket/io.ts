@@ -23,13 +23,26 @@ export function initWebsocket(server: HttpServer) {
 
   io.on("connection", async (socket) => {
     const user = (socket.data as { user: JwtPayload }).user;
-    if (user.role === "COO" || user.role === "MANAGER") socket.join("overview");
+    if (user.role === "COO") socket.join("overview");
     if (user.role === "PRE") {
       const row = await db.prepare("SELECT pre_block_id FROM users WHERE id=?")
         .get<{ pre_block_id: number | null }>(user.id);
       if (row?.pre_block_id) socket.join(`pre:${row.pre_block_id}`);
     }
     if (user.role === "NURSE" && user.station_id) socket.join(`station:${user.station_id}`);
+    if (user.role === "DOCTOR") {
+      // Join a room per ward the doctor can currently reach (active blocks only).
+      // This makes a bed change from ANY role (nurse/PRE/admin/doctor) land on
+      // the doctor's live view, since every bed:update payload carries wardId.
+      const rooms = await db.prepare(
+        `SELECT DISTINCT dbw.ward_id
+         FROM doctor_block_users dbu
+         JOIN doctor_blocks db        ON db.id = dbu.doctor_block_id AND db.status = 'active'
+         JOIN doctor_block_wards dbw  ON dbw.doctor_block_id = db.id
+         WHERE dbu.user_id = ?`
+      ).all<{ ward_id: number }>(user.id);
+      for (const r of rooms) socket.join(`ward:${r.ward_id}`);
+    }
   });
 
   return io;
@@ -41,7 +54,7 @@ export function initWebsocket(server: HttpServer) {
 export function emitUpdate(
   event: string,
   data: unknown,
-  opts?: { pre?: string | string[]; stationId?: number | number[] },
+  opts?: { pre?: string | string[]; stationId?: number | number[]; wardId?: number | number[] },
 ) {
   if (!io) return;
   io.to("overview").emit(event, data);
@@ -53,4 +66,14 @@ export function emitUpdate(
     const stations = Array.isArray(opts.stationId) ? opts.stationId : [opts.stationId];
     for (const s of stations) io.to(`station:${s}`).emit(event, data);
   }
+  // Ward rooms power the Doctor live view. Prefer an explicit opts.wardId, but
+  // fall back to the wardId carried in the payload so existing bed:update call
+  // sites (nurse/PRE/admin) reach watching doctors without needing changes.
+  const wardIds = opts?.wardId !== undefined
+    ? (Array.isArray(opts.wardId) ? opts.wardId : [opts.wardId])
+    : (() => {
+        const w = (data as { wardId?: unknown })?.wardId;
+        return typeof w === "number" ? [w] : [];
+      })();
+  for (const w of wardIds) io.to(`ward:${w}`).emit(event, data);
 }

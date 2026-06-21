@@ -6,9 +6,11 @@ CREATE TABLE IF NOT EXISTS users (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
   username      TEXT NOT NULL UNIQUE,
   password_hash TEXT NOT NULL,
-  role          TEXT NOT NULL CHECK (role IN ('PRE','MANAGER','COO')),
+  role          TEXT NOT NULL CHECK (role IN ('PRE','COO','NURSE','DOCTOR')),
   name          TEXT NOT NULL,
   shift         TEXT NOT NULL DEFAULT 'morning' CHECK (shift IN ('morning','night')),
+  status        TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','inactive')),
+  remarks       TEXT,
   created_at    INTEGER NOT NULL,
   updated_at    INTEGER NOT NULL
 );
@@ -71,7 +73,8 @@ CREATE INDEX IF NOT EXISTS idx_assign_user ON pre_assignments(user_id);
 -- immutable log of every bed count change
 CREATE TABLE IF NOT EXISTS bed_status_updates (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
-  ward_id    INTEGER NOT NULL REFERENCES wards(id) ON DELETE CASCADE,
+  ward_id    INTEGER REFERENCES wards(id) ON DELETE SET NULL,
+  ward_name  TEXT,
   vacant     INTEGER NOT NULL,
   reserved   INTEGER NOT NULL,
   occupied   INTEGER NOT NULL,
@@ -124,12 +127,13 @@ CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_logs(ts);
 
 -- periodic hospital-wide occupancy snapshots (for charts/history)
 CREATE TABLE IF NOT EXISTS occupancy_snapshots (
-  id         INTEGER PRIMARY KEY AUTOINCREMENT,
-  ts         INTEGER NOT NULL,
-  total      INTEGER NOT NULL,
-  vacant     INTEGER NOT NULL,
-  reserved   INTEGER NOT NULL,
-  occupied   INTEGER NOT NULL
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts             INTEGER NOT NULL,
+  total          INTEGER NOT NULL,
+  vacant         INTEGER NOT NULL,
+  reserved       INTEGER NOT NULL,
+  occupied       INTEGER NOT NULL,
+  payer_snapshot TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_snap_ts ON occupancy_snapshots(ts);
 

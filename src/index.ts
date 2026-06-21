@@ -14,6 +14,7 @@ import managerRoutes from "./routes/manager.js";
 import cooRoutes from "./routes/coo.js";
 import metaRoutes from "./routes/meta.js";
 import nurseRoutes from "./routes/nurse.js";
+import doctorRoutes from "./routes/doctor.js";
 
 // Serialize BigInt as Number in all JSON responses (timestamps are epoch-ms BigInt in Postgres)
 (BigInt.prototype as unknown as { toJSON: () => number }).toJSON = function () {
@@ -60,6 +61,7 @@ app.get("/api/health", (_req, res) => res.json({ ok: true }));
 app.use("/api/auth", authRoutes);
 app.use("/api/pre", preRoutes);
 app.use("/api/nurse", nurseRoutes);
+app.use("/api/doctor", doctorRoutes);
 app.use("/api/manager", managerRoutes);
 app.use("/api/coo", cooRoutes);
 app.use("/api/push", pushLimiter);

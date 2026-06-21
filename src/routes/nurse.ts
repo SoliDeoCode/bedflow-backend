@@ -4,6 +4,7 @@ import { authRequired, requireRole } from "../middleware/auth.js";
 import { asyncH, HttpError } from "../middleware/error.js";
 import { listBeds, updateBedStatus } from "../services/bedDetailService.js";
 import { listPayerTypes } from "../services/payerTypeService.js";
+import { listDestinations } from "../services/destinationService.js";
 import { emitUpdate } from "../websocket/io.js";
 import { db } from "../db/index.js";
 
@@ -141,13 +142,19 @@ router.get("/payer-types", asyncH(async (_req, res) => {
   res.json({ payerTypes: await listPayerTypes(true) });
 }));
 
+router.get("/destinations", asyncH(async (_req, res) => {
+  res.json({ destinations: await listDestinations(true) });
+}));
+
 router.patch("/beds/:id/status", asyncH(async (req, res) => {
   const station = await getMyStation(req);
   const bedId = Number(req.params.id);
-  const { physical_status, reservation_status, payer_type } = z.object({
+  const { physical_status, reservation_status, payer_type, destination, reservation_note } = z.object({
     physical_status:    z.enum(["VACANT", "OCCUPIED"]),
     reservation_status: z.enum(["NONE", "RESERVED"]),
     payer_type:         z.string().max(100).nullable().optional(),
+    destination:        z.string().max(100).nullable().optional(),
+    reservation_note:   z.string().max(255).nullable().optional(),
   }).parse(req.body);
 
   const allowed = await canNurseAccessBed(req.user!.id, bedId, station.id);
@@ -155,7 +162,7 @@ router.patch("/beds/:id/status", asyncH(async (req, res) => {
 
   const result = await updateBedStatus({
     bedId, physicalStatus: physical_status, reservationStatus: reservation_status,
-    payerType: payer_type, userId: req.user!.id,
+    payerType: payer_type, destination, reservationNote: reservation_note, userId: req.user!.id,
   });
 
   const preBlockRow = await db.prepare(
@@ -165,7 +172,7 @@ router.patch("/beds/:id/status", asyncH(async (req, res) => {
   emitUpdate("bed:update", {
     bedId, wardId: result.ward_id, stationId: station.id,
     physicalStatus: physical_status, reservationStatus: reservation_status,
-    payerType: result.payer_type,
+    payerType: result.payer_type, destination: result.destination, reservationNote: result.reservation_note,
   }, {
     stationId: station.id,
     pre: preBlockRow ? String(preBlockRow.pre_block_id) : undefined,

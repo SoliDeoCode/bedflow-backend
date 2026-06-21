@@ -36,6 +36,7 @@ const CATEGORY_ACTIONS: Record<string, string[]> = {
     "nurse_create", "nurse_edit", "nurse_delete",
     "nurse_access_create", "nurse_access_edit", "nurse_access_update", "nurse_access_delete",
     "payer_type_create", "payer_type_update", "payer_type_delete",
+    "destination_create", "destination_update", "destination_delete",
   ],
 };
 
@@ -116,6 +117,7 @@ async function enrichActivityRows(rows: Array<{
   const bedIds = new Set<number>(), wardIds = new Set<number>(), userIds = new Set<number>();
   const stationIds = new Set<number>(), floorIds = new Set<number>(), blockIds = new Set<number>();
   const payerIds = new Set<number>(), preBlockIds = new Set<number>();
+  const destinationIds = new Set<number>();
   const BED_ENTITY = new Set(["bed_status_update", "bed_master_edit", "bed_rename", "bed_delete"]);
 
   for (const r of parsed) {
@@ -129,6 +131,7 @@ async function enrichActivityRows(rows: Array<{
     if (typeof d.floorId === "number") floorIds.add(d.floorId);
     if (typeof d.blockId === "number") blockIds.add(d.blockId);
     if (r.action.startsWith("payer_type") && numEntity(r) != null) payerIds.add(numEntity(r)!);
+    if (r.action.startsWith("destination") && numEntity(r) != null) destinationIds.add(numEntity(r)!);
     if (r.action === "round_submit") { const m = /^pb(\d+)$/.exec(String(r.entity ?? "")); if (m) preBlockIds.add(Number(m[1])); }
   }
 
@@ -145,7 +148,7 @@ async function enrichActivityRows(rows: Array<{
       .all<{ id: number; bed_name: string; ward_id: number }>([...bedIds]);
     for (const b of bd) { bedMap.set(Number(b.id), { bed_name: b.bed_name, ward_id: Number(b.ward_id) }); wardIds.add(Number(b.ward_id)); }
   }
-  const [wardMap, userMap, stationMap, floorMap, blockMap, payerMap, preBlockMap] = await Promise.all([
+  const [wardMap, userMap, stationMap, floorMap, blockMap, payerMap, preBlockMap, destinationMap] = await Promise.all([
     loadMap("SELECT id, name AS label FROM wards WHERE id = ANY(?)", wardIds),
     loadMap("SELECT id, name AS label FROM users WHERE id = ANY(?)", userIds),
     loadMap("SELECT id, name AS label FROM nursing_stations WHERE id = ANY(?)", stationIds),
@@ -153,6 +156,7 @@ async function enrichActivityRows(rows: Array<{
     loadMap("SELECT id, name AS label FROM building_blocks WHERE id = ANY(?)", blockIds),
     loadMap("SELECT id, name AS label FROM payer_types WHERE id = ANY(?)", payerIds),
     loadMap("SELECT id, name AS label FROM pre_blocks WHERE id = ANY(?)", preBlockIds),
+    loadMap("SELECT id, name AS label FROM destinations WHERE id = ANY(?)", destinationIds),
   ]);
 
   const minToClock = (m: number) => {
@@ -204,6 +208,7 @@ async function enrichActivityRows(rows: Array<{
       else if (a.startsWith("nurse_access")) target = nurseName;
       else if (a === "nurse_create" || a === "nurse_edit" || a === "nurse_delete" || a === "pre_create" || a === "pre_edit" || a === "pre_delete") target = userName ?? d.name ?? null;
       else if (a.startsWith("payer_type")) target = d.name ?? (numEntity(r) != null ? payerMap.get(numEntity(r)!) ?? null : null);
+      else if (a.startsWith("destination")) target = d.name ?? (numEntity(r) != null ? destinationMap.get(numEntity(r)!) ?? null : null);
       else if (a.startsWith("ward")) target = wardName ?? d.name ?? null;
       else if (a.startsWith("station")) target = stationName ?? (numEntity(r) == null ? r.entity : null);
       else if (a.startsWith("floor")) target = floorName ?? (numEntity(r) == null ? r.entity : null);
@@ -218,7 +223,7 @@ async function enrichActivityRows(rows: Array<{
     if (d.old && d.new) {
       if (bedName) info.push({ label: "Bed", value: bedName });
       if (wardName) info.push({ label: "Ward", value: wardName });
-      for (const [lbl, key] of [["Physical", "physical"], ["Reservation", "reservation"], ["Payer", "payer"]] as const) {
+      for (const [lbl, key] of [["Physical", "physical"], ["Reservation", "reservation"], ["Payer", "payer"], ["Destination", "destination"], ["Note", "note"]] as const) {
         const ov = d.old[key], nv = d.new[key];
         if (ov != null || nv != null) info.push({ label: lbl, value: `${ov ?? "—"} → ${nv ?? "—"}` });
       }
@@ -246,9 +251,22 @@ async function enrichActivityRows(rows: Array<{
           to:   { physical: d.new.physical, reservation: d.new.reservation } }
       : null;
 
+    // A bed leaving OCCUPIED+RESERVED tells a complete story on its own: the
+    // patient either came back to this bed, or didn't — surface that in plain
+    // language instead of making the reader infer it from raw status codes.
+    let note: string | null = null;
+    if (change && d.old.physical === "OCCUPIED" && d.old.reservation === "RESERVED") {
+      const dest = d.new.destination || d.old.destination;
+      if (change.to.physical === "OCCUPIED" && change.to.reservation === "NONE") {
+        note = dest ? `Patient returned from ${dest}` : "Patient returned";
+      } else if (change.to.physical === "VACANT") {
+        note = dest ? `Patient did not return from ${dest}` : "Patient did not return";
+      }
+    }
+
     return {
       id: r.id, ts: Number(r.ts), action: r.action,
-      target, bedName, wardName, info, change,
+      target, bedName, wardName, info, change, note,
       userId: r.user_id, username: r.username, name: r.name, role: r.role,
     };
   });

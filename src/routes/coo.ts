@@ -10,7 +10,7 @@ import { db } from "../db/index.js";
 import { HttpError } from "../middleware/error.js";
 
 const router = Router();
-router.use(authRequired, requireRole("COO", "MANAGER"));
+router.use(authRequired, requireRole("COO"));
 
 router.get("/overview", asyncH(async (_req, res) => {
   const base = await orgOverview();
@@ -84,7 +84,7 @@ router.get("/activity", asyncH(async (req, res) => {
   const q = z.object({
     from:       z.coerce.number().int().optional(),
     to:         z.coerce.number().int().optional(),
-    roles:      z.string().optional(),       // CSV: PRE,NURSE,MANAGER,COO
+    roles:      z.string().optional(),       // CSV: PRE,NURSE,COO
     userId:     z.coerce.number().int().positive().optional(),
     categories: z.string().optional(),       // CSV: bed,round,config,login
     q:          z.string().max(100).optional(),
@@ -290,9 +290,102 @@ router.get("/nurse-activity", asyncH(async (_req, res) => {
 
 router.get("/snapshots", asyncH(async (_req, res) => {
   const rows = await db.prepare(
-    "SELECT ts,total,vacant,reserved,occupied FROM occupancy_snapshots ORDER BY ts DESC LIMIT 48"
-  ).all();
-  res.json({ snapshots: rows.reverse() });
+    "SELECT ts,total,vacant,reserved,occupied,payer_snapshot FROM occupancy_snapshots ORDER BY ts DESC LIMIT 48"
+  ).all<{ ts: number; total: number; vacant: number; reserved: number; occupied: number; payer_snapshot: Record<string, number> | null }>();
+  // pg auto-parses the jsonb column; older rows predate this column and are NULL.
+  const snapshots = rows.reverse().map((r) => ({ ...r, payers: r.payer_snapshot || {} }));
+  res.json({ snapshots });
+}));
+
+// Occupancy trend for the dashboard chart.
+// - "today": hourly occupancy_snapshots for the current IST day.
+// - "7d": hourly occupancy_snapshots across the full 7-day window — real
+//   timestamped history, not just one point per day — falling back to that
+//   single day's midnight_census point only for days with zero snapshots
+//   (e.g. the server was down through midnight that day).
+// - "30d"/"1y": one point per day from midnight_census; hourly granularity
+//   over that many days would be hundreds/thousands of points and isn't
+//   practical for this chart.
+router.get("/occupancy-trend", asyncH(async (req, res) => {
+  const range = String(req.query.range || "7d");
+  const points: Array<{ label: string; pct: number }> = [];
+  const IST = 5.5 * 3600 * 1000;
+  const startOfTodayIST = Math.floor((Date.now() + IST) / 86400000) * 86400000 - IST;
+
+  if (range === "today") {
+    const rows = await db.prepare(
+      "SELECT ts,total,occupied FROM occupancy_snapshots WHERE ts >= ? ORDER BY ts ASC"
+    ).all<{ ts: number; total: number; occupied: number }>(startOfTodayIST);
+    for (const r of rows) {
+      const pct = r.total > 0 ? Math.round((r.occupied / r.total) * 100) : 0;
+      points.push({ label: new Date(Number(r.ts)).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", timeZone: "Asia/Kolkata" }), pct });
+    }
+  } else if (range === "7d") {
+    const windowStart = startOfTodayIST - 6 * 86400000; // today + 6 days back = 7 calendar days
+    const rows = await db.prepare(
+      "SELECT ts,total,occupied FROM occupancy_snapshots WHERE ts >= ? ORDER BY ts ASC"
+    ).all<{ ts: number; total: number; occupied: number }>(windowStart);
+
+    const hourlyPoints = rows.map((r) => ({
+      ts: Number(r.ts),
+      label: new Date(Number(r.ts)).toLocaleString("en-IN", {
+        day: "numeric", month: "short", hour: "2-digit", minute: "2-digit", timeZone: "Asia/Kolkata",
+      }),
+      pct: r.total > 0 ? Math.round((r.occupied / r.total) * 100) : 0,
+    }));
+    // Which IST calendar days in the window actually have an hourly snapshot
+    const daysWithSnapshots = new Set(rows.map((r) => new Date(Number(r.ts) + IST).toISOString().slice(0, 10)));
+
+    // Fill any day in the window with zero hourly data using its midnight_census point,
+    // so a server-downtime gap shows as one sparse point instead of a dead blank stretch.
+    const censusRows = await db.prepare(
+      "SELECT census_date, ts, snapshot FROM midnight_census WHERE census_date >= ? ORDER BY census_date ASC"
+    ).all<{ census_date: string; ts: number; snapshot: string }>(
+      new Date(windowStart + IST).toISOString().slice(0, 10)
+    );
+    const fallbackPoints = censusRows
+      .filter((row) => !daysWithSnapshots.has(row.census_date))
+      .map((row) => {
+        let total = 0, occ = 0;
+        try {
+          const wards = JSON.parse(row.snapshot) as Array<{ total: number; occupied: number; occupied_reserved: number }>;
+          for (const w of wards) { total += w.total || 0; occ += (w.occupied || 0) + (w.occupied_reserved || 0); }
+        } catch { /* skip malformed */ }
+        const d = new Date(row.census_date + "T00:00:00");
+        return {
+          ts: Number(row.ts),
+          label: d.toLocaleDateString("en-GB", { day: "numeric", month: "short" }) + " (midnight only)",
+          pct: total > 0 ? Math.round((occ / total) * 100) : 0,
+        };
+      });
+
+    for (const p of [...hourlyPoints, ...fallbackPoints].sort((a, b) => a.ts - b.ts))
+      points.push({ label: p.label, pct: p.pct });
+  } else {
+    const days = range === "1y" ? 365 : 30;
+    const rows = await db.prepare(
+      "SELECT census_date, snapshot FROM midnight_census ORDER BY census_date DESC LIMIT ?"
+    ).all<{ census_date: string; snapshot: string }>(days);
+    for (const row of rows.reverse()) {
+      let total = 0, occ = 0;
+      try {
+        const wards = JSON.parse(row.snapshot) as Array<{ total: number; occupied: number; occupied_reserved: number }>;
+        for (const w of wards) { total += w.total || 0; occ += (w.occupied || 0) + (w.occupied_reserved || 0); }
+      } catch { /* skip malformed */ }
+      const pct = total > 0 ? Math.round((occ / total) * 100) : 0;
+      const d = new Date(row.census_date + "T00:00:00");
+      points.push({ label: d.toLocaleDateString("en-GB", { day: "numeric", month: "short" }), pct });
+    }
+  }
+
+  const vals = points.map((p) => p.pct);
+  const avg  = vals.length ? Math.round(vals.reduce((a, b) => a + b, 0) / vals.length) : 0;
+  let high = { pct: 0, label: "—" }, low = { pct: 0, label: "—" };
+  if (points.length) {
+    high = points.reduce((m, p) => (p.pct > m.pct ? p : m), points[0]);
+    low  = points.reduce((m, p) => (p.pct < m.pct ? p : m), points[0]);
+  }
+  res.json({ points, avg, high, low });
 }));
 
 // ── Saved Views ───────────────────────────────────────────────────────────────

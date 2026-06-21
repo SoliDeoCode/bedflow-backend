@@ -1,4 +1,7 @@
-export type Role = "PRE" | "MANAGER" | "COO" | "NURSE";
+// COO is the single management role, presented in the UI as "Admin".
+// The former MANAGER role was merged into COO (migration 20260621000000).
+// DOCTOR updates beds in assigned Doctor Blocks (migration 20260622000000).
+export type Role = "PRE" | "COO" | "NURSE" | "DOCTOR";
 
 export interface User {
   id: number;
@@ -12,6 +15,8 @@ export interface User {
   pre_block_id: number | null;   // PRE Block assignment (new)
   nursing_station: string | null;
   station_id: number | null;
+  status: "active" | "inactive";
+  remarks: string | null;
   created_at: number;
   updated_at: number;
 }

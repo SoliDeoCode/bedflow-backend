@@ -10,6 +10,7 @@ import {
   createWard, editWard, deleteWard,
   createPre, editPre, setPreShift, deletePre,
   createNurse, editNurse, deleteNurse,
+  createDoctor, editDoctor, deleteDoctor,
   listNursingStations, createNursingStation, editNursingStation, deleteNursingStation, assignWardsToStation,
   availableDates, censusDates, historyForDate,
   listNurseAccess, createNurseAccess, editNurseAccess, deleteNurseAccess,
@@ -19,19 +20,26 @@ import {
   setPreBlockStatus, deletePreBlock,
 } from "../services/preBlockService.js";
 import {
+  listDoctorBlocks, getDoctorBlock, createDoctorBlock, editDoctorBlock,
+  setDoctorBlockStatus, deleteDoctorBlock, wardIdsForDoctorBlock,
+} from "../services/doctorBlockService.js";
+import {
   generateBeds, addSingleBed, listBeds, renameBed, deleteBed, updateBedMaster,
 } from "../services/bedDetailService.js";
 import { midnightCensusFor } from "../services/bedService.js";
 import {
   listPayerTypes, createPayerType, updatePayerType, reorderPayerType, deletePayerType,
 } from "../services/payerTypeService.js";
+import {
+  listDestinations, createDestination, updateDestination, reorderDestination, deleteDestination,
+} from "../services/destinationService.js";
 
 const router = Router();
-router.use(authRequired, requireRole("MANAGER", "COO"));
+router.use(authRequired, requireRole("COO"));
 
 // Nurses only join the `station:<id>` socket room, not `overview` — these
-// helpers let mutation routes target the right nurse station(s) so a manager's
-// edit is visible on the nurse's dashboard too, not just COO/Manager's.
+// helpers let mutation routes target the right nurse station(s) so an Admin's
+// edit is visible on the nurse's dashboard too, not just the Admin's.
 async function stationIdForWard(wardId: number): Promise<number | undefined> {
   const row = await db.prepare("SELECT station_id FROM wards WHERE id=?")
     .get<{ station_id: number | null }>(wardId);
@@ -229,7 +237,7 @@ router.delete("/wards/:id", asyncH(async (req, res) => {
 
 router.get("/users", asyncH(async (_req, res) => {
   const users = await db.prepare(
-    `SELECT u.id, u.username, u.role, u.name, u.shift,
+    `SELECT u.id, u.username, u.role, u.name, u.shift, u.status, u.remarks,
             u.pre_block_id, u.station_id, u.nursing_station,
             pb.name AS pre_block_name,
             ns.name AS station_name
@@ -303,6 +311,39 @@ router.put("/nurses/:id", asyncH(async (req, res) => {
 
 router.delete("/nurses/:id", asyncH(async (req, res) => {
   res.json(await deleteNurse(Number(req.params.id), req.user!.id));
+}));
+
+// ── Doctor users ──────────────────────────────────────────────────────────────
+// Strong password: ≥8 chars with at least one letter and one number.
+const strongPassword = z.string()
+  .min(8, "Password must be at least 8 characters.")
+  .max(72, "Password is too long.")
+  .regex(/[A-Za-z]/, "Password must contain at least one letter.")
+  .regex(/[0-9]/, "Password must contain at least one number.");
+
+router.post("/doctors", asyncH(async (req, res) => {
+  const b = z.object({
+    username: z.string().min(1, "Username is required.").max(40, "Username must be 40 characters or less."),
+    password: strongPassword,
+    name:     z.string().min(1, "Display name is required.").max(80, "Display name is too long."),
+    status:   z.enum(["active", "inactive"]).optional(),
+    remarks:  z.string().max(500).optional(),
+  }).parse(req.body);
+  res.status(201).json(await createDoctor({ ...b, adminId: req.user!.id }));
+}));
+
+router.put("/doctors/:id", asyncH(async (req, res) => {
+  const b = z.object({
+    name:     z.string().min(1, "Display name is required.").max(80, "Display name is too long.").optional(),
+    password: strongPassword.optional(),
+    status:   z.enum(["active", "inactive"]).optional(),
+    remarks:  z.string().max(500).nullable().optional(),
+  }).parse(req.body);
+  res.json(await editDoctor({ userId: Number(req.params.id), ...b, adminId: req.user!.id }));
+}));
+
+router.delete("/doctors/:id", asyncH(async (req, res) => {
+  res.json(await deleteDoctor(Number(req.params.id), req.user!.id));
 }));
 
 // ── bed details ───────────────────────────────────────────────────────────────
@@ -617,6 +658,63 @@ router.delete("/pre-blocks/:id", asyncH(async (req, res) => {
   res.json(result);
 }));
 
+// ── Doctor Blocks ───────────────────────────────────────────────────────────────
+
+router.get("/doctor-blocks", asyncH(async (_req, res) => {
+  res.json({ blocks: await listDoctorBlocks() });
+}));
+
+router.get("/doctor-blocks/:id", asyncH(async (req, res) => {
+  res.json(await getDoctorBlock(Number(req.params.id)));
+}));
+
+router.post("/doctor-blocks", asyncH(async (req, res) => {
+  const { name, description, wardIds, doctorIds } = z.object({
+    name:        z.string().min(1).max(100),
+    description: z.string().max(500).optional(),
+    wardIds:     z.array(z.number().int()).optional(),
+    doctorIds:   z.array(z.number().int()).optional(),
+  }).parse(req.body);
+  const result = await createDoctorBlock({ name, description, wardIds, doctorIds, adminId: req.user!.id });
+  emitUpdate("bed:update", { doctorBlockId: result.id }, { wardId: wardIds ?? [] });
+  res.status(201).json(result);
+}));
+
+router.put("/doctor-blocks/:id", asyncH(async (req, res) => {
+  const { name, description, wardIds, doctorIds } = z.object({
+    name:        z.string().min(1).max(100).optional(),
+    description: z.string().max(500).nullable().optional(),
+    wardIds:     z.array(z.number().int()).optional(),
+    doctorIds:   z.array(z.number().int()).optional(),
+  }).parse(req.body);
+  const blockId = Number(req.params.id);
+  // Ward rooms before AND after the edit must be notified (a ward could be removed).
+  const before = await wardIdsForDoctorBlock(blockId);
+  const result = await editDoctorBlock({
+    blockId, name, description: description ?? undefined, wardIds, doctorIds, adminId: req.user!.id,
+  });
+  const after = await wardIdsForDoctorBlock(blockId);
+  emitUpdate("bed:update", { doctorBlockId: blockId }, { wardId: [...new Set([...before, ...after])] });
+  res.json(result);
+}));
+
+router.patch("/doctor-blocks/:id/status", asyncH(async (req, res) => {
+  const { status } = z.object({ status: z.enum(["active", "inactive"]) }).parse(req.body);
+  const blockId = Number(req.params.id);
+  const wardIds = await wardIdsForDoctorBlock(blockId);
+  const result = await setDoctorBlockStatus(blockId, status, req.user!.id);
+  emitUpdate("bed:update", { doctorBlockId: blockId, status }, { wardId: wardIds });
+  res.json(result);
+}));
+
+router.delete("/doctor-blocks/:id", asyncH(async (req, res) => {
+  const blockId = Number(req.params.id);
+  const wardIds = await wardIdsForDoctorBlock(blockId);
+  const result = await deleteDoctorBlock(blockId, req.user!.id);
+  emitUpdate("bed:update", { doctorBlockId: blockId }, { wardId: wardIds });
+  res.json(result);
+}));
+
 // ── Payer Types ───────────────────────────────────────────────────────────────
 router.get("/payer-types", asyncH(async (_req, res) => {
   res.json({ payerTypes: await listPayerTypes() });
@@ -652,6 +750,44 @@ router.delete("/payer-types/:id", asyncH(async (req, res) => {
   const id = Number(req.params.id);
   const result = await deletePayerType({ id, userId: req.user!.id });
   emitUpdate("bed:update", { payerTypeId: id });
+  res.json(result);
+}));
+
+// ── Destinations ──────────────────────────────────────────────────────────────
+router.get("/destinations", asyncH(async (_req, res) => {
+  res.json({ destinations: await listDestinations() });
+}));
+
+router.post("/destinations", asyncH(async (req, res) => {
+  const { name } = z.object({ name: z.string().min(1).max(100) }).parse(req.body);
+  const result = await createDestination({ name, userId: req.user!.id });
+  emitUpdate("bed:update", { destinationId: result.id });
+  res.status(201).json(result);
+}));
+
+router.put("/destinations/:id", asyncH(async (req, res) => {
+  const { name, active } = z.object({
+    name:   z.string().min(1).max(100).optional(),
+    active: z.boolean().optional(),
+  }).parse(req.body);
+  const id = Number(req.params.id);
+  const result = await updateDestination({ id, name, active, userId: req.user!.id });
+  emitUpdate("bed:update", { destinationId: id });
+  res.json(result);
+}));
+
+router.patch("/destinations/:id/order", asyncH(async (req, res) => {
+  const { direction } = z.object({ direction: z.enum(["up", "down"]) }).parse(req.body);
+  const id = Number(req.params.id);
+  const result = await reorderDestination({ id, direction, userId: req.user!.id });
+  emitUpdate("bed:update", { destinationId: id });
+  res.json(result);
+}));
+
+router.delete("/destinations/:id", asyncH(async (req, res) => {
+  const id = Number(req.params.id);
+  const result = await deleteDestination({ id, userId: req.user!.id });
+  emitUpdate("bed:update", { destinationId: id });
   res.json(result);
 }));
 

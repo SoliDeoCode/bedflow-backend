@@ -2,11 +2,33 @@ import bcrypt from "bcryptjs";
 import { db } from "../db/index.js";
 import { HttpError } from "../middleware/error.js";
 import { audit } from "./auditService.js";
+import { deleteBed } from "./bedDetailService.js";
 
 const now = () => Date.now();
 
 function isUniqueViolation(err: unknown): boolean {
   return /unique/i.test(String((err as { message?: string })?.message ?? ""));
+}
+
+// Format a list of names for a user-facing message: "A", "A" and "B",
+// "A", "B" and "C" (caps the list so the message stays readable).
+function quoteList(names: string[], max = 4): string {
+  const shown = names.slice(0, max).map((n) => `"${n}"`);
+  const extra = names.length - shown.length;
+  const tail = extra > 0 ? `${shown.join(", ")} and ${extra} more` : shown.length > 1
+    ? `${shown.slice(0, -1).join(", ")} and ${shown[shown.length - 1]}`
+    : shown[0] ?? "";
+  return tail;
+}
+
+// Combine multiple independent blocking reasons into one sentence fragment, so
+// a delete guard can report ALL reasons at once instead of only the first one
+// found (which would otherwise force the manager to fix issues one at a time,
+// hitting a new 409 on every retry): "A"; "A and B"; "A; B and C".
+function joinClauses(clauses: string[]): string {
+  return clauses.length > 1
+    ? `${clauses.slice(0, -1).join("; ")} and ${clauses[clauses.length - 1]}`
+    : clauses[0] ?? "";
 }
 
 // ── BUILDING BLOCKS (Block A / Block B …) ────────────────────────────────────
@@ -308,9 +330,9 @@ export async function editWard(opts: {
       await db.prepare("UPDATE wards SET operational=?, updated_at=? WHERE id=?")
         .run(opts.operational, t, opts.wardId);
       await db.prepare(
-        `INSERT INTO ward_operational_log (ward_id, changed_by, changed_at, old_value, new_value)
-         VALUES (?,?,?,?,?)`
-      ).run(opts.wardId, opts.managerId, t, ward.operational, opts.operational);
+        `INSERT INTO ward_operational_log (ward_id, ward_name, changed_by, changed_at, old_value, new_value)
+         VALUES (?,?,?,?,?,?)`
+      ).run(opts.wardId, ward.name, opts.managerId, t, ward.operational, opts.operational);
     }
   });
 
@@ -322,12 +344,67 @@ export async function editWard(opts: {
 }
 
 export async function deleteWard(wardId: number, managerId: number) {
-  const ward = await db.prepare("SELECT floor_id FROM wards WHERE id=?")
-    .get<{ floor_id: number }>(wardId);
+  const ward = await db.prepare("SELECT id, name, floor_id FROM wards WHERE id=?")
+    .get<{ id: number; name: string; floor_id: number }>(wardId);
   if (!ward) throw new HttpError(404, "Ward not found");
+
+  // Guard against silent data loss: pre_block_wards.ward_id, nurse_access_assignments.ward_id,
+  // and doctor_block_wards.ward_id all cascade ON DELETE, so deleting the ward
+  // would quietly strip it from its PRE block, any nurse's access, and any
+  // Doctor Block. Check ALL three up front (not just the first match) so the
+  // manager sees every reason at once instead of hitting a new 409 on every retry.
+  const blockers: string[] = [];
+
+  const preBlocks = await db.prepare(
+    `SELECT pb.name FROM pre_block_wards pbw
+       JOIN pre_blocks pb ON pb.id = pbw.pre_block_id
+      WHERE pbw.ward_id = ? ORDER BY pb.name`
+  ).all<{ name: string }>(wardId);
+  if (preBlocks.length)
+    blockers.push(`part of PRE Block ${quoteList(preBlocks.map(b => b.name))}`);
+
+  const nurses = await db.prepare(
+    `SELECT DISTINCT u.name FROM nurse_access_assignments na
+       JOIN users u ON u.id = na.nurse_id
+      WHERE na.ward_id = ? AND na.status = 'active' ORDER BY u.name`
+  ).all<{ name: string }>(wardId);
+  if (nurses.length)
+    blockers.push(`assigned to nurse ${quoteList(nurses.map(n => n.name))}`);
+
+  const doctorBlocks = await db.prepare(
+    `SELECT db.name FROM doctor_block_wards dbw
+       JOIN doctor_blocks db ON db.id = dbw.doctor_block_id
+      WHERE dbw.ward_id = ? ORDER BY db.name`
+  ).all<{ name: string }>(wardId);
+  if (doctorBlocks.length)
+    blockers.push(`part of Doctor Block ${quoteList(doctorBlocks.map(b => b.name))}`);
+
+  // bed_details.ward_id cascades ON DELETE too — refuse while any bed in the
+  // ward is OCCUPIED (a live patient), the same "blocked while in use" rule
+  // deletePayerType already applies. Vacant beds are not blocked: they're
+  // auto-deleted just below via the normal per-bed path, so each one is still
+  // properly tombstoned into bed_movements instead of silently cascading away.
+  const occupiedBeds = await db.prepare(
+    "SELECT bed_name FROM bed_details WHERE ward_id=? AND physical_status='OCCUPIED' ORDER BY bed_name"
+  ).all<{ bed_name: string }>(wardId);
+  if (occupiedBeds.length)
+    blockers.push(`currently holding ${occupiedBeds.length} occupied bed${occupiedBeds.length > 1 ? "s" : ""} (${quoteList(occupiedBeds.map(b => b.bed_name))})`);
+
+  if (blockers.length)
+    throw new HttpError(409,
+      `Ward "${ward.name}" is ${joinClauses(blockers)}. Remove these before deleting the ward.`);
+
+  // No occupied beds remain (checked above) — any beds still here are vacant.
+  // Delete them through the normal per-bed path so each gets a proper
+  // bed_movements tombstone, instead of letting the ward delete cascade them
+  // away with no record at all.
+  const remainingBeds = await db.prepare("SELECT id FROM bed_details WHERE ward_id=?")
+    .all<{ id: number }>(wardId);
+  for (const b of remainingBeds) await deleteBed({ bedId: b.id, userId: managerId });
+
   await db.prepare("DELETE FROM wards WHERE id=?").run(wardId);
-  await audit(managerId, "ward_delete", "floor", { wardId });
-  return { ok: true };
+  await audit(managerId, "ward_delete", ward.name, { wardId, autoDeletedBeds: remainingBeds.length });
+  return { ok: true, deletedBeds: remainingBeds.length };
 }
 
 // ── PRE user lifecycle ────────────────────────────────────────────────────────
@@ -494,6 +571,65 @@ export async function deleteNurse(userId: number, managerId: number) {
   return { ok: true };
 }
 
+// ── Doctor lifecycle ──────────────────────────────────────────────────────────
+// Doctors are NOT tied to a block on the users row — block membership lives in
+// doctor_block_users (many-to-many). Creating a doctor never requires a block.
+
+export async function createDoctor(opts: {
+  username: string; password: string; name: string;
+  status?: "active" | "inactive"; remarks?: string; adminId: number;
+}) {
+  const username = opts.username.trim().toLowerCase();
+  if (!/^[a-z0-9_]+$/.test(username))
+    throw new HttpError(400, "Username can only contain letters, numbers, and underscores — no spaces or special characters.");
+  if (await db.prepare("SELECT 1 FROM users WHERE username=?").get(username))
+    throw new HttpError(409, "Username already taken");
+
+  const t = now();
+  const status = opts.status ?? "active";
+  const r = await db.prepare(
+    `INSERT INTO users (username,password_hash,role,name,shift,status,remarks,created_at,updated_at)
+     VALUES (?,?,?,?,?,?,?,?,?) RETURNING id`
+  ).run(username, bcrypt.hashSync(opts.password, 10), "DOCTOR", opts.name.trim(),
+        "morning", status, opts.remarks?.trim() || null, t, t);
+  await audit(opts.adminId, "doctor_create", username, { name: opts.name, status });
+  return { ok: true, id: Number(r.lastInsertRowid), username };
+}
+
+export async function editDoctor(opts: {
+  userId: number; name?: string; password?: string;
+  status?: "active" | "inactive"; remarks?: string | null; adminId: number;
+}) {
+  const user = await db.prepare("SELECT id, role FROM users WHERE id=?")
+    .get<{id: number; role: string}>(opts.userId);
+  if (!user || user.role !== "DOCTOR") throw new HttpError(404, "Doctor not found");
+
+  const t = now();
+  await db.transaction(async () => {
+    if (opts.name !== undefined)
+      await db.prepare("UPDATE users SET name=?, updated_at=? WHERE id=?").run(opts.name, t, opts.userId);
+    if (opts.password)
+      await db.prepare("UPDATE users SET password_hash=?, updated_at=? WHERE id=?")
+        .run(bcrypt.hashSync(opts.password, 10), t, opts.userId);
+    if (opts.status !== undefined)
+      await db.prepare("UPDATE users SET status=?, updated_at=? WHERE id=?").run(opts.status, t, opts.userId);
+    if (opts.remarks !== undefined)
+      await db.prepare("UPDATE users SET remarks=?, updated_at=? WHERE id=?").run(opts.remarks?.trim() || null, t, opts.userId);
+  });
+  await audit(opts.adminId, "doctor_edit", null, { userId: opts.userId });
+  return { ok: true };
+}
+
+export async function deleteDoctor(userId: number, adminId: number) {
+  const user = await db.prepare("SELECT id, role, name FROM users WHERE id=?")
+    .get<{id: number; role: string; name: string}>(userId);
+  if (!user || user.role !== "DOCTOR") throw new HttpError(404, "Doctor not found");
+  // doctor_block_users rows cascade away (membership only); blocks survive.
+  await db.prepare("DELETE FROM users WHERE id=?").run(userId);
+  await audit(adminId, "doctor_delete", null, { userId, name: user.name });
+  return { ok: true };
+}
+
 // ── Nursing station lifecycle ─────────────────────────────────────────────────
 
 export async function listNursingStations() {
@@ -597,11 +733,29 @@ export async function deleteNursingStation(stationId: number, managerId: number)
   const s = await db.prepare("SELECT id, name FROM nursing_stations WHERE id=?")
     .get<{id: number; name: string}>(stationId);
   if (!s) throw new HttpError(404, "Station not found");
-  const t = now();
-  // Unassign all wards and nurses before deleting; clean up their access assignments
-  await db.prepare("DELETE FROM nurse_access_assignments WHERE ward_id IN (SELECT id FROM wards WHERE station_id=?)").run(stationId);
-  await db.prepare("UPDATE wards SET station_id=NULL, nursing_station=NULL, updated_at=? WHERE station_id=?").run(t, stationId);
-  await db.prepare("UPDATE users SET station_id=NULL, nursing_station=NULL, updated_at=? WHERE station_id=?").run(t, stationId);
+
+  // Refuse while wards or nurses are still attached — deleting would otherwise
+  // silently null out their station and drop the wards' nurse-access rows.
+  // Check BOTH up front so the manager sees every reason at once, not just
+  // whichever one happens to be checked first.
+  const blockers: string[] = [];
+
+  const wards = await db.prepare(
+    "SELECT name FROM wards WHERE station_id=? ORDER BY name"
+  ).all<{ name: string }>(stationId);
+  if (wards.length)
+    blockers.push(`${wards.length} ward${wards.length > 1 ? "s" : ""} (${quoteList(wards.map(w => w.name))})`);
+
+  const nurses = await db.prepare(
+    "SELECT name FROM users WHERE station_id=? AND role='NURSE' ORDER BY name"
+  ).all<{ name: string }>(stationId);
+  if (nurses.length)
+    blockers.push(`${nurses.length} nurse${nurses.length > 1 ? "s" : ""} (${quoteList(nurses.map(n => n.name))})`);
+
+  if (blockers.length)
+    throw new HttpError(409,
+      `Station "${s.name}" still has ${joinClauses(blockers)}. Reassign them before deleting this station.`);
+
   await db.prepare("DELETE FROM nursing_stations WHERE id=?").run(stationId);
   await audit(managerId, "station_delete", s.name, { stationId });
   return { ok: true };

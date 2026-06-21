@@ -81,8 +81,8 @@ export async function updateWard(
       "UPDATE beds SET vacant=?, reserved=?, occupied=?, occupied_reserved=?, updated_at=?, updated_by=? WHERE ward_id=?"
     ).run(vn, vr, on_, or_, now, userId, wardId);
     await db.prepare(
-      "INSERT INTO bed_status_updates (ward_id, vacant_none, vacant_reserved, occupied_none, occupied_reserved, updated_by, created_at) VALUES (?,?,?,?,?,?,?)"
-    ).run(wardId, vn, vr, on_, or_, userId, now);
+      "INSERT INTO bed_status_updates (ward_id, ward_name, vacant_none, vacant_reserved, occupied_none, occupied_reserved, updated_by, created_at) VALUES (?,?,?,?,?,?,?,?)"
+    ).run(wardId, ward.name, vn, vr, on_, or_, userId, now);
   });
 
   const floorLabel = ward.floor_id
@@ -254,20 +254,92 @@ export async function allWardsLive() {
             bb.name AS block_name,
             f.name  AS floor_name,
             b.vacant, b.reserved, b.occupied, b.occupied_reserved,
-            b.updated_at AS "updatedAt"
+            b.updated_at AS "updatedAt",
+            rv.reviewed_at AS "reviewedAt"
      FROM wards w
      JOIN beds b ON b.ward_id = w.id
      LEFT JOIN floors f ON f.id = w.floor_id
      LEFT JOIN building_blocks bb ON bb.id = f.building_block_id
+     -- "Last reviewed" = newest confirmation for any block that holds this ward,
+     -- from EITHER a PRE round or a Doctor review-confirm. Unlike beds.updated_at
+     -- (last value change), this moves every time a PRE/Doctor confirms the ward,
+     -- even with no occupancy change.
+     LEFT JOIN (
+       SELECT ward_id, MAX(reviewed_at) AS reviewed_at FROM (
+         SELECT pbw.ward_id, pr.submitted_at AS reviewed_at
+         FROM pre_block_wards pbw
+         JOIN pre_rounds pr ON pr.pre_block_id = pbw.pre_block_id
+         UNION ALL
+         -- Block-wide doctor reviews (ward_id NULL) fan out to every ward in the block
+         SELECT dbw.ward_id, dr.reviewed_at
+         FROM doctor_block_wards dbw
+         JOIN doctor_block_reviews dr ON dr.doctor_block_id = dbw.doctor_block_id AND dr.ward_id IS NULL
+         UNION ALL
+         -- Single-ward doctor reviews apply to that ward only
+         SELECT dr.ward_id, dr.reviewed_at
+         FROM doctor_block_reviews dr WHERE dr.ward_id IS NOT NULL
+       ) src
+       GROUP BY ward_id
+     ) rv ON rv.ward_id = w.id
      WHERE w.operational = true
      ORDER BY w.name`
-  ).all<WardView & { bed_type: string | null; room_type: string | null; block_name: string | null; floor_name: string | null }>();
+  ).all<WardView & { bed_type: string | null; room_type: string | null; block_name: string | null; floor_name: string | null; reviewedAt: number | null }>();
 
   const allBedRow = await db.prepare(
     `SELECT COALESCE(SUM(total_beds),0) AS all_beds,
             COALESCE(SUM(CASE WHEN operational = false THEN total_beds ELSE 0 END),0) AS non_op_beds
      FROM wards`
   ).get<{ all_beds: number; non_op_beds: number }>();
+
+  // Per-ward payer breakdown so the dashboard's Payer Mix can be recomputed
+  // client-side from whatever wards are currently visible (Unit + Search).
+  //   payersLive  = currently occupied beds by payer in that ward
+  //   payersAdmit = beds taken OCCUPIED by payer, bucketed by time window
+  //                 (today IST / last 7d / 30d / 12 months) for the range toggle.
+  const IST = 5.5 * 3600 * 1000;
+  const startOfTodayMs = Math.floor((Date.now() + IST) / 86400000) * 86400000 - IST;
+  const d7Ms  = Date.now() - 7   * 86400000;
+  const d30Ms = Date.now() - 30  * 86400000;
+  const y1Ms  = Date.now() - 365 * 86400000;
+  const wardIds = wards.map((w) => w.id);
+  const [liveP, admitP] = wardIds.length === 0 ? [[], []] : await Promise.all([
+    db.prepare(
+      `SELECT ward_id, payer_type, COUNT(*)::int AS n FROM bed_details
+        WHERE payer_type IS NOT NULL AND ward_id = ANY(?) GROUP BY ward_id, payer_type`
+    ).all<{ ward_id: number; payer_type: string; n: number }>(wardIds),
+    db.prepare(
+      `SELECT ward_id, payer_type,
+              COUNT(*) FILTER (WHERE changed_at >= ?)::int AS today,
+              COUNT(*) FILTER (WHERE changed_at >= ?)::int AS d7,
+              COUNT(*) FILTER (WHERE changed_at >= ?)::int AS d30,
+              COUNT(*)::int                                AS y1
+         FROM bed_movements
+        WHERE new_physical = 'OCCUPIED' AND payer_type IS NOT NULL
+          AND changed_at >= ? AND ward_id = ANY(?)
+        GROUP BY ward_id, payer_type`
+    ).all<{ ward_id: number; payer_type: string; today: number; d7: number; d30: number; y1: number }>(
+      startOfTodayMs, d7Ms, d30Ms, y1Ms, wardIds
+    ),
+  ]);
+  const liveByWard = new Map<number, Record<string, number>>();
+  for (const row of liveP) {
+    const m = liveByWard.get(row.ward_id) ?? {}; m[row.payer_type] = row.n; liveByWard.set(row.ward_id, m);
+  }
+  type Admit = { today: Record<string, number>; d7: Record<string, number>; d30: Record<string, number>; y1: Record<string, number> };
+  const admitByWard = new Map<number, Admit>();
+  for (const row of admitP) {
+    const m = admitByWard.get(row.ward_id) ?? { today: {}, d7: {}, d30: {}, y1: {} };
+    if (row.today) m.today[row.payer_type] = row.today;
+    if (row.d7)    m.d7[row.payer_type]    = row.d7;
+    if (row.d30)   m.d30[row.payer_type]   = row.d30;
+    if (row.y1)    m.y1[row.payer_type]    = row.y1;
+    admitByWard.set(row.ward_id, m);
+  }
+  for (const w of wards) {
+    const wr = w as unknown as Record<string, unknown>;
+    wr.payersLive  = liveByWard.get(w.id)  ?? {};
+    wr.payersAdmit = admitByWard.get(w.id) ?? { today: {}, d7: {}, d30: {}, y1: {} };
+  }
 
   let v = 0, r = 0, o = 0, or_ = 0, total = 0;
   for (const w of wards) {
@@ -287,9 +359,20 @@ export async function allWardsLive() {
 
 export async function snapshotOccupancy() {
   const { totals } = await orgOverview();
+
+  // Per-payer occupied-bed breakdown at this instant, so Dashboard payer cards
+  // can build a real sparkline over time (no history before this column existed).
+  const payerRows = await db.prepare(
+    `SELECT payer_type, COUNT(*)::int AS n FROM bed_details
+     WHERE physical_status='OCCUPIED' AND payer_type IS NOT NULL
+     GROUP BY payer_type`
+  ).all<{ payer_type: string; n: number }>();
+  const payerSnapshot: Record<string, number> = {};
+  for (const r of payerRows) payerSnapshot[r.payer_type] = r.n;
+
   await db.prepare(
-    "INSERT INTO occupancy_snapshots (ts, total, vacant, reserved, occupied) VALUES (?,?,?,?,?)"
-  ).run(Date.now(), totals.total, totals.v, totals.r, totals.o);
+    "INSERT INTO occupancy_snapshots (ts, total, vacant, reserved, occupied, payer_snapshot) VALUES (?,?,?,?,?,?)"
+  ).run(Date.now(), totals.total, totals.v, totals.r, totals.o, JSON.stringify(payerSnapshot));
 }
 
 // ── Midnight census ──────────────────────────────────────────────────────────

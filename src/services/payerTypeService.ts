@@ -44,7 +44,16 @@ export async function updatePayerType(opts: {
     if (!name) throw new HttpError(400, "Name cannot be empty");
     const clash = await db.prepare("SELECT 1 FROM payer_types WHERE LOWER(name)=LOWER(?) AND id!=?").get(name, opts.id);
     if (clash) throw new HttpError(409, `Payer type "${name}" already exists`);
-    await db.prepare("UPDATE payer_types SET name=? WHERE id=?").run(name, opts.id);
+    // The payer is stored on beds by name (not FK), so a rename propagates to
+    // the LIVE beds (bed_details) atomically with the list update. History
+    // (bed_movements) is intentionally left untouched — it's an audit trail and
+    // must keep the literal payer name that was chosen at the time.
+    await db.transaction(async () => {
+      await db.prepare("UPDATE payer_types SET name=? WHERE id=?").run(name, opts.id);
+      if (name !== row.name) {
+        await db.prepare("UPDATE bed_details SET payer_type=? WHERE payer_type=?").run(name, row.name);
+      }
+    });
   }
   if (opts.active !== undefined) {
     await db.prepare("UPDATE payer_types SET active=? WHERE id=?").run(opts.active, opts.id);

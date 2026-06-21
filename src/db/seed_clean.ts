@@ -21,8 +21,10 @@ async function run() {
   const users = [
     { username: "admin1",    password: "Admin@1234",    role: "COO",     name: "Admin One" },
     { username: "admin2",    password: "Admin@5678",    role: "COO",     name: "Admin Two" },
-    { username: "manager1",  password: "Manager@1234",  role: "MANAGER", name: "Manager One" },
-    { username: "manager2",  password: "Manager@5678",  role: "MANAGER", name: "Manager Two" },
+    // Former MANAGER accounts now seed as COO (Admin) — usernames preserved,
+    // mirroring the production merge migration (20260621000000).
+    { username: "manager1",  password: "Manager@1234",  role: "COO",     name: "Manager One" },
+    { username: "manager2",  password: "Manager@5678",  role: "COO",     name: "Manager Two" },
     { username: "nurse1",    password: "Nurse@1234",    role: "NURSE",   name: "Nurse One" },
   ];
 

@@ -178,7 +178,7 @@ async function run() {
     await db.prepare(
       `INSERT INTO users (username, password_hash, role, name, shift, block_id, created_at, updated_at)
        VALUES (?,?,?,?,?,NULL,?,?)`
-    ).run("manager", bcrypt.hashSync("manager123", 10), "MANAGER", "Ward Manager", "morning", now, now);
+    ).run("manager", bcrypt.hashSync("manager123", 10), "COO", "Ward Manager", "morning", now, now);
     await db.prepare(
       `INSERT INTO users (username, password_hash, role, name, shift, block_id, created_at, updated_at)
        VALUES (?,?,?,?,?,NULL,?,?)`
