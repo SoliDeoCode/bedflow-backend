@@ -502,7 +502,8 @@ async function validateStationIds(stationIds: number[]): Promise<Map<number, str
 /** Replace-all: a nurse's full set of stations becomes exactly stationIds. Also
  *  refreshes the legacy single station_id/nursing_station "primary" columns
  *  (first id in the list, or NULL) so old display code keeps working. */
-async function setNurseStations(nurseId: number, stationIds: number[], t: number) {
+async function setNurseStations(nurseId: number, stationIdsIn: number[], t: number) {
+  const stationIds = [...new Set(stationIdsIn)];
   const nameById = await validateStationIds(stationIds);
   await db.prepare("DELETE FROM nurse_stations WHERE nurse_id=?").run(nurseId);
   for (const id of stationIds) {
@@ -527,26 +528,29 @@ export async function createNurse(opts: {
   if (await db.prepare("SELECT 1 FROM users WHERE username=?").get(username))
     throw new HttpError(409, "Username already taken");
 
-  const stationIds = opts.stationIds ?? [];
+  const stationIds = [...new Set(opts.stationIds ?? [])];
   const nameById = await validateStationIds(stationIds);
   const primaryId   = stationIds[0] ?? null;
   const primaryName = primaryId != null ? nameById.get(primaryId)! : null;
 
   const t = now();
-  const r = await db.prepare(
-    `INSERT INTO users
-       (username,password_hash,role,name,shift,nursing_station,station_id,
-        employee_id,phone,email,created_at,updated_at)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id`
-  ).run(username, bcrypt.hashSync(opts.password, 10), "NURSE", opts.name.trim(),
-        "morning", primaryName, primaryId,
-        opts.employeeId?.trim() || null, opts.phone?.trim() || null, opts.email?.trim() || null,
-        t, t);
-  const nurseId = Number(r.lastInsertRowid);
-  for (const id of stationIds) {
-    await db.prepare("INSERT INTO nurse_stations (nurse_id, station_id, created_at) VALUES (?,?,?)")
-      .run(nurseId, id, t);
-  }
+  let nurseId = 0;
+  await db.transaction(async () => {
+    const r = await db.prepare(
+      `INSERT INTO users
+         (username,password_hash,role,name,shift,nursing_station,station_id,
+          employee_id,phone,email,created_at,updated_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id`
+    ).run(username, bcrypt.hashSync(opts.password, 10), "NURSE", opts.name.trim(),
+          "morning", primaryName, primaryId,
+          opts.employeeId?.trim() || null, opts.phone?.trim() || null, opts.email?.trim() || null,
+          t, t);
+    nurseId = Number(r.lastInsertRowid);
+    for (const id of stationIds) {
+      await db.prepare("INSERT INTO nurse_stations (nurse_id, station_id, created_at) VALUES (?,?,?)")
+        .run(nurseId, id, t);
+    }
+  });
   const stationLabel = stationIds.length
     ? stationIds.map(id => nameById.get(id)).join(", ")
     : "unassigned";

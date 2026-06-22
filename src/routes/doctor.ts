@@ -54,7 +54,7 @@ router.get("/me", asyncH(async (req, res) => {
   const blocks = await db.prepare(
     `SELECT db.id, db.name, db.description,
             COUNT(DISTINCT dbw.ward_id)::int AS ward_count,
-            COALESCE(SUM(DISTINCT w.total_beds)::int, 0) AS total_beds
+            COALESCE(SUM(w.total_beds)::int, 0) AS total_beds
      FROM doctor_block_users dbu
      JOIN doctor_blocks db       ON db.id = dbu.doctor_block_id AND db.status = 'active'
      LEFT JOIN doctor_block_wards dbw ON dbw.doctor_block_id = db.id

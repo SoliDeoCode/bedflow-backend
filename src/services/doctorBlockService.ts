@@ -38,14 +38,19 @@ async function assertWardsAssignable(wardIds: number[], selfBlockId: number | nu
 export async function listDoctorBlocks() {
   return db.prepare(`
     SELECT db.id, db.name, db.description, db.status, db.created_at, db.updated_at,
-           COUNT(DISTINCT dbw.ward_id)::int        AS ward_count,
-           COUNT(DISTINCT dbu.user_id)::int        AS doctor_count,
-           COALESCE(SUM(DISTINCT w.total_beds)::int, 0) AS total_beds
+           COUNT(DISTINCT dbw.ward_id)::int AS ward_count,
+           COUNT(DISTINCT dbu.user_id)::int AS doctor_count,
+           COALESCE(wb.total_beds, 0)       AS total_beds
     FROM doctor_blocks db
     LEFT JOIN doctor_block_wards dbw ON dbw.doctor_block_id = db.id
-    LEFT JOIN wards w                ON w.id = dbw.ward_id
     LEFT JOIN doctor_block_users dbu ON dbu.doctor_block_id = db.id
-    GROUP BY db.id
+    LEFT JOIN LATERAL (
+      SELECT SUM(w.total_beds)::int AS total_beds
+      FROM doctor_block_wards dbw2
+      JOIN wards w ON w.id = dbw2.ward_id
+      WHERE dbw2.doctor_block_id = db.id
+    ) wb ON true
+    GROUP BY db.id, wb.total_beds
     ORDER BY db.status DESC, db.name
   `).all<DoctorBlockRow & { ward_count: number; doctor_count: number; total_beds: number }>();
 }

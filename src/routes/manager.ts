@@ -245,7 +245,9 @@ router.get("/users", asyncH(async (_req, res) => {
             pb.name AS pre_block_name,
             ns.name AS station_name,
             COALESCE(st.station_ids,   ARRAY[]::int[])  AS station_ids,
-            COALESCE(st.station_names, ARRAY[]::text[]) AS station_names
+            COALESCE(st.station_names, ARRAY[]::text[]) AS station_names,
+            COALESCE(dbk.block_ids,   ARRAY[]::int[])  AS block_ids,
+            COALESCE(dbk.block_names, ARRAY[]::text[]) AS block_names
      FROM users u
      LEFT JOIN pre_blocks pb ON pb.id = u.pre_block_id
      LEFT JOIN nursing_stations ns ON ns.id = u.station_id
@@ -256,6 +258,13 @@ router.get("/users", asyncH(async (_req, res) => {
        JOIN nursing_stations ns2 ON ns2.id = nst.station_id
        WHERE nst.nurse_id = u.id
      ) st ON true
+     LEFT JOIN LATERAL (
+       SELECT array_agg(dbu.doctor_block_id ORDER BY db2.name) AS block_ids,
+              array_agg(db2.name           ORDER BY db2.name) AS block_names
+       FROM doctor_block_users dbu
+       JOIN doctor_blocks db2 ON db2.id = dbu.doctor_block_id
+       WHERE dbu.user_id = u.id
+     ) dbk ON true
      ORDER BY u.role, u.username`
   ).all();
   res.json({ users });
