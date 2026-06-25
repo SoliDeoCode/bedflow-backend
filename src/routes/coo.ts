@@ -2,7 +2,7 @@ import { Router } from "express";
 import { authRequired, requireRole } from "../middleware/auth.js";
 import { asyncH } from "../middleware/error.js";
 import { z } from "zod";
-import { orgOverview, allWardsLive } from "../services/bedService.js";
+import { orgOverview, allWardsLive, allBedDetailsLive } from "../services/bedService.js";
 import { COO_REMINDERS, hmToMin, minsNow, todayStr, startOfDayIST, PRE_INTERVAL_MIN, SHIFTS,
          currentRound, inShift, roundKey, type ShiftKey } from "../config/domain.js";
 import { recentAudit, queryActivity } from "../services/auditService.js";
@@ -73,6 +73,10 @@ router.get("/overview", asyncH(async (_req, res) => {
 
 router.get("/live-wards", asyncH(async (_req, res) => {
   res.json(await allWardsLive());
+}));
+
+router.get("/bed-details", asyncH(async (_req, res) => {
+  res.json(await allBedDetailsLive());
 }));
 
 router.get("/audit", asyncH(async (_req, res) => {

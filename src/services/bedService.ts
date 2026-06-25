@@ -357,6 +357,37 @@ export async function allWardsLive() {
   };
 }
 
+export interface LiveBedDetail {
+  id: number; ward_id: number; ward: string; bed_name: string;
+  physical_status: string; reservation_status: string;
+  payer_type: string | null; bed_type: string; unit_type: string | null;
+  destination: string | null; reservation_note: string | null;
+  operational_status: boolean; updated_at: number | null;
+  updated_by_name: string | null;
+}
+
+// Bed-level rows for the dashboard's Bed Explorer popup (click a KPI/payer
+// card to see which beds make it up). Mirrors allWardsLive's WHERE clause
+// (operational wards only) so the beds returned here always add up to the
+// counts shown on the cards. updated_by_name resolves to the staff member's
+// name (not a doctor — this system has no patient/doctor records at all).
+export async function allBedDetailsLive() {
+  return db.prepare(
+    `SELECT bd.id, bd.ward_id, w.name AS ward, w.unit_type, w.bed_type,
+            bd.bed_name, bd.physical_status, bd.reservation_status, bd.payer_type,
+            bd.destination, bd.reservation_note, bd.operational_status,
+            bd.updated_at, u.name AS updated_by_name
+     FROM bed_details bd
+     JOIN wards w ON w.id = bd.ward_id
+     LEFT JOIN users u ON u.id = bd.updated_by
+     WHERE w.operational = true
+     ORDER BY w.name,
+       substring(bd.bed_name from '^[^0-9]*') ASC,
+       NULLIF(substring(bd.bed_name from '[0-9]+'), '')::bigint NULLS LAST,
+       bd.bed_name ASC`
+  ).all<LiveBedDetail>();
+}
+
 export async function snapshotOccupancy() {
   const { totals } = await orgOverview();
 
