@@ -19,14 +19,15 @@ async function tick() {
   for (const key of lastPush.keys())
     if (key.startsWith("coo:") && !key.startsWith(`coo:${today}:`)) lastPush.delete(key);
 
-  // Single JOIN: PRE users that have a block with at least one ward assigned
+  // One row per (user, block) pair — a user assigned to N blocks yields N rows
   const pres = await db.prepare(
-    `SELECT u.id, u.username, u.shift, u.pre_block_id, pb.name AS block_name
+    `SELECT u.id, u.username, u.shift, upb.pre_block_id, pb.name AS block_name
      FROM users u
-     JOIN pre_blocks pb ON pb.id = u.pre_block_id
-     JOIN pre_block_wards pbw ON pbw.pre_block_id = u.pre_block_id
+     JOIN user_pre_blocks upb ON upb.user_id = u.id
+     JOIN pre_blocks pb ON pb.id = upb.pre_block_id
+     JOIN pre_block_wards pbw ON pbw.pre_block_id = upb.pre_block_id
      WHERE u.role = 'PRE'
-     GROUP BY u.id, u.username, u.shift, u.pre_block_id, pb.name`
+     GROUP BY u.id, u.username, u.shift, upb.pre_block_id, pb.name`
   ).all<{ id: number; username: string; shift: string; pre_block_id: number; block_name: string }>();
 
   if (pres.length > 0) {

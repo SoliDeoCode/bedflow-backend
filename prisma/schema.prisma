@@ -29,6 +29,7 @@ model User {
   bed_movements      BedMovement[]     @relation("BedMover")
   pre_rounds         PreRound[]        @relation("RoundUser")
   pre_assignments    PreAssignment[]
+  pre_blocks         UserPreBlock[]
   push_subscriptions PushSubscription[]
   audit_logs         AuditLog[]
   saved_views        SavedView[]       @relation("ViewCreator")
@@ -117,6 +118,19 @@ model PreAssignment {
   @@unique([user_id, pre_code])
   @@index([user_id])
   @@map("pre_assignments")
+}
+
+model UserPreBlock {
+  user_id      Int
+  pre_block_id Int
+  created_at   BigInt
+
+  user User @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@id([user_id, pre_block_id])
+  @@index([user_id])
+  @@index([pre_block_id])
+  @@map("user_pre_blocks")
 }
 
 model BedStatusUpdate {

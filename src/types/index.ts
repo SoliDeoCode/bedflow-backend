@@ -12,7 +12,6 @@ export interface User {
   shift: "morning" | "night";
   block_id: number | null;       // legacy — kept for old tokens
   floor_id: number | null;       // legacy physical floor (no longer used for PRE)
-  pre_block_id: number | null;   // PRE Block assignment (new)
   nursing_station: string | null;
   station_id: number | null;
   status: "active" | "inactive";

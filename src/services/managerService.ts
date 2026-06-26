@@ -411,7 +411,7 @@ export async function deleteWard(wardId: number, managerId: number) {
 
 export async function createPre(opts: {
   username: string; password: string; name: string;
-  preBlockId?: number | null; shift?: "morning" | "night"; managerId: number;
+  preBlockIds?: number[]; shift?: "morning" | "night"; managerId: number;
 }) {
   const username = opts.username.trim().toLowerCase();
   if (!/^[a-z0-9_]+$/.test(username))
@@ -419,37 +419,46 @@ export async function createPre(opts: {
   if (await db.prepare("SELECT 1 FROM users WHERE username=?").get(username))
     throw new HttpError(409, "Username already taken");
 
-  if (opts.preBlockId != null) {
-    const pb = await db.prepare("SELECT name FROM pre_blocks WHERE id=?")
-      .get<{name:string}>(opts.preBlockId);
-    if (!pb) throw new HttpError(404, "PRE Block not found");
+  const blockIds = opts.preBlockIds ?? [];
+  for (const pbId of blockIds) {
+    const pb = await db.prepare("SELECT name FROM pre_blocks WHERE id=?").get<{name:string}>(pbId);
+    if (!pb) throw new HttpError(404, `PRE Block ${pbId} not found`);
   }
 
   const t = now();
   const shift = opts.shift || "morning";
   const r = await db.prepare(
-    "INSERT INTO users (username,password_hash,role,name,shift,pre_block_id,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?) RETURNING id"
-  ).run(username, bcrypt.hashSync(opts.password, 10), "PRE", opts.name, shift,
-        opts.preBlockId ?? null, t, t);
+    "INSERT INTO users (username,password_hash,role,name,shift,created_at,updated_at) VALUES (?,?,?,?,?,?,?) RETURNING id"
+  ).run(username, bcrypt.hashSync(opts.password, 10), "PRE", opts.name, shift, t, t);
+  const userId = Number(r.lastInsertRowid);
 
-  const blockName = opts.preBlockId
-    ? (await db.prepare("SELECT name FROM pre_blocks WHERE id=?").get<{name:string}>(opts.preBlockId))?.name
-    : null;
-  await audit(opts.managerId, "pre_create", blockName ?? "unassigned", { username, name: opts.name, shift });
-  return { ok: true, id: Number(r.lastInsertRowid), username };
+  for (const pbId of blockIds)
+    await db.prepare("INSERT INTO user_pre_blocks (user_id, pre_block_id, created_at) VALUES (?,?,?)")
+      .run(userId, pbId, t);
+
+  const blockNames = blockIds.length
+    ? (await Promise.all(blockIds.map(id =>
+        db.prepare("SELECT name FROM pre_blocks WHERE id=?").get<{name:string}>(id)
+          .then(r => r?.name ?? String(id))
+      ))).join(", ")
+    : "unassigned";
+  await audit(opts.managerId, "pre_create", blockNames, { username, name: opts.name, shift });
+  return { ok: true, id: userId, username };
 }
 
 export async function editPre(opts: {
   userId: number; name?: string; password?: string;
-  shift?: "morning" | "night"; preBlockId?: number | null; managerId: number;
+  shift?: "morning" | "night"; preBlockIds?: number[]; managerId: number;
 }) {
   const user = await db.prepare("SELECT id, role FROM users WHERE id=?")
     .get<{id: number; role: string}>(opts.userId);
-  if (!user || user.role !== "PRE") throw new HttpError(404, "PRE not found");
+  if (!user || user.role !== "PRE") throw new HttpError(404, "PRE user not found.");
 
-  if (opts.preBlockId != null) {
-    const pb = await db.prepare("SELECT id FROM pre_blocks WHERE id=?").get<{id:number}>(opts.preBlockId);
-    if (!pb) throw new HttpError(404, "PRE Block not found");
+  if (opts.preBlockIds !== undefined) {
+    for (const pbId of opts.preBlockIds) {
+      const pb = await db.prepare("SELECT id FROM pre_blocks WHERE id=?").get<{id:number}>(pbId);
+      if (!pb) throw new HttpError(404, `PRE Block ${pbId} not found`);
+    }
   }
 
   const t = now();
@@ -461,9 +470,12 @@ export async function editPre(opts: {
         .run(bcrypt.hashSync(opts.password, 10), t, opts.userId);
     if (opts.shift)
       await db.prepare("UPDATE users SET shift=?, updated_at=? WHERE id=?").run(opts.shift, t, opts.userId);
-    if (opts.preBlockId !== undefined)
-      await db.prepare("UPDATE users SET pre_block_id=?, updated_at=? WHERE id=?")
-        .run(opts.preBlockId, t, opts.userId);
+    if (opts.preBlockIds !== undefined) {
+      await db.prepare("DELETE FROM user_pre_blocks WHERE user_id=?").run(opts.userId);
+      for (const pbId of opts.preBlockIds)
+        await db.prepare("INSERT INTO user_pre_blocks (user_id, pre_block_id, created_at) VALUES (?,?,?)")
+          .run(opts.userId, pbId, t);
+    }
   });
   await audit(opts.managerId, "pre_edit", null, { userId: opts.userId });
   return { ok: true };
@@ -472,7 +484,7 @@ export async function editPre(opts: {
 export async function setPreShift(userId: number, shift: "morning" | "night", managerId: number) {
   const user = await db.prepare("SELECT id,role FROM users WHERE id=?")
     .get<{id: number; role: string}>(userId);
-  if (!user || user.role !== "PRE") throw new HttpError(404, "PRE not found");
+  if (!user || user.role !== "PRE") throw new HttpError(404, "PRE user not found.");
   await db.prepare("UPDATE users SET shift=?,updated_at=? WHERE id=?").run(shift, now(), userId);
   await audit(managerId, "pre_shift", null, { userId, shift });
   return { ok: true, shift };
@@ -481,7 +493,7 @@ export async function setPreShift(userId: number, shift: "morning" | "night", ma
 export async function deletePre(userId: number, managerId: number) {
   const user = await db.prepare("SELECT id,role,name,floor_id FROM users WHERE id=?")
     .get<{id: number; role: string; name: string; floor_id: number | null}>(userId);
-  if (!user || user.role !== "PRE") throw new HttpError(404, "PRE not found");
+  if (!user || user.role !== "PRE") throw new HttpError(404, "PRE user not found.");
   await db.prepare("DELETE FROM users WHERE id=?").run(userId);
   await audit(managerId, "pre_delete", null, { userId, name: user.name });
   return { ok: true };
@@ -565,7 +577,7 @@ export async function editNurse(opts: {
 }) {
   const user = await db.prepare("SELECT id, role FROM users WHERE id=?")
     .get<{id: number; role: string}>(opts.userId);
-  if (!user || user.role !== "NURSE") throw new HttpError(404, "Nurse not found");
+  if (!user || user.role !== "NURSE") throw new HttpError(404, "Nurse user not found.");
 
   const t = now();
   await db.transaction(async () => {
@@ -592,7 +604,7 @@ export async function editNurse(opts: {
 export async function addNurseStation(nurseId: number, stationId: number, managerId: number) {
   const user = await db.prepare("SELECT id, role, station_id FROM users WHERE id=?")
     .get<{id: number; role: string; station_id: number | null}>(nurseId);
-  if (!user || user.role !== "NURSE") throw new HttpError(404, "Nurse not found");
+  if (!user || user.role !== "NURSE") throw new HttpError(404, "Nurse user not found.");
   const ns = await db.prepare("SELECT name FROM nursing_stations WHERE id=?")
     .get<{name: string}>(stationId);
   if (!ns) throw new HttpError(404, "Nursing station not found");
@@ -613,7 +625,7 @@ export async function addNurseStation(nurseId: number, stationId: number, manage
 export async function removeNurseStation(nurseId: number, stationId: number, managerId: number) {
   const user = await db.prepare("SELECT id, role, station_id FROM users WHERE id=?")
     .get<{id: number; role: string; station_id: number | null}>(nurseId);
-  if (!user || user.role !== "NURSE") throw new HttpError(404, "Nurse not found");
+  if (!user || user.role !== "NURSE") throw new HttpError(404, "Nurse user not found.");
 
   const t = now();
   await db.prepare("DELETE FROM nurse_stations WHERE nurse_id=? AND station_id=?").run(nurseId, stationId);
@@ -633,7 +645,7 @@ export async function removeNurseStation(nurseId: number, stationId: number, man
 export async function deleteNurse(userId: number, managerId: number) {
   const user = await db.prepare("SELECT id, role, name FROM users WHERE id=?")
     .get<{id: number; role: string; name: string}>(userId);
-  if (!user || user.role !== "NURSE") throw new HttpError(404, "Nurse not found");
+  if (!user || user.role !== "NURSE") throw new HttpError(404, "Nurse user not found.");
   await db.prepare("DELETE FROM nurse_access_assignments WHERE nurse_id=?").run(userId);
   await db.prepare("DELETE FROM nurse_stations WHERE nurse_id=?").run(userId);
   await db.prepare("DELETE FROM users WHERE id=?").run(userId);
@@ -672,7 +684,7 @@ export async function editDoctor(opts: {
 }) {
   const user = await db.prepare("SELECT id, role FROM users WHERE id=?")
     .get<{id: number; role: string}>(opts.userId);
-  if (!user || user.role !== "DOCTOR") throw new HttpError(404, "Doctor not found");
+  if (!user || user.role !== "DOCTOR") throw new HttpError(404, "Doctor user not found.");
 
   const t = now();
   await db.transaction(async () => {
@@ -693,7 +705,7 @@ export async function editDoctor(opts: {
 export async function deleteDoctor(userId: number, adminId: number) {
   const user = await db.prepare("SELECT id, role, name FROM users WHERE id=?")
     .get<{id: number; role: string; name: string}>(userId);
-  if (!user || user.role !== "DOCTOR") throw new HttpError(404, "Doctor not found");
+  if (!user || user.role !== "DOCTOR") throw new HttpError(404, "Doctor user not found.");
   // doctor_block_users rows cascade away (membership only); blocks survive.
   await db.prepare("DELETE FROM users WHERE id=?").run(userId);
   await audit(adminId, "doctor_delete", null, { userId, name: user.name });
@@ -737,7 +749,7 @@ export async function editNursingStation(opts: {
   const name = opts.name.trim();
   if (!name) throw new HttpError(400, "Station name required");
   const ex = await db.prepare("SELECT id FROM nursing_stations WHERE id=?").get<{id:number}>(opts.stationId);
-  if (!ex) throw new HttpError(404, "Station not found");
+  if (!ex) throw new HttpError(404, "Nursing station not found.");
   const t = now();
   try {
     await db.prepare("UPDATE nursing_stations SET name=?, updated_at=? WHERE id=?").run(name, t, opts.stationId);
@@ -754,7 +766,7 @@ export async function editNursingStation(opts: {
 export async function assignWardsToStation(stationId: number, wardIds: number[], managerId: number) {
   const s = await db.prepare("SELECT id, name FROM nursing_stations WHERE id=?")
     .get<{id: number; name: string}>(stationId);
-  if (!s) throw new HttpError(404, "Station not found");
+  if (!s) throw new HttpError(404, "Nursing station not found.");
   const t = now();
 
   const currentWards = await db.prepare("SELECT id FROM wards WHERE station_id=?")
@@ -802,7 +814,7 @@ export async function assignWardsToStation(stationId: number, wardIds: number[],
 export async function deleteNursingStation(stationId: number, managerId: number) {
   const s = await db.prepare("SELECT id, name FROM nursing_stations WHERE id=?")
     .get<{id: number; name: string}>(stationId);
-  if (!s) throw new HttpError(404, "Station not found");
+  if (!s) throw new HttpError(404, "Nursing station not found.");
 
   // Refuse while wards or nurses are still attached — deleting would otherwise
   // silently null out their station and drop the wards' nurse-access rows.
@@ -974,7 +986,7 @@ export async function editNurseAccess(opts: {
   const row = await db.prepare(
     "SELECT id, access_type, bed_names, status FROM nurse_access_assignments WHERE id=?"
   ).get<{ id: number; access_type: string; bed_names: string; status: string }>(opts.id);
-  if (!row) throw new HttpError(404, "Assignment not found");
+  if (!row) throw new HttpError(404, "Nurse access assignment not found.");
 
   const accessType = (opts.accessType ?? row.access_type) as "FULL" | "BEDS";
   let beds: string[];
@@ -999,7 +1011,7 @@ export async function deleteNurseAccess(id: number, managerId: number) {
   const row = await db.prepare(
     "SELECT id, nurse_id, ward_id FROM nurse_access_assignments WHERE id=?"
   ).get<{ id: number; nurse_id: number; ward_id: number }>(id);
-  if (!row) throw new HttpError(404, "Assignment not found");
+  if (!row) throw new HttpError(404, "Nurse access assignment not found.");
   await db.prepare("DELETE FROM nurse_access_assignments WHERE id=?").run(id);
   await audit(managerId, "nurse_access_delete", null, { id, nurseId: row.nurse_id, wardId: row.ward_id });
   return { ok: true };

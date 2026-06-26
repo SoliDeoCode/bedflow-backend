@@ -52,7 +52,7 @@ router.use(authRequired, requireRole("NURSE"));
 /** Resolve all stations this nurse is assigned to, directly from DB — always fresh, no JWT dependency. */
 async function getMyStations(req: { user?: { id: number } }): Promise<{ id: number; name: string }[]> {
   const userId = req.user?.id;
-  if (!userId) throw new HttpError(401, "Not authenticated");
+  if (!userId) throw new HttpError(401, "Please sign in to continue.");
   const rows = await db.prepare(
     `SELECT ns.id, ns.name
      FROM nurse_stations nst

@@ -39,6 +39,39 @@ export async function wardsForPreBlock(preBlockId: number): Promise<WardView[]> 
   ).all<WardView>(preBlockId);
 }
 
+/** All wards across every PRE Block the user is assigned to (deduplicated). */
+export async function wardsForUserBlocks(userId: number): Promise<WardView[]> {
+  return db.prepare(
+    `SELECT w.id, w.name AS ward, w.total_beds AS total, w.unit_type, w.operational,
+            b.vacant, b.reserved, b.occupied, b.occupied_reserved, b.updated_at AS "updatedAt"
+     FROM wards w
+     JOIN beds b ON b.ward_id = w.id
+     WHERE w.id IN (
+       SELECT DISTINCT pbw.ward_id
+       FROM user_pre_blocks upb
+       JOIN pre_block_wards pbw ON pbw.pre_block_id = upb.pre_block_id
+       WHERE upb.user_id = ?
+     )
+     ORDER BY w.operational DESC, w.name`
+  ).all<WardView>(userId);
+}
+
+/** Wards for each PRE Block a user is assigned to, grouped by block (preserves block membership). */
+export async function wardsGroupedByBlock(userId: number): Promise<{ id: number; name: string; wards: WardView[] }[]> {
+  const blocks = await db.prepare(
+    `SELECT pb.id, pb.name
+     FROM user_pre_blocks upb
+     JOIN pre_blocks pb ON pb.id = upb.pre_block_id
+     WHERE upb.user_id = ?
+     ORDER BY pb.name`
+  ).all<{ id: number; name: string }>(userId);
+
+  const result: { id: number; name: string; wards: WardView[] }[] = [];
+  for (const block of blocks)
+    result.push({ id: block.id, name: block.name, wards: await wardsForPreBlock(block.id) });
+  return result;
+}
+
 export function summarize(wards: WardView[]): PreSummary {
   let v = 0, r = 0, o = 0, or_ = 0, total = 0, wardsDone = 0;
   // Non-operational wards are shown to PRE but excluded from round counts
@@ -174,10 +207,12 @@ export async function orgOverview(): Promise<{
   ).all<{ pre_block_id: number; c: number }>(today, blockIds);
   const roundCountByBlock = new Map(countRows.map(r => [Number(r.pre_block_id), Number(r.c)]));
 
-  // Batch 4: one PRE user per pre_block
+  // Batch 4: one representative PRE user per pre_block (lowest id wins)
   const preUsers = await db.prepare(
-    `SELECT DISTINCT ON (pre_block_id) id, name, shift, pre_block_id
-     FROM users WHERE role = 'PRE' AND pre_block_id = ANY(?) ORDER BY pre_block_id, id`
+    `SELECT DISTINCT ON (upb.pre_block_id) u.id, u.name, u.shift, upb.pre_block_id
+     FROM user_pre_blocks upb
+     JOIN users u ON u.id = upb.user_id
+     WHERE upb.pre_block_id = ANY(?) ORDER BY upb.pre_block_id, u.id`
   ).all<{ id: number; name: string; shift: string; pre_block_id: number }>(blockIds);
   const userByBlock = new Map(preUsers.map(u => [Number(u.pre_block_id), u]));
 

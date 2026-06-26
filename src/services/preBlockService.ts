@@ -153,16 +153,17 @@ export async function deletePreBlock(blockId: number, managerId: number) {
     .get<{ name: string }>(blockId);
   if (!block) throw new HttpError(404, "PRE Block not found");
 
-  // users.pre_block_id cascades ON DELETE SET NULL, so deleting a block would
-  // silently unassign every PRE user on it. Refuse and name them instead.
+  // Refuse to delete while any PRE user is still assigned to this block.
   const pres = await db.prepare(
-    "SELECT name FROM users WHERE pre_block_id=? AND role='PRE' ORDER BY name"
+    `SELECT u.name FROM user_pre_blocks upb
+     JOIN users u ON u.id = upb.user_id
+     WHERE upb.pre_block_id = ? ORDER BY u.name`
   ).all<{ name: string }>(blockId);
   if (pres.length) {
     const names = pres.slice(0, 4).map((p) => `"${p.name}"`).join(", ");
     const extra = pres.length > 4 ? ` and ${pres.length - 4} more` : "";
     throw new HttpError(409,
-      `PRE Block "${block.name}" is assigned to ${pres.length} PRE user${pres.length > 1 ? "s" : ""} (${names}${extra}). Reassign them to another PRE block before deleting this one.`);
+      `PRE Block "${block.name}" is assigned to ${pres.length} PRE user${pres.length > 1 ? "s" : ""} (${names}${extra}). Remove them from this block before deleting it.`);
   }
 
   // pre_block_wards rows are this block's own ward mappings — they cascade away

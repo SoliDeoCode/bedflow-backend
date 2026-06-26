@@ -128,10 +128,12 @@ router.get("/compliance", asyncH(async (_req, res) => {
 
   const blockIds = blocks.map(b => b.id);
 
-  // Batch: one PRE user per block
+  // Batch: one representative PRE user per block (lowest id wins)
   const userRows = await db.prepare(
-    `SELECT DISTINCT ON (pre_block_id) id, shift, name, pre_block_id
-     FROM users WHERE role = 'PRE' AND pre_block_id = ANY(?) ORDER BY pre_block_id, id`
+    `SELECT DISTINCT ON (upb.pre_block_id) u.id, u.shift, u.name, upb.pre_block_id
+     FROM user_pre_blocks upb
+     JOIN users u ON u.id = upb.user_id
+     WHERE upb.pre_block_id = ANY(?) ORDER BY upb.pre_block_id, u.id`
   ).all<{ id: number; shift: string; name: string; pre_block_id: number }>(blockIds);
   const userByBlock = new Map(userRows.map(u => [Number(u.pre_block_id), u]));
 
@@ -181,8 +183,10 @@ router.get("/pre-activity", asyncH(async (_req, res) => {
   const blockIds = blocks.map(b => b.id);
 
   const userRows = await db.prepare(
-    `SELECT DISTINCT ON (pre_block_id) id, name, shift, pre_block_id
-     FROM users WHERE role = 'PRE' AND pre_block_id = ANY(?) ORDER BY pre_block_id, id`
+    `SELECT DISTINCT ON (upb.pre_block_id) u.id, u.name, u.shift, upb.pre_block_id
+     FROM user_pre_blocks upb
+     JOIN users u ON u.id = upb.user_id
+     WHERE upb.pre_block_id = ANY(?) ORDER BY upb.pre_block_id, u.id`
   ).all<{ id: number; name: string; shift: string; pre_block_id: number }>(blockIds);
   const userByBlock = new Map(userRows.map(u => [Number(u.pre_block_id), u]));
 
@@ -444,9 +448,9 @@ router.post("/views", asyncH(async (req, res) => {
 router.put("/views/:id", asyncH(async (req, res) => {
   const id = Number(req.params.id);
   const view = await db.prepare("SELECT * FROM saved_views WHERE id=?").get<SavedViewRow>(id);
-  if (!view) throw new HttpError(404, "View not found");
-  if (view.is_system) throw new HttpError(403, "System views cannot be edited");
-  if (view.created_by !== req.user!.id) throw new HttpError(403, "Not your view");
+  if (!view) throw new HttpError(404, "Saved view not found. It may have already been deleted.");
+  if (view.is_system) throw new HttpError(403, "Default system views cannot be edited. Create your own view to customise it.");
+  if (view.created_by !== req.user!.id) throw new HttpError(403, "You can only edit views you created.");
   const { name, selected_wards, is_shared } = z.object({
     name:           z.string().min(1).max(60),
     selected_wards: z.array(z.string()),
@@ -461,9 +465,9 @@ router.put("/views/:id", asyncH(async (req, res) => {
 router.delete("/views/:id", asyncH(async (req, res) => {
   const id = Number(req.params.id);
   const view = await db.prepare("SELECT * FROM saved_views WHERE id=?").get<SavedViewRow>(id);
-  if (!view) throw new HttpError(404, "View not found");
-  if (view.is_system) throw new HttpError(403, "System views cannot be deleted");
-  if (view.created_by !== req.user!.id) throw new HttpError(403, "Not your view");
+  if (!view) throw new HttpError(404, "Saved view not found. It may have already been deleted.");
+  if (view.is_system) throw new HttpError(403, "Default system views cannot be deleted.");
+  if (view.created_by !== req.user!.id) throw new HttpError(403, "You can only delete views you created.");
   await db.prepare("DELETE FROM saved_views WHERE id=?").run(id);
   res.json({ ok: true });
 }));

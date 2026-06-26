@@ -25,9 +25,9 @@ export function initWebsocket(server: HttpServer) {
     const user = (socket.data as { user: JwtPayload }).user;
     if (user.role === "COO") socket.join("overview");
     if (user.role === "PRE") {
-      const row = await db.prepare("SELECT pre_block_id FROM users WHERE id=?")
-        .get<{ pre_block_id: number | null }>(user.id);
-      if (row?.pre_block_id) socket.join(`pre:${row.pre_block_id}`);
+      const rows = await db.prepare("SELECT pre_block_id FROM user_pre_blocks WHERE user_id=?")
+        .all<{ pre_block_id: number }>(user.id);
+      for (const r of rows) socket.join(`pre:${r.pre_block_id}`);
     }
     if (user.role === "NURSE") {
       const rows = await db.prepare("SELECT station_id FROM nurse_stations WHERE nurse_id=?")

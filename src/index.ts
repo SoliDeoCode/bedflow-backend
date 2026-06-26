@@ -67,6 +67,7 @@ app.use("/api/coo", cooRoutes);
 app.use("/api/push", pushLimiter);
 app.use("/api", metaRoutes);
 
+app.use((_req, res) => res.status(404).json({ error: "The requested endpoint was not found." }));
 app.use(errorHandler);
 
 const server = createServer(app);

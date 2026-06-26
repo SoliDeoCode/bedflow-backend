@@ -241,16 +241,23 @@ router.delete("/wards/:id", asyncH(async (req, res) => {
 router.get("/users", asyncH(async (_req, res) => {
   const users = await db.prepare(
     `SELECT u.id, u.username, u.role, u.name, u.shift, u.status, u.remarks,
-            u.pre_block_id, u.station_id, u.nursing_station,
-            pb.name AS pre_block_name,
+            u.station_id, u.nursing_station,
             ns.name AS station_name,
+            COALESCE(upb.pre_block_ids,   ARRAY[]::int[])  AS pre_block_ids,
+            COALESCE(upb.pre_block_names, ARRAY[]::text[]) AS pre_block_names,
             COALESCE(st.station_ids,   ARRAY[]::int[])  AS station_ids,
             COALESCE(st.station_names, ARRAY[]::text[]) AS station_names,
             COALESCE(dbk.block_ids,   ARRAY[]::int[])  AS block_ids,
             COALESCE(dbk.block_names, ARRAY[]::text[]) AS block_names
      FROM users u
-     LEFT JOIN pre_blocks pb ON pb.id = u.pre_block_id
      LEFT JOIN nursing_stations ns ON ns.id = u.station_id
+     LEFT JOIN LATERAL (
+       SELECT array_agg(upb2.pre_block_id ORDER BY pb.name) AS pre_block_ids,
+              array_agg(pb.name           ORDER BY pb.name) AS pre_block_names
+       FROM user_pre_blocks upb2
+       JOIN pre_blocks pb ON pb.id = upb2.pre_block_id
+       WHERE upb2.user_id = u.id
+     ) upb ON true
      LEFT JOIN LATERAL (
        SELECT array_agg(nst.station_id ORDER BY ns2.name) AS station_ids,
               array_agg(ns2.name      ORDER BY ns2.name) AS station_names
@@ -274,21 +281,21 @@ router.get("/users", asyncH(async (_req, res) => {
 
 router.post("/pre", asyncH(async (req, res) => {
   const b = z.object({
-    username:    z.string().min(1, "Username is required.").max(40, "Username must be 40 characters or less."),
-    password:    z.string().min(8, "Password must be at least 8 characters.").max(72, "Password is too long."),
-    name:        z.string().min(1, "Display name is required.").max(80, "Display name is too long."),
-    preBlockId:  z.number().int().nullable().optional(),
-    shift:       z.enum(["morning", "night"]).optional(),
+    username:     z.string().min(1, "Username is required.").max(40, "Username must be 40 characters or less."),
+    password:     z.string().min(8, "Password must be at least 8 characters.").max(72, "Password is too long."),
+    name:         z.string().min(1, "Display name is required.").max(80, "Display name is too long."),
+    preBlockIds:  z.array(z.number().int()).optional(),
+    shift:        z.enum(["morning", "night"]).optional(),
   }).parse(req.body);
   res.status(201).json(await createPre({ ...b, managerId: req.user!.id }));
 }));
 
 router.put("/pre/:id", asyncH(async (req, res) => {
   const b = z.object({
-    name:        z.string().min(1, "Display name is required.").max(80, "Display name is too long.").optional(),
-    password:    z.string().min(8, "Password must be at least 8 characters.").max(72, "Password is too long.").optional(),
-    shift:       z.enum(["morning", "night"]).optional(),
-    preBlockId:  z.number().int().nullable().optional(),
+    name:         z.string().min(1, "Display name is required.").max(80, "Display name is too long.").optional(),
+    password:     z.string().min(8, "Password must be at least 8 characters.").max(72, "Password is too long.").optional(),
+    shift:        z.enum(["morning", "night"]).optional(),
+    preBlockIds:  z.array(z.number().int()).optional(),
   }).parse(req.body);
   res.json(await editPre({ userId: Number(req.params.id), ...b, managerId: req.user!.id }));
 }));
