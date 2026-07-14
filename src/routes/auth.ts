@@ -8,7 +8,7 @@ const router = Router();
 const loginSchema = z.object({
   username: z.string().min(1, "Please enter your username."),
   password: z.string().min(1, "Please enter your password."),
-  role: z.enum(["PRE", "COO", "NURSE", "DOCTOR"]).optional(),
+  role: z.enum(["PRE", "COO", "NURSE", "DOCTOR", "FC"]).optional(),
 });
 
 router.post("/login", asyncH(async (req, res) => {

@@ -33,6 +33,14 @@ import {
 import {
   listDestinations, createDestination, updateDestination, reorderDestination, deleteDestination,
 } from "../services/destinationService.js";
+import {
+  listDepartments, createDepartment, updateDepartment, deleteDepartment,
+  listDoctorsWithDepartments, createDoctor as createDoctorMaster,
+  updateDoctorMaster, deleteDoctorMaster,
+} from "../services/doctorDeptService.js";
+import {
+  getDischargeLounge, setupDischargeLounge, renameDischargeLounge,
+} from "../services/dischargeLoungeService.js";
 
 const router = Router();
 router.use(authRequired, requireRole("COO"));
@@ -60,10 +68,17 @@ async function stationIdsForNurse(nurseId: number): Promise<number[] | undefined
 // ── KPIs ──────────────────────────────────────────────────────────────────────
 
 router.get("/kpis", asyncH(async (_req, res) => {
+  // total/census/non_census are raw inventory (no operational_status filter —
+  // matches Hospital Snapshot's totalBeds/censusBeds/nonCensusBeds). The
+  // vacant/vacant_reserved/occupied state counts all require bd.operational_status
+  // consistently — a bed pulled out of service isn't available capacity, so it
+  // shouldn't register as vacant OR occupied (same rule as the Occupancy Board).
+  // Ward-level operational is filtered too — a bed inside a shut-down ward is
+  // never counted anywhere else in the app, so it shouldn't inflate this one either.
   const row = await db.prepare(`
     SELECT
       COUNT(*)::int                                                            AS total,
-      COUNT(*) FILTER (WHERE (w.bed_type = 'Census' OR w.bed_type IS NULL) AND bd.operational_status)::int AS census,
+      COUNT(*) FILTER (WHERE w.bed_type = 'Census' OR w.bed_type IS NULL)::int  AS census,
       COUNT(*) FILTER (WHERE w.bed_type = 'Non-Census')::int                  AS non_census,
       COUNT(*) FILTER (WHERE bd.operational_status)::int                      AS operational,
       COUNT(*) FILTER (WHERE NOT bd.operational_status)::int                  AS non_operational,
@@ -71,10 +86,13 @@ router.get("/kpis", asyncH(async (_req, res) => {
                          AND bd.reservation_status = 'NONE'
                          AND bd.operational_status)::int                      AS vacant,
       COUNT(*) FILTER (WHERE bd.physical_status = 'VACANT'
-                         AND bd.reservation_status = 'RESERVED')::int         AS vacant_reserved,
-      COUNT(*) FILTER (WHERE bd.physical_status = 'OCCUPIED')::int             AS occupied
+                         AND bd.reservation_status = 'RESERVED'
+                         AND bd.operational_status)::int                      AS vacant_reserved,
+      COUNT(*) FILTER (WHERE bd.physical_status = 'OCCUPIED'
+                         AND bd.operational_status)::int                      AS occupied
     FROM bed_details bd
     JOIN wards w ON w.id = bd.ward_id
+    WHERE w.operational = true AND NOT w.is_discharge_lounge
   `).get<Record<string, number>>();
   const occupiedTotal = row?.occupied ?? 0;
   const operational   = row?.operational ?? 0;
@@ -395,28 +413,28 @@ router.get("/wards/:id/beds", asyncH(async (req, res) => {
 }));
 
 router.post("/wards/:id/generate-beds", asyncH(async (req, res) => {
-  const { bedNames, operationalStatus, bedType, acStatus } = z.object({
+  // bedType is never accepted here — beds always inherit the ward's current
+  // type (Census/Non-Census is ward-level only, see bedDetailService.ts).
+  const { bedNames, operationalStatus, acStatus } = z.object({
     bedNames:          z.array(z.string().min(1)).min(1).max(500),
     operationalStatus: z.boolean().optional(),
-    bedType:           z.enum(["Census", "Non-Census"]).optional(),
     acStatus:          z.boolean().optional(),
   }).parse(req.body);
   const wardId = Number(req.params.id);
-  const result = await generateBeds({ wardId, bedNames, operationalStatus, bedType, acStatus, userId: req.user!.id });
+  const result = await generateBeds({ wardId, bedNames, operationalStatus, acStatus, userId: req.user!.id });
   const stationId = await stationIdForWard(wardId);
   emitUpdate("bed:update", { wardId }, stationId ? { stationId } : undefined);
   res.status(201).json(result);
 }));
 
 router.post("/wards/:id/beds", asyncH(async (req, res) => {
-  const { bedName, operationalStatus, bedType, acStatus } = z.object({
+  const { bedName, operationalStatus, acStatus } = z.object({
     bedName:           z.string().min(1),
     operationalStatus: z.boolean().optional(),
-    bedType:           z.enum(["Census", "Non-Census"]).optional(),
     acStatus:          z.boolean().optional(),
   }).parse(req.body);
   const wardId = Number(req.params.id);
-  const result = await addSingleBed({ wardId, bedName, operationalStatus, bedType, acStatus, userId: req.user!.id });
+  const result = await addSingleBed({ wardId, bedName, operationalStatus, acStatus, userId: req.user!.id });
   const stationId = await stationIdForWard(wardId);
   emitUpdate("bed:update", { wardId }, stationId ? { stationId } : undefined);
   res.status(201).json(result);
@@ -428,15 +446,15 @@ router.patch("/beds/:id/name", asyncH(async (req, res) => {
 }));
 
 router.patch("/beds/:id/master", asyncH(async (req, res) => {
-  const { bedType, operationalStatus, acStatus } = z.object({
-    bedType:           z.enum(["Census", "Non-Census"]).optional(),
+  // bedType removed — see generate-beds comment above.
+  const { operationalStatus, acStatus } = z.object({
     operationalStatus: z.boolean().optional(),
     acStatus:          z.boolean().optional(),
   }).parse(req.body);
   const bedId = Number(req.params.id);
   const stationId = await stationIdForBed(bedId);
   const result = await updateBedMaster({
-    bedId, bedType, operationalStatus, acStatus, userId: req.user!.id,
+    bedId, operationalStatus, acStatus, userId: req.user!.id,
   });
   emitUpdate("bed:update", { bedId }, stationId ? { stationId } : undefined);
   res.json(result);
@@ -830,6 +848,82 @@ router.delete("/destinations/:id", asyncH(async (req, res) => {
   const result = await deleteDestination({ id, userId: req.user!.id });
   emitUpdate("bed:update", { destinationId: id });
   res.json(result);
+}));
+
+// ── Departments & Doctors (master data) — admin-only. Deliberately separate from
+// the ward/floor/building-block hierarchy: a doctor/department is not a physical
+// place, so none of this touches wards/beds/floors. ────────────────────────────
+
+router.get("/departments", asyncH(async (_req, res) => {
+  res.json({ departments: await listDepartments(false) });
+}));
+
+router.post("/departments", asyncH(async (req, res) => {
+  const { name } = z.object({ name: z.string().min(1).max(150) }).parse(req.body);
+  res.json({ department: await createDepartment(name) });
+}));
+
+router.put("/departments/:id", asyncH(async (req, res) => {
+  const { name, active } = z.object({
+    name:   z.string().min(1).max(150).optional(),
+    active: z.boolean().optional(),
+  }).parse(req.body);
+  const id = Number(req.params.id);
+  res.json(await updateDepartment({ id, name, active, userId: req.user!.id }));
+}));
+
+router.delete("/departments/:id", asyncH(async (req, res) => {
+  const id = Number(req.params.id);
+  res.json(await deleteDepartment({ id, userId: req.user!.id }));
+}));
+
+router.get("/doctors-master", asyncH(async (_req, res) => {
+  res.json({ doctors: await listDoctorsWithDepartments(false) });
+}));
+
+router.post("/doctors-master", asyncH(async (req, res) => {
+  const { name, department_ids } = z.object({
+    name: z.string().min(1).max(150),
+    department_ids: z.array(z.number().int().positive()).min(1),
+  }).parse(req.body);
+  res.json({ doctor: await createDoctorMaster(name, department_ids) });
+}));
+
+router.put("/doctors-master/:id", asyncH(async (req, res) => {
+  const { name, active, department_ids } = z.object({
+    name:           z.string().min(1).max(150).optional(),
+    active:         z.boolean().optional(),
+    department_ids: z.array(z.number().int().positive()).optional(),
+  }).parse(req.body);
+  const id = Number(req.params.id);
+  res.json(await updateDoctorMaster({ id, name, active, departmentIds: department_ids, userId: req.user!.id }));
+}));
+
+router.delete("/doctors-master/:id", asyncH(async (req, res) => {
+  const id = Number(req.params.id);
+  res.json(await deleteDoctorMaster({ id, userId: req.user!.id }));
+}));
+
+// ── Discharge Lounge — a virtual holding ward, set up once by an admin. Lives
+// outside the floor/building-block hierarchy (no floorId) and never counts toward
+// hospital total/Census/Non-Census beds anywhere in the app. ───────────────────
+
+router.get("/discharge-lounge", asyncH(async (_req, res) => {
+  res.json(await getDischargeLounge());
+}));
+
+router.post("/discharge-lounge", asyncH(async (req, res) => {
+  const { name, initial_beds } = z.object({
+    name: z.string().min(1).max(150),
+    initial_beds: z.number().int().min(0).max(200),
+  }).parse(req.body);
+  const result = await setupDischargeLounge({ name, initialBeds: initial_beds, managerId: req.user!.id });
+  res.status(201).json(result);
+}));
+
+router.put("/discharge-lounge", asyncH(async (req, res) => {
+  const { name } = z.object({ name: z.string().min(1).max(150) }).parse(req.body);
+  res.json(await renameDischargeLounge({ name, managerId: req.user!.id }));
 }));
 
 export default router;

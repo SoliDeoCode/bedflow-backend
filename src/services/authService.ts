@@ -11,7 +11,7 @@ export async function login(username: string, password: string, role?: string) {
   if (!user || !bcrypt.compareSync(password || "", user.password_hash))
     throw new HttpError(401, "Incorrect username or password.");
   if (role && user.role !== role) {
-    const tabLabel: Record<string, string> = { PRE: "PRE", NURSE: "Nurse", COO: "Admin", DOCTOR: "Doctor" };
+    const tabLabel: Record<string, string> = { PRE: "PRE", NURSE: "Nurse", COO: "Admin", DOCTOR: "Doctor", FC: "FC" };
     const label = tabLabel[user.role] || user.role;
     throw new HttpError(403, `This account belongs to the ${label} role. Please select the ${label} tab and try again.`);
   }

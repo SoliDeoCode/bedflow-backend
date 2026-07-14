@@ -1,6 +1,6 @@
 import { db } from "../db/index.js";
 import { pushToUser } from "../services/pushService.js";
-import { snapshotOccupancy, captureMidnightCensus } from "../services/bedService.js";
+import { snapshotOccupancy, snapshotAdminDashboard, captureMidnightCensus } from "../services/bedService.js";
 import { emitUpdate } from "../websocket/io.js";
 import { COO_REMINDERS, hmToMin, minsNow, todayStr, currentRound, inShift, roundKey,
          type ShiftKey } from "../config/domain.js";
@@ -65,6 +65,40 @@ async function tick() {
     }
   }
 
+  // "Start Discharge?" prompt — fires once per planned discharge, the moment its
+  // planned date arrives. prompted_at is persisted on the row itself (not just in
+  // lastPush) so a server restart never re-derives "already prompted" from memory.
+  const dueDischarges = await db.prepare(
+    `SELECT dt.id, dt.admission_id, pa.ward_id, pa.bed_id
+     FROM discharge_tracking dt
+     JOIN patient_admissions pa ON pa.id = dt.admission_id
+     WHERE dt.status='PLANNED' AND dt.prompted_at IS NULL AND dt.planned_date <= ?`
+  ).all<{ id: number; admission_id: number; ward_id: number; bed_id: number }>(today);
+
+  for (const row of dueDischarges) {
+    await db.prepare("UPDATE discharge_tracking SET prompted_at=? WHERE id=?").run(now, row.id);
+    // A ward can belong to MULTIPLE PRE blocks — prompt every block that contains it,
+    // and push to every distinct PRE user across those blocks (no duplicates).
+    const preBlocks = await db.prepare("SELECT pre_block_id FROM pre_block_wards WHERE ward_id=?")
+      .all<{ pre_block_id: number }>(row.ward_id);
+    if (preBlocks.length > 0) {
+      const blockIds = preBlocks.map(b => b.pre_block_id);
+      emitUpdate("discharge:prompt", { admissionId: row.admission_id, bedId: row.bed_id, wardId: row.ward_id }, {
+        pre: blockIds.map(String),
+      });
+      const preUsers = await db.prepare(
+        "SELECT DISTINCT user_id FROM user_pre_blocks WHERE pre_block_id = ANY(?)"
+      ).all<{ user_id: number }>(blockIds);
+      for (const u of preUsers)
+        void pushToUser(u.user_id, {
+          title: "Start Discharge?", body: "A planned discharge is due — open BedFlow to start it.",
+          tag: "discharge-prompt", requireInteraction: true,
+        });
+    } else {
+      emitUpdate("discharge:prompt", { admissionId: row.admission_id, bedId: row.bed_id, wardId: row.ward_id });
+    }
+  }
+
   // COO reminders at the top of each 3-hour slot
   for (const r of COO_REMINDERS) {
     if (mins === hmToMin(r)) {
@@ -86,6 +120,7 @@ async function tick() {
   if (india.getMinutes() === 0 && india.getHours() !== lastSnapshotHour) {
     lastSnapshotHour = india.getHours();
     void snapshotOccupancy();
+    void snapshotAdminDashboard();
   }
 
   // midnight census: snapshot all ward counts at 00:00 IST; the capture is

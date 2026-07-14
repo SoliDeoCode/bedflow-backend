@@ -1,6 +1,7 @@
 import { db } from "../db/index.js";
 import { HttpError } from "../middleware/error.js";
 import { audit } from "./auditService.js";
+import { validateIpLast6, validateAdmissionType, createAdmission } from "./patientAdmissionService.js";
 
 const BED_NAME_RE = /^[A-Za-z0-9 \-]+$/;
 
@@ -11,13 +12,17 @@ function validateBedName(name: string) {
 }
 
 export async function _recalcWardTotals(wardId: number, actorId: number) {
+  // total = every physical bed in the ward, operational or not (raw inventory —
+  // matches Hospital Snapshot's Total Beds). vacant/reserved/occupied/occupied_reserved
+  // only count operational beds — a bed pulled out of service isn't available
+  // capacity, so it shouldn't register as either vacant or occupied.
   const counts = await db.prepare(`
     SELECT
       COUNT(*) AS total,
-      SUM(CASE WHEN physical_status='VACANT'   AND reservation_status='NONE'     THEN 1 ELSE 0 END) AS vacant,
-      SUM(CASE WHEN physical_status='VACANT'   AND reservation_status='RESERVED' THEN 1 ELSE 0 END) AS reserved,
-      SUM(CASE WHEN physical_status='OCCUPIED' AND reservation_status='NONE'     THEN 1 ELSE 0 END) AS occupied,
-      SUM(CASE WHEN physical_status='OCCUPIED' AND reservation_status='RESERVED' THEN 1 ELSE 0 END) AS occupied_reserved
+      SUM(CASE WHEN operational_status AND physical_status='VACANT'   AND reservation_status='NONE'     THEN 1 ELSE 0 END) AS vacant,
+      SUM(CASE WHEN operational_status AND physical_status='VACANT'   AND reservation_status='RESERVED' THEN 1 ELSE 0 END) AS reserved,
+      SUM(CASE WHEN operational_status AND physical_status='OCCUPIED' AND reservation_status='NONE'     THEN 1 ELSE 0 END) AS occupied,
+      SUM(CASE WHEN operational_status AND physical_status='OCCUPIED' AND reservation_status='RESERVED' THEN 1 ELSE 0 END) AS occupied_reserved
     FROM bed_details WHERE ward_id = ?
   `).get<{ total: number; vacant: number; reserved: number; occupied: number; occupied_reserved: number }>(wardId);
   if (!counts) return;
@@ -51,9 +56,12 @@ export async function _recalcWardTotals(wardId: number, actorId: number) {
   await db.prepare("UPDATE wards SET total_beds=? WHERE id=?").run(total, wardId);
 }
 
-/** Generate beds from an explicit list of names (frontend expands patterns). */
+/** Generate beds from an explicit list of names (frontend expands patterns).
+ *  bed_type always inherits the ward's current type — Census/Non-Census is a
+ *  ward-level decision, no per-bed override (see wards.bed_type as the single
+ *  source of truth, kept in sync by editWard's cascade update). */
 export async function generateBeds(opts: {
-  wardId: number; bedNames: string[]; userId: number; operationalStatus?: boolean; bedType?: string; acStatus?: boolean;
+  wardId: number; bedNames: string[]; userId: number; operationalStatus?: boolean; acStatus?: boolean;
 }) {
   const ward = await db.prepare("SELECT id, bed_type, operational, ac FROM wards WHERE id=?")
     .get<{ id: number; bed_type: string; operational: boolean; ac: boolean }>(opts.wardId);
@@ -65,7 +73,7 @@ export async function generateBeds(opts: {
 
   for (const n of opts.bedNames) validateBedName(n);
 
-  const bedType     = opts.bedType ?? ward.bed_type ?? "Census";
+  const bedType     = ward.bed_type ?? "Census";
   const operational = opts.operationalStatus ?? ward.operational ?? true;
   const acStatus    = opts.acStatus ?? ward.ac ?? true;
   const now = Date.now();
@@ -86,15 +94,16 @@ export async function generateBeds(opts: {
   return { ok: true, generated: inserted };
 }
 
+/** bed_type always inherits the ward's current type — see generateBeds' comment. */
 export async function addSingleBed(opts: {
-  wardId: number; bedName: string; userId: number; operationalStatus?: boolean; bedType?: string; acStatus?: boolean;
+  wardId: number; bedName: string; userId: number; operationalStatus?: boolean; acStatus?: boolean;
 }) {
   const ward = await db.prepare("SELECT id, bed_type, operational, ac FROM wards WHERE id=?")
     .get<{ id: number; bed_type: string; operational: boolean; ac: boolean }>(opts.wardId);
   if (!ward) throw new HttpError(404, "Ward not found");
 
   const trimmed     = opts.bedName.trim();
-  const bedType     = opts.bedType ?? ward.bed_type ?? "Census";
+  const bedType     = ward.bed_type ?? "Census";
   const operational = opts.operationalStatus ?? ward.operational ?? true;
   const acStatus    = opts.acStatus ?? ward.ac ?? true;
   validateBedName(trimmed);
@@ -120,6 +129,17 @@ export interface BedDetail {
   bed_type: string; operational_status: boolean; ac_status: boolean;
   payer_type: string | null; destination: string | null; reservation_note: string | null;
   updated_at: number; updated_by: number | null;
+  /** The active admission's discharge_tracking row (or null) — read-only enrichment for the
+   *  discharge module's progress badge. bed_details itself carries none of this; it stays the
+   *  source of truth for physical occupancy exactly as before. */
+  discharge_tracking: unknown | null;
+  /** Active admission fields — read-only enrichment, same source as discharge_tracking above. */
+  ip_last6: string | null;
+  admission_type: string | null;
+  consultant_name: string | null;
+  department_name: string | null;
+  doctor_id: number | null;
+  department_id: number | null;
 }
 
 export async function listBeds(
@@ -128,26 +148,32 @@ export async function listBeds(
   reservationStatus?: string,
   operationalOnly = false,
 ): Promise<BedDetail[]> {
-  let sql = `SELECT id, ward_id, bed_name, physical_status, reservation_status,
-                    bed_type, operational_status, ac_status, payer_type, destination, reservation_note, updated_at, updated_by
-             FROM bed_details WHERE ward_id=?`;
+  let sql = `SELECT bd.id, bd.ward_id, bd.bed_name, bd.physical_status, bd.reservation_status,
+                    bd.bed_type, bd.operational_status, bd.ac_status, bd.payer_type, bd.destination, bd.reservation_note,
+                    bd.updated_at, bd.updated_by, row_to_json(dt.*) AS discharge_tracking,
+                    pa.ip_last6, pa.admission_type, pa.consultant_name, pa.department_name,
+                    pa.doctor_id, pa.department_id
+             FROM bed_details bd
+             LEFT JOIN patient_admissions pa ON pa.bed_id = bd.id AND pa.status = 'ACTIVE'
+             LEFT JOIN discharge_tracking dt ON dt.admission_id = pa.id
+             WHERE bd.ward_id=?`;
   const params: unknown[] = [wardId];
-  if (operationalOnly) sql += " AND operational_status = true";
+  if (operationalOnly) sql += " AND bd.operational_status = true";
   if (physicalStatus) {
     if (!["VACANT", "OCCUPIED"].includes(physicalStatus.toUpperCase()))
       throw new HttpError(400, "Invalid physical_status filter");
-    sql += " AND physical_status=?"; params.push(physicalStatus.toUpperCase());
+    sql += " AND bd.physical_status=?"; params.push(physicalStatus.toUpperCase());
   }
   if (reservationStatus) {
     if (!["NONE", "RESERVED"].includes(reservationStatus.toUpperCase()))
       throw new HttpError(400, "Invalid reservation_status filter");
-    sql += " AND reservation_status=?"; params.push(reservationStatus.toUpperCase());
+    sql += " AND bd.reservation_status=?"; params.push(reservationStatus.toUpperCase());
   }
   // Natural sort: prefix alphabetically, then numeric portion numerically, then full name
   sql += ` ORDER BY
-    substring(bed_name from '^[^0-9]*') ASC,
-    NULLIF(substring(bed_name from '[0-9]+'), '')::bigint NULLS LAST,
-    bed_name ASC`;
+    substring(bd.bed_name from '^[^0-9]*') ASC,
+    NULLIF(substring(bd.bed_name from '[0-9]+'), '')::bigint NULLS LAST,
+    bd.bed_name ASC`;
 
   return db.prepare(sql).all<BedDetail>(...params);
 }
@@ -194,8 +220,10 @@ export async function renameBed(opts: {
   return { ok: true };
 }
 
+/** bed_type is never edited per-bed — it always follows the ward (see generateBeds'
+ *  comment). Only operational status and AC status are genuinely bed-level facts. */
 export async function updateBedMaster(opts: {
-  bedId: number; bedType?: string; operationalStatus?: boolean; acStatus?: boolean; userId: number;
+  bedId: number; operationalStatus?: boolean; acStatus?: boolean; userId: number;
 }) {
   const bed = await db.prepare(
     "SELECT id, ward_id, operational_status FROM bed_details WHERE id=?"
@@ -203,13 +231,6 @@ export async function updateBedMaster(opts: {
   if (!bed) throw new HttpError(404, "Bed not found");
 
   const now = Date.now();
-  if (opts.bedType !== undefined) {
-    const valid = ["Census", "Non-Census"];
-    if (!valid.includes(opts.bedType))
-      throw new HttpError(400, `Invalid bed_type. Must be one of: ${valid.join(", ")}`);
-    await db.prepare("UPDATE bed_details SET bed_type=?, updated_at=? WHERE id=?")
-      .run(opts.bedType, now, opts.bedId);
-  }
   if (opts.operationalStatus !== undefined) {
     await db.prepare("UPDATE bed_details SET operational_status=?, updated_at=? WHERE id=?")
       .run(opts.operationalStatus, now, opts.bedId);
@@ -217,6 +238,9 @@ export async function updateBedMaster(opts: {
       `INSERT INTO bed_operational_log (bed_id, ward_id, changed_by, changed_at, old_value, new_value, forced_vacant)
        VALUES (?,?,?,?,?,?,?)`
     ).run(opts.bedId, bed.ward_id, opts.userId, now, bed.operational_status, opts.operationalStatus, false);
+    // Ward totals now depend on operational_status too (a non-operational bed
+    // no longer counts as vacant/occupied) — recalc so the cache stays correct.
+    await _recalcWardTotals(bed.ward_id, opts.userId);
   }
   if (opts.acStatus !== undefined) {
     await db.prepare("UPDATE bed_details SET ac_status=?, updated_at=? WHERE id=?")
@@ -224,7 +248,7 @@ export async function updateBedMaster(opts: {
   }
 
   await audit(opts.userId, "bed_master_edit", String(opts.bedId),
-    { bedType: opts.bedType, operationalStatus: opts.operationalStatus, acStatus: opts.acStatus });
+    { operationalStatus: opts.operationalStatus, acStatus: opts.acStatus });
   return { ok: true };
 }
 
@@ -267,6 +291,22 @@ export async function deleteBed(opts: { bedId: number; userId: number }) {
 export async function updateBedStatus(opts: {
   bedId: number; physicalStatus: string; reservationStatus: string;
   payerType?: string | null; destination?: string | null; reservationNote?: string | null; userId: number;
+  /** Last 6 digits of the patient's IP number — required when this call is a fresh
+   *  Vacant→Occupied transition initiated manually (see the discharge-module hook below). */
+  ipLast6?: string;
+  /** "IP" | "DAYCARE" — required alongside ipLast6 on a fresh admission. */
+  admissionType?: string;
+  /** Optional free-text captured alongside ipLast6 on a fresh admission — same
+   *  "V1 manual entry, HIS integration later" pattern. */
+  consultantName?: string | null;
+  departmentName?: string | null;
+  doctorId?: number | null;
+  departmentId?: number | null;
+  /** MANUAL (default) triggers discharge-module side effects (new admission on fresh
+   *  occupancy, auto-reset of an in-progress discharge on an unexpected vacate).
+   *  TRANSFER / DISCHARGE_CHECKOUT are used by bedTransferService / dischargeService
+   *  themselves, which already manage the admission — the hook no-ops for those. */
+  changeReason?: "MANUAL" | "TRANSFER" | "DISCHARGE_CHECKOUT";
 }) {
   const bed = await db.prepare(
     `SELECT bd.id, bd.ward_id, bd.bed_name, bd.physical_status, bd.reservation_status,
@@ -291,6 +331,16 @@ export async function updateBedStatus(opts: {
     throw new HttpError(400, "Invalid physical_status");
   if (!["NONE", "RESERVED"].includes(opts.reservationStatus))
     throw new HttpError(400, "Invalid reservation_status");
+
+  // A fresh Vacant→Occupied admission requires the patient's IP number up front —
+  // validated here, before the transaction commits, so a bad/missing ip_last6 never
+  // leaves the bed marked Occupied with no admission record behind it.
+  const changeReason = opts.changeReason ?? "MANUAL";
+  const isFreshAdmission = changeReason === "MANUAL" && bed.physical_status === "VACANT" && opts.physicalStatus === "OCCUPIED";
+  if (isFreshAdmission) {
+    validateIpLast6(opts.ipLast6);
+    validateAdmissionType(opts.admissionType);
+  }
 
   // Determine new payer_type:
   // - Going VACANT (any reservation): always clear to NULL
@@ -379,5 +429,46 @@ export async function updateBedStatus(opts: {
     new: { physical: opts.physicalStatus,  reservation: opts.reservationStatus,  payer: newPayerType,  destination: movementDestination, note: movementReservationNote },
     wardId: bed.ward_id,
   });
+
+  await handleDischargeSideEffects({
+    bedId: opts.bedId, wardId: bed.ward_id,
+    oldPhysical: bed.physical_status, newPhysical: opts.physicalStatus,
+    ipLast6: opts.ipLast6, admissionType: opts.admissionType,
+    consultantName: opts.consultantName, departmentName: opts.departmentName,
+    doctorId: opts.doctorId, departmentId: opts.departmentId,
+    changeReason, userId: opts.userId,
+  });
+
   return { ok: true, ward_id: bed.ward_id, physical_status: opts.physicalStatus, reservation_status: opts.reservationStatus, payer_type: newPayerType, destination: newDestination, reservation_note: newReservationNote };
+}
+
+// Discharge module hook. createAdmission is a plain, non-circular import (patientAdmissionService
+// never imports this file). dischargeService.handleManualVacate is dynamically imported instead,
+// since dischargeService itself imports updateBedStatus from here — a static import would be
+// circular. Only "MANUAL" transitions trigger side effects; TRANSFER and DISCHARGE_CHECKOUT are
+// driven by bedTransferService/dischargeService, which already manage the admission on their own.
+async function handleDischargeSideEffects(opts: {
+  bedId: number; wardId: number; oldPhysical: string; newPhysical: string;
+  ipLast6?: string; admissionType?: string; consultantName?: string | null; departmentName?: string | null;
+  doctorId?: number | null; departmentId?: number | null;
+  changeReason: "MANUAL" | "TRANSFER" | "DISCHARGE_CHECKOUT"; userId: number;
+}) {
+  if (opts.changeReason !== "MANUAL") return;
+
+  const freshlyOccupied = opts.oldPhysical === "VACANT" && opts.newPhysical === "OCCUPIED";
+  const vacated = opts.oldPhysical === "OCCUPIED" && opts.newPhysical === "VACANT";
+  if (!freshlyOccupied && !vacated) return;
+
+  if (freshlyOccupied) {
+    // ip_last6 / admission_type were already validated above, before the transaction committed.
+    await createAdmission({
+      bedId: opts.bedId, wardId: opts.wardId, ipLast6: opts.ipLast6!.trim(), admissionType: opts.admissionType!, userId: opts.userId,
+      consultantName: opts.consultantName, departmentName: opts.departmentName,
+      doctorId: opts.doctorId, departmentId: opts.departmentId,
+    });
+    return;
+  }
+
+  const { handleManualVacate } = await import("./dischargeService.js");
+  await handleManualVacate(opts.bedId, opts.userId);
 }

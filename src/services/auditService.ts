@@ -38,6 +38,11 @@ const CATEGORY_ACTIONS: Record<string, string[]> = {
     "payer_type_create", "payer_type_update", "payer_type_delete",
     "destination_create", "destination_update", "destination_delete",
   ],
+  discharge: [
+    "admission_create", "admission_close", "admission_move",
+    "discharge_plan", "discharge_reschedule", "discharge_cancel_plan", "discharge_initiate",
+    "discharge_cancel", "discharge_step_update", "discharge_complete", "bed_transfer",
+  ],
 };
 
 export interface ActivityQuery {

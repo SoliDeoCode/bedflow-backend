@@ -1,7 +1,7 @@
 // COO is the single management role, presented in the UI as "Admin".
 // The former MANAGER role was merged into COO (migration 20260621000000).
 // DOCTOR updates beds in assigned Doctor Blocks (migration 20260622000000).
-export type Role = "PRE" | "COO" | "NURSE" | "DOCTOR";
+export type Role = "PRE" | "COO" | "NURSE" | "DOCTOR" | "FC";
 
 export interface User {
   id: number;

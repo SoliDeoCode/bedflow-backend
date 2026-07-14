@@ -17,7 +17,7 @@ router.use(authRequired, requireRole("DOCTOR"));
 
 interface WardAccess { ward_id: number; doctor_block_id: number; }
 
-async function accessibleWards(doctorId: number): Promise<WardAccess[]> {
+export async function accessibleWards(doctorId: number): Promise<WardAccess[]> {
   return db.prepare(
     `SELECT dbw.ward_id, dbw.doctor_block_id
      FROM doctor_block_users dbu
@@ -27,7 +27,7 @@ async function accessibleWards(doctorId: number): Promise<WardAccess[]> {
   ).all<WardAccess>(doctorId);
 }
 
-async function blockForWard(doctorId: number, wardId: number): Promise<number | null> {
+export async function blockForWard(doctorId: number, wardId: number): Promise<number | null> {
   const rows = await accessibleWards(doctorId);
   const hit = rows.find((r) => Number(r.ward_id) === wardId);
   return hit ? Number(hit.doctor_block_id) : null;
@@ -165,12 +165,18 @@ router.get("/destinations", asyncH(async (_req, res) => {
 router.patch("/beds/:id/status", asyncH(async (req, res) => {
   const doctorId = req.user!.id;
   const bedId = Number(req.params.id);
-  const { physical_status, reservation_status, payer_type, destination, reservation_note } = z.object({
+  const { physical_status, reservation_status, payer_type, destination, reservation_note, ip_last6, admission_type, consultant_name, department_name, doctor_id, department_id } = z.object({
     physical_status:    z.enum(["VACANT", "OCCUPIED"]),
     reservation_status: z.enum(["NONE", "RESERVED"]),
     payer_type:         z.string().max(100).nullable().optional(),
     destination:        z.string().max(100).nullable().optional(),
     reservation_note:   z.string().max(255).nullable().optional(),
+    ip_last6:           z.string().max(6).optional(),
+    admission_type:     z.enum(["IP", "DAYCARE", "OPD"]).optional(),
+    consultant_name:    z.string().max(120).nullable().optional(),
+    department_name:    z.string().max(120).nullable().optional(),
+    doctor_id:          z.number().int().positive().nullable().optional(),
+    department_id:      z.number().int().positive().nullable().optional(),
   }).parse(req.body);
 
   // Read current bed first (for the doctor activity log) + authorize the ward.
@@ -187,6 +193,8 @@ router.patch("/beds/:id/status", asyncH(async (req, res) => {
   const result = await updateBedStatus({
     bedId, physicalStatus: physical_status, reservationStatus: reservation_status,
     payerType: payer_type, destination, reservationNote: reservation_note, userId: doctorId,
+    ipLast6: ip_last6, admissionType: admission_type, consultantName: consultant_name, departmentName: department_name,
+    doctorId: doctor_id, departmentId: department_id,
   });
 
   // Doctor-specific audit with ip/device, in addition to bed_movements + audit_logs.

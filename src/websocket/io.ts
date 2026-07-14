@@ -23,7 +23,9 @@ export function initWebsocket(server: HttpServer) {
 
   io.on("connection", async (socket) => {
     const user = (socket.data as { user: JwtPayload }).user;
-    if (user.role === "COO") socket.join("overview");
+    // FC is hospital-wide for the discharge module (billing isn't ward-scoped),
+    // same as COO — reuses the existing broadcast room rather than adding a new one.
+    if (user.role === "COO" || user.role === "FC") socket.join("overview");
     if (user.role === "PRE") {
       const rows = await db.prepare("SELECT pre_block_id FROM user_pre_blocks WHERE user_id=?")
         .all<{ pre_block_id: number }>(user.id);

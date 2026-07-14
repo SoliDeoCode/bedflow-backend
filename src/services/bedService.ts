@@ -2,6 +2,7 @@ import { db } from "../db/index.js";
 import { HttpError } from "../middleware/error.js";
 import { audit } from "./auditService.js";
 import { startOfDayIST } from "../config/domain.js";
+import { dashboardCounts } from "./dischargeService.js";
 
 export interface WardView {
   id: number; ward: string; total: number;
@@ -285,7 +286,7 @@ export async function orgOverview(): Promise<{
 export async function allWardsLive() {
   const wards = await db.prepare(
     `SELECT w.id, w.name AS ward, w.total_beds AS total,
-            w.unit_type, w.bed_type, w.room_type,
+            w.unit_type, w.bed_type, w.room_type, w.is_discharge_lounge,
             bb.name AS block_name,
             f.name  AS floor_name,
             b.vacant, b.reserved, b.occupied, b.occupied_reserved,
@@ -318,7 +319,7 @@ export async function allWardsLive() {
      ) rv ON rv.ward_id = w.id
      WHERE w.operational = true
      ORDER BY w.name`
-  ).all<WardView & { bed_type: string | null; room_type: string | null; block_name: string | null; floor_name: string | null; reviewedAt: number | null }>();
+  ).all<WardView & { bed_type: string | null; room_type: string | null; block_name: string | null; floor_name: string | null; reviewedAt: number | null; is_discharge_lounge: boolean }>();
 
   const allBedRow = await db.prepare(
     `SELECT COALESCE(SUM(total_beds),0) AS all_beds,
@@ -399,6 +400,8 @@ export interface LiveBedDetail {
   destination: string | null; reservation_note: string | null;
   operational_status: boolean; updated_at: number | null;
   updated_by_name: string | null;
+  discharge_tracking: unknown | null;
+  admission_type: string | null;
 }
 
 // Bed-level rows for the dashboard's Bed Explorer popup (click a KPI/payer
@@ -406,15 +409,21 @@ export interface LiveBedDetail {
 // (operational wards only) so the beds returned here always add up to the
 // counts shown on the cards. updated_by_name resolves to the staff member's
 // name (not a doctor — this system has no patient/doctor records at all).
+// bed_type is sourced from the WARD (w.bed_type), not the bed — Census/Non-
+// Census is ward-level everywhere, so the Explorer's own classify()/filter
+// logic (BedExplorerModal.jsx) sees the same answer the cards computed.
 export async function allBedDetailsLive() {
   return db.prepare(
     `SELECT bd.id, bd.ward_id, w.name AS ward, w.unit_type, w.bed_type,
             bd.bed_name, bd.physical_status, bd.reservation_status, bd.payer_type,
             bd.destination, bd.reservation_note, bd.operational_status,
-            bd.updated_at, u.name AS updated_by_name
+            bd.updated_at, u.name AS updated_by_name, row_to_json(dt.*) AS discharge_tracking,
+            pa.admission_type
      FROM bed_details bd
      JOIN wards w ON w.id = bd.ward_id
      LEFT JOIN users u ON u.id = bd.updated_by
+     LEFT JOIN patient_admissions pa ON pa.bed_id = bd.id AND pa.status = 'ACTIVE'
+     LEFT JOIN discharge_tracking dt ON dt.admission_id = pa.id
      WHERE w.operational = true
      ORDER BY w.name,
        substring(bd.bed_name from '^[^0-9]*') ASC,
@@ -471,4 +480,257 @@ export async function midnightCensusFor(date: string) {
   let wards: unknown[] = [];
   try { wards = JSON.parse(row.snapshot || "[]"); } catch { /* corrupt row */ }
   return { ts: row.ts, wards };
+}
+
+// ── Admin dashboard — Hospital Snapshot / Occupancy Board / Transaction Board ───
+// "Lounge" (Discharge Lounge) beds are a real bed_type but never counted in these
+// cards — they're virtual holding beds, not real hospital capacity, and would
+// distort every count here if included.
+//
+// state classification per bed (mutually exclusive, so buckets sum cleanly):
+//   lounge      — an active admission sitting in the Discharge Lounge
+//   overstay    — Occupied+None, System Checkout done but the patient hasn't
+//                 actually left yet (billing/paperwork finished, bed still not
+//                 free). Keyed off patient_left rather than physical_checkout_status
+//                 — Physical Checkout can be marked COMPLETED with "Patient left: No",
+//                 which still means the patient is physically in the bed. patient_left
+//                 can never be true on an Occupied bed once System Checkout is already
+//                 done — completeIfEligible vacates the bed in the same request the
+//                 moment both are true — so this check is safe.
+//   onbed       — Occupied+None, everything else (the default occupied case)
+//   occ_res     — Occupied+Reserved (patient temporarily away — OT, Scanning)
+//   vacant_none — Vacant, no reservation
+//   vacant_res  — Vacant + Reserved (held for an incoming patient)
+/** wardIds = null means hospital-wide (no unit filter applied).
+ *  Census/Non-Census classification is ward-level (w.bed_type) — the single
+ *  source of truth. bed_details.bed_type is never read for this; a bed always
+ *  inherits its ward's type and can't be individually overridden (see
+ *  bedDetailService.ts generateBeds/addSingleBed/updateBedMaster).
+ *  Bed-level operational_status is also required here — a bed pulled out of
+ *  service shouldn't register as onbed/occ_res/vacant/etc, same as it's
+ *  already excluded from "Operational Beds" on the snapshot. */
+async function bedStateBreakdown(wardIds: number[] | null) {
+  return db.prepare(`
+    SELECT w.bed_type, pa.admission_type,
+      CASE
+        WHEN w.is_discharge_lounge AND bd.physical_status='OCCUPIED' THEN 'lounge'
+        WHEN bd.physical_status='OCCUPIED' AND bd.reservation_status='NONE'
+             AND dt.system_checkout_status='COMPLETED' AND dt.patient_left IS DISTINCT FROM true
+          THEN 'overstay'
+        WHEN bd.physical_status='OCCUPIED' AND bd.reservation_status='NONE' THEN 'onbed'
+        WHEN bd.physical_status='OCCUPIED' AND bd.reservation_status='RESERVED' THEN 'occ_res'
+        WHEN bd.physical_status='VACANT' AND bd.reservation_status='NONE' THEN 'vacant_none'
+        WHEN bd.physical_status='VACANT' AND bd.reservation_status='RESERVED' THEN 'vacant_res'
+        ELSE 'other'
+      END AS state,
+      COUNT(*)::int AS c
+    FROM bed_details bd
+    JOIN wards w ON w.id = bd.ward_id
+    LEFT JOIN patient_admissions pa ON pa.bed_id = bd.id AND pa.status = 'ACTIVE'
+    LEFT JOIN discharge_tracking dt ON dt.admission_id = pa.id
+    -- Same convention as allWardsLive/allBedDetailsLive/orgOverview: a bed in a
+    -- shut-down ward isn't counted anywhere else in the app, so it shouldn't
+    -- inflate these cards either — otherwise clicking a card to see its beds
+    -- (Bed Explorer, which also excludes non-operational wards) shows fewer
+    -- beds than the card's own number. Bed-level operational_status matches
+    -- the same convention one level down.
+    WHERE w.operational = true AND bd.operational_status = true ${wardIds ? "AND w.id = ANY(?)" : ""}
+    GROUP BY w.bed_type, pa.admission_type, state
+  `).all<{ bed_type: string; admission_type: string | null; state: string; c: number }>(...(wardIds ? [wardIds] : []));
+}
+
+/** For every admission currently sitting in the Discharge Lounge, the bed_type of
+ *  the WARD they were moved out of (their most recent transfer-in) — lounge
+ *  beds have no Census/Non-Census identity of their own, so the CEO's Occupancy
+ *  Board splits lounge occupancy by where each patient actually came from.
+ *  wardIds scopes by the ORIGIN ward (where the patient came from), matching
+ *  the Unit filter's meaning everywhere else on this dashboard. */
+async function loungeOriginBreakdown(wardIds: number[] | null) {
+  return db.prepare(`
+    SELECT w_from.bed_type AS origin_bed_type, COUNT(*)::int AS c
+    FROM patient_admissions pa
+    JOIN bed_details bd_lounge ON bd_lounge.id = pa.bed_id
+    JOIN wards w_lounge ON w_lounge.id = bd_lounge.ward_id AND w_lounge.is_discharge_lounge AND w_lounge.operational = true
+    JOIN LATERAL (
+      SELECT bth.from_bed_id FROM bed_transfer_history bth
+      WHERE bth.admission_id = pa.id ORDER BY bth.transferred_at DESC LIMIT 1
+    ) lt ON true
+    JOIN bed_details bd_from ON bd_from.id = lt.from_bed_id
+    JOIN wards w_from ON w_from.id = bd_from.ward_id
+    WHERE pa.status = 'ACTIVE' ${wardIds ? "AND bd_from.ward_id = ANY(?)" : ""}
+    GROUP BY w_from.bed_type
+  `).all<{ origin_bed_type: string; c: number }>(...(wardIds ? [wardIds] : []));
+}
+
+/** unitType = null/undefined/"TOTAL" means hospital-wide — matches the COO
+ *  dashboard's "Unit" toolbar filter (TOTAL + each distinct wards.unit_type).
+ *  Every count below is scoped to the same set of wards so the whole board
+ *  (Hospital Snapshot, Occupancy Board, Transaction Board) moves together
+ *  when that filter changes, same as the ward tables and By Payer cards
+ *  already did. */
+export async function adminDashboard(unitType?: string | null) {
+  const scoped = !!unitType && unitType !== "TOTAL";
+  const wardIds = scoped
+    ? (await db.prepare("SELECT id FROM wards WHERE unit_type=? AND operational=true").all<{ id: number }>(unitType))
+        .map(r => r.id)
+    : null;
+
+  const rows = await bedStateBreakdown(wardIds);
+  const sum = (pred: (r: { bed_type: string; admission_type: string | null; state: string }) => boolean) =>
+    rows.filter(pred).reduce((s, r) => s + r.c, 0);
+  const occStates = ["onbed", "overstay", "occ_res"];
+
+  // Inventory counts — deliberately NOT filtered by bed-level operational_status
+  // (a broken bed is still physically a bed; that's what "Operational Beds"
+  // is for, distinguishing it from the raw total). Census/Non-Census here is
+  // ward-level (w.bed_type), same source of truth as everywhere else.
+  const snapshotRow = await db.prepare(`
+    SELECT
+      COUNT(*) FILTER (WHERE w.bed_type IN ('Census','Non-Census')) AS total_beds,
+      COUNT(*) FILTER (WHERE w.bed_type IN ('Census','Non-Census') AND bd.operational_status) AS operational_beds,
+      COUNT(*) FILTER (WHERE w.bed_type='Census') AS census_beds,
+      COUNT(*) FILTER (WHERE w.bed_type='Non-Census') AS non_census_beds
+    FROM bed_details bd
+    JOIN wards w ON w.id = bd.ward_id
+    WHERE w.operational = true ${wardIds ? "AND w.id = ANY(?)" : ""}
+  `).get<Record<string, number>>(...(wardIds ? [wardIds] : []));
+
+  const onbed = sum(r => r.state === "onbed");
+  const overstay = sum(r => r.state === "overstay");
+  const loungePatients = sum(r => r.state === "lounge");
+  const loungeOrigin = await loungeOriginBreakdown(wardIds);
+  const loungeBy = (bedType: string) => loungeOrigin.find(r => r.origin_bed_type === bedType)?.c ?? 0;
+  const allAdmittedStates = ["onbed", "overstay", "occ_res", "lounge"];
+
+  const todayStart = startOfDayIST();
+  const todayEnd = todayStart + 24 * 60 * 60 * 1000;
+  const admissionsToday = await db.prepare(`
+    SELECT COUNT(*)::int AS c FROM patient_admissions
+    WHERE admitted_at >= ? AND admitted_at < ? ${wardIds ? "AND ward_id = ANY(?)" : ""}
+  `).get<{ c: number }>(todayStart, todayEnd, ...(wardIds ? [wardIds] : []));
+  const plannedTotal = await db.prepare(`
+    SELECT COUNT(*)::int AS c FROM discharge_tracking dt
+    JOIN patient_admissions pa ON pa.id = dt.admission_id
+    WHERE dt.status='PLANNED' ${wardIds ? "AND pa.ward_id = ANY(?)" : ""}
+  `).get<{ c: number }>(...(wardIds ? [wardIds] : []));
+
+  const discharge = await dashboardCounts(wardIds);
+
+  return {
+    snapshot: {
+      totalBeds: Number(snapshotRow?.total_beds || 0),
+      operationalBeds: Number(snapshotRow?.operational_beds || 0),
+      censusBeds: Number(snapshotRow?.census_beds || 0),
+      nonCensusBeds: Number(snapshotRow?.non_census_beds || 0),
+    },
+    occupancy: {
+      totalPatients: onbed + overstay + loungePatients,
+
+      // Kept for anything still reading the old flat shape.
+      onbed, overstay, loungePatients,
+      censusOcc: sum(r => r.bed_type === "Census" && occStates.includes(r.state)),
+      nonCensusOcc: sum(r => r.bed_type === "Non-Census" && occStates.includes(r.state)),
+      vacantCensus: sum(r => r.bed_type === "Census" && (r.state === "vacant_none" || r.state === "vacant_res")),
+      vacantNonCensus: sum(r => r.bed_type === "Non-Census" && (r.state === "vacant_none" || r.state === "vacant_res")),
+      // admission_type only exists on admissions created from 2026-07-12 onward —
+      // pre-existing occupied beds have admission_type=NULL and won't count here yet.
+      censusDaycare: sum(r => r.bed_type === "Census" && r.admission_type === "DAYCARE" && occStates.includes(r.state)),
+      nonCensusDaycare: sum(r => r.bed_type === "Non-Census" && r.admission_type === "DAYCARE" && occStates.includes(r.state)),
+
+      // CEO's Occupancy Board layout — grouped exactly as drawn.
+      census: {
+        totalOcc: sum(r => r.bed_type === "Census" && occStates.includes(r.state)),
+        onBed: sum(r => r.bed_type === "Census" && r.state === "onbed"),
+        res: sum(r => r.bed_type === "Census" && r.state === "occ_res"),
+        overstay: sum(r => r.bed_type === "Census" && r.state === "overstay"),
+      },
+      nonCensus: {
+        totalOcc: sum(r => r.bed_type === "Non-Census" && occStates.includes(r.state)),
+        onBed: sum(r => r.bed_type === "Non-Census" && r.state === "onbed"),
+        res: sum(r => r.bed_type === "Non-Census" && r.state === "occ_res"),
+        overstay: sum(r => r.bed_type === "Non-Census" && r.state === "overstay"),
+      },
+      lounge: {
+        total: loungePatients,
+        census: loungeBy("Census"),
+        nonCensus: loungeBy("Non-Census"),
+      },
+      vacant: {
+        total: sum(r => r.state === "vacant_none" || r.state === "vacant_res") - sum(r => r.bed_type === "Lounge" && (r.state === "vacant_none" || r.state === "vacant_res")),
+        census: sum(r => r.bed_type === "Census" && r.state === "vacant_none"),
+        cRes: sum(r => r.bed_type === "Census" && r.state === "vacant_res"),
+        nonCensus: sum(r => r.bed_type === "Non-Census" && r.state === "vacant_none"),
+        ncRes: sum(r => r.bed_type === "Non-Census" && r.state === "vacant_res"),
+      },
+      patientType: {
+        ipd: sum(r => r.admission_type === "IP" && allAdmittedStates.includes(r.state)),
+        dayCare: sum(r => r.admission_type === "DAYCARE" && allAdmittedStates.includes(r.state)),
+        opd: sum(r => r.admission_type === "OPD" && allAdmittedStates.includes(r.state)),
+      },
+    },
+    transaction: {
+      newAdmissionsToday: Number(admissionsToday?.c || 0),
+      completedToday: discharge.completedToday,
+      // Live status='PLANNED' queue — a discharge drops out the moment it's
+      // initiated (or cancelled), so this never double-counts against `initiated`.
+      plannedTotal: Number(plannedTotal?.c || 0),
+      initiated: discharge.initiated,
+      pending: discharge.pending,
+      cancelled: discharge.cancelled,
+      drugReturnPending: discharge.drugReturnPending,
+      pharmacyPending: discharge.pharmacyPending,
+      procedurePending: discharge.procedurePending,
+      billingStarted: discharge.billingStarted,
+      auditPending: discharge.auditPending,
+      billReady: discharge.billReady,
+      paymentPending: discharge.paymentPending,
+      systemCheckoutPending: discharge.systemCheckoutPending,
+      physicalCheckoutPending: discharge.physicalCheckoutPending,
+    },
+  };
+}
+
+/** Hourly capture for every adminDashboard() field that occupancy_snapshots doesn't
+ *  already cover — called from the scheduler on the same hourly tick as
+ *  snapshotOccupancy(). Builds real sparkline history for the flat-line cards.
+ *  Writes one row for hospital-wide (unit_type=NULL) PLUS one row per operational
+ *  unit_type, so the Unit toolbar filter can show a real per-unit trend instead
+ *  of always falling back to the hospital-wide line. */
+export async function snapshotAdminDashboard() {
+  const unitRows = await db.prepare(
+    "SELECT DISTINCT unit_type FROM wards WHERE operational=true AND unit_type IS NOT NULL AND unit_type <> ''"
+  ).all<{ unit_type: string }>();
+  const targets: (string | null)[] = [null, ...unitRows.map(r => r.unit_type)];
+  const ts = Date.now();
+
+  for (const unit of targets) {
+    const { occupancy, transaction } = await adminDashboard(unit ?? undefined);
+    await db.prepare(
+      `INSERT INTO admin_dashboard_snapshots (
+         ts, unit_type, lounge_patients, census_daycare, non_census_daycare,
+         new_admissions_today, completed_today, planned_total, initiated, pending, cancelled,
+         drug_return_pending, pharmacy_pending, procedure_pending, billing_started,
+         audit_pending, bill_ready, payment_pending, system_checkout_pending, physical_checkout_pending
+       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+    ).run(
+      ts, unit, occupancy.loungePatients, occupancy.censusDaycare, occupancy.nonCensusDaycare,
+      transaction.newAdmissionsToday, transaction.completedToday, transaction.plannedTotal, transaction.initiated,
+      transaction.pending, transaction.cancelled,
+      transaction.drugReturnPending, transaction.pharmacyPending, transaction.procedurePending, transaction.billingStarted,
+      transaction.auditPending, transaction.billReady, transaction.paymentPending,
+      transaction.systemCheckoutPending, transaction.physicalCheckoutPending,
+    );
+  }
+}
+
+/** Last N hourly rows for one unit (or hospital-wide when unitType is null/"TOTAL"),
+ *  oldest first (matches the shape callers expect for sparklines). */
+export async function adminDashboardHistory(limit = 48, unitType?: string | null) {
+  const scoped = !!unitType && unitType !== "TOTAL";
+  const rows = await db.prepare(
+    `SELECT * FROM admin_dashboard_snapshots
+     WHERE unit_type IS NOT DISTINCT FROM ?
+     ORDER BY ts DESC LIMIT ?`
+  ).all<Record<string, number>>(scoped ? unitType : null, limit);
+  return rows.reverse();
 }

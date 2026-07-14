@@ -15,6 +15,7 @@ import cooRoutes from "./routes/coo.js";
 import metaRoutes from "./routes/meta.js";
 import nurseRoutes from "./routes/nurse.js";
 import doctorRoutes from "./routes/doctor.js";
+import dischargeRoutes from "./routes/discharge.js";
 
 // Serialize BigInt as Number in all JSON responses (timestamps are epoch-ms BigInt in Postgres)
 (BigInt.prototype as unknown as { toJSON: () => number }).toJSON = function () {
@@ -24,6 +25,11 @@ import doctorRoutes from "./routes/doctor.js";
 migrate(); // ensure schema exists (no-op with Prisma — run: npx prisma migrate deploy)
 
 const app = express();
+// Render sits one reverse-proxy hop in front of the app and passes the real client IP
+// via X-Forwarded-For. Trusting exactly 1 hop makes req.ip the visitor's IP — without
+// this, express-rate-limit sees every user as the proxy's IP (one shared bucket) and
+// logs ERR_ERL_UNEXPECTED_X_FORWARDED_FOR on every rate-limited request.
+app.set("trust proxy", 1);
 app.use(helmet({
   // SPA needs inline styles (vite-injected) and connection to its own origin.
   // Tighten further if you fingerprint inline assets.
@@ -62,6 +68,7 @@ app.use("/api/auth", authRoutes);
 app.use("/api/pre", preRoutes);
 app.use("/api/nurse", nurseRoutes);
 app.use("/api/doctor", doctorRoutes);
+app.use("/api/discharge", dischargeRoutes);
 app.use("/api/manager", managerRoutes);
 app.use("/api/coo", cooRoutes);
 app.use("/api/push", pushLimiter);

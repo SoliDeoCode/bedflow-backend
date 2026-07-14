@@ -323,9 +323,15 @@ export async function editWard(opts: {
     if (opts.roomType !== undefined)
       await db.prepare("UPDATE wards SET room_type=?, updated_at=? WHERE id=?")
         .run(opts.roomType?.trim() || null, t, opts.wardId);
-    if (opts.bedType != null)
+    if (opts.bedType != null) {
       await db.prepare("UPDATE wards SET bed_type=?, updated_at=? WHERE id=?")
         .run(opts.bedType, t, opts.wardId);
+      // Census/Non-Census is ward-level only — no per-bed override exists anymore,
+      // so every existing bed in this ward must follow the ward's new type too.
+      // Without this, a ward edit would silently leave its beds mismatched.
+      await db.prepare("UPDATE bed_details SET bed_type=?, updated_at=? WHERE ward_id=?")
+        .run(opts.bedType, t, opts.wardId);
+    }
     if (opts.operational != null) {
       await db.prepare("UPDATE wards SET operational=?, updated_at=? WHERE id=?")
         .run(opts.operational, t, opts.wardId);

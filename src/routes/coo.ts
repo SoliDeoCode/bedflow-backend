@@ -2,7 +2,7 @@ import { Router } from "express";
 import { authRequired, requireRole } from "../middleware/auth.js";
 import { asyncH } from "../middleware/error.js";
 import { z } from "zod";
-import { orgOverview, allWardsLive, allBedDetailsLive } from "../services/bedService.js";
+import { orgOverview, allWardsLive, allBedDetailsLive, adminDashboard, adminDashboardHistory } from "../services/bedService.js";
 import { COO_REMINDERS, hmToMin, minsNow, todayStr, startOfDayIST, PRE_INTERVAL_MIN, SHIFTS,
          currentRound, inShift, roundKey, type ShiftKey } from "../config/domain.js";
 import { recentAudit, queryActivity } from "../services/auditService.js";
@@ -77,6 +77,21 @@ router.get("/live-wards", asyncH(async (_req, res) => {
 
 router.get("/bed-details", asyncH(async (_req, res) => {
   res.json(await allBedDetailsLive());
+}));
+
+// New — Hospital Snapshot / Occupancy Board / Transaction Board cards. Additive
+// only; the existing /overview endpoint and every card built on it is untouched.
+// ?unit=<unit_type> scopes every count to that unit's wards, same as the Unit
+// toolbar filter already does for the ward tables and By Payer cards — omit
+// (or "TOTAL") for hospital-wide.
+router.get("/admin-dashboard", asyncH(async (req, res) => {
+  const unit = typeof req.query.unit === "string" ? req.query.unit : null;
+  res.json(await adminDashboard(unit));
+}));
+
+router.get("/admin-dashboard-history", asyncH(async (req, res) => {
+  const unit = typeof req.query.unit === "string" ? req.query.unit : null;
+  res.json({ snapshots: await adminDashboardHistory(48, unit) });
 }));
 
 router.get("/audit", asyncH(async (_req, res) => {

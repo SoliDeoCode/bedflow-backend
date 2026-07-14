@@ -29,7 +29,7 @@ function stationsWithOverrides(assignments: NaaAssignment[]): Set<number> {
   return new Set(assignments.map(a => a.station_id).filter((id): id is number => id != null));
 }
 
-async function canNurseAccessBed(nurseId: number, bedId: number, stationIds: number[]): Promise<boolean> {
+export async function canNurseAccessBed(nurseId: number, bedId: number, stationIds: number[]): Promise<boolean> {
   const bd = await db.prepare(
     "SELECT bd.ward_id, bd.bed_name, w.station_id FROM bed_details bd JOIN wards w ON w.id=bd.ward_id WHERE bd.id=?"
   ).get<{ ward_id: number; bed_name: string; station_id: number | null }>(bedId);
@@ -50,7 +50,7 @@ const router = Router();
 router.use(authRequired, requireRole("NURSE"));
 
 /** Resolve all stations this nurse is assigned to, directly from DB — always fresh, no JWT dependency. */
-async function getMyStations(req: { user?: { id: number } }): Promise<{ id: number; name: string }[]> {
+export async function getMyStations(req: { user?: { id: number } }): Promise<{ id: number; name: string }[]> {
   const userId = req.user?.id;
   if (!userId) throw new HttpError(401, "Please sign in to continue.");
   const rows = await db.prepare(
@@ -165,12 +165,18 @@ router.patch("/beds/:id/status", asyncH(async (req, res) => {
   const stations = await getMyStations(req);
   const stationIds = stations.map(s => s.id);
   const bedId = Number(req.params.id);
-  const { physical_status, reservation_status, payer_type, destination, reservation_note } = z.object({
+  const { physical_status, reservation_status, payer_type, destination, reservation_note, ip_last6, admission_type, consultant_name, department_name, doctor_id, department_id } = z.object({
     physical_status:    z.enum(["VACANT", "OCCUPIED"]),
     reservation_status: z.enum(["NONE", "RESERVED"]),
     payer_type:         z.string().max(100).nullable().optional(),
     destination:        z.string().max(100).nullable().optional(),
     reservation_note:   z.string().max(255).nullable().optional(),
+    ip_last6:           z.string().max(6).optional(),
+    admission_type:     z.enum(["IP", "DAYCARE", "OPD"]).optional(),
+    consultant_name:    z.string().max(120).nullable().optional(),
+    department_name:    z.string().max(120).nullable().optional(),
+    doctor_id:          z.number().int().positive().nullable().optional(),
+    department_id:      z.number().int().positive().nullable().optional(),
   }).parse(req.body);
 
   const allowed = await canNurseAccessBed(req.user!.id, bedId, stationIds);
@@ -179,6 +185,8 @@ router.patch("/beds/:id/status", asyncH(async (req, res) => {
   const result = await updateBedStatus({
     bedId, physicalStatus: physical_status, reservationStatus: reservation_status,
     payerType: payer_type, destination, reservationNote: reservation_note, userId: req.user!.id,
+    ipLast6: ip_last6, admissionType: admission_type, consultantName: consultant_name, departmentName: department_name,
+    doctorId: doctor_id, departmentId: department_id,
   });
 
   const preBlockRow = await db.prepare(
