@@ -3,44 +3,30 @@ import { HttpError } from "../middleware/error.js";
 import { audit } from "./auditService.js";
 import { wardsForFloor, wardsForPreBlock, type WardView } from "./bedService.js";
 import { calculateWardTotals } from "./wardTotals.js";
-import {
-  inShift, currentRound, roundKey, todayStr, minsNow, formatShiftWindow, type ShiftKey,
-} from "../config/domain.js";
+import { currentRound, roundKey, todayStr, minsNow } from "../config/domain.js";
 
-export async function userShift(userId: number): Promise<ShiftKey> {
-  const u = await db.prepare("SELECT shift FROM users WHERE id=?").get<{ shift: ShiftKey }>(userId);
-  return (u?.shift as ShiftKey) || "morning";
-}
-
-export async function setShift(userId: number, shift: ShiftKey) {
-  await db.prepare("UPDATE users SET shift=?,updated_at=? WHERE id=?").run(shift, Date.now(), userId);
-}
-
-/** Alarm state for all PRE Blocks the user is assigned to. Alarm is active if any block has a pending round. */
-export async function alarmState(preBlockIds: number[], shift: ShiftKey) {
-  const mins   = minsNow();
-  const onDuty = inShift(shift, mins);
-  const round  = currentRound(shift, mins);
+/** Alarm state for all PRE Blocks the user is assigned to. Every PRE user is on
+ *  duty 24/7 — alarm is active whenever any assigned block has a pending round. */
+export async function alarmState(preBlockIds: number[]) {
+  const mins  = minsNow();
+  const round = currentRound(mins);
 
   if (preBlockIds.length === 0)
-    return { shift, onDuty, round, submitted: false, hasWards: false,
-             alarmActive: false, shiftWindow: formatShiftWindow(shift) };
+    return { round, submitted: false, hasWards: false, alarmActive: false };
 
   const wardCountRow = await db.prepare(
     "SELECT COUNT(DISTINCT ward_id) AS n FROM pre_block_wards WHERE pre_block_id = ANY(?)"
   ).get<{ n: number }>(preBlockIds);
   const hasWards = (wardCountRow?.n ?? 0) > 0;
 
-  const keys = preBlockIds.map(id => roundKey(`pb${id}`, shift, todayStr(), round.startMin));
+  const keys = preBlockIds.map(id => roundKey(`pb${id}`, todayStr(), round.startMin));
   const submittedRows = await db.prepare(
     "SELECT round_key FROM pre_rounds WHERE round_key = ANY(?)"
   ).all<{ round_key: string }>(keys);
   const submittedSet = new Set(submittedRows.map(r => r.round_key));
   const submitted = keys.every(k => submittedSet.has(k));
 
-  return { shift, onDuty, round, submitted, hasWards,
-           alarmActive: onDuty && hasWards && !submitted,
-           shiftWindow: formatShiftWindow(shift) };
+  return { round, submitted, hasWards, alarmActive: hasWards && !submitted };
 }
 
 /** Submit rounds for every PRE Block the user is assigned to. One pre_rounds row is inserted per block. */
@@ -78,18 +64,17 @@ export async function submitRounds(preBlockIds: number[], userId: number) {
     }
   }
 
-  const shift = await userShift(userId);
-  const round = currentRound(shift, minsNow());
+  const round = currentRound(minsNow());
   const roundKeys: string[] = [];
 
   for (const [preBlockId, wards] of blockWards) {
-    const key = roundKey(`pb${preBlockId}`, shift, todayStr(), round.startMin);
+    const key = roundKey(`pb${preBlockId}`, todayStr(), round.startMin);
     try {
       await db.prepare(
         `INSERT INTO pre_rounds
-           (pre_code, pre_block_id, user_id, shift, round_key, start_min, submitted_at, snapshot)
-         VALUES (?,?,?,?,?,?,?,?)`
-      ).run(`pb${preBlockId}`, preBlockId, userId, shift, key, round.startMin, Date.now(), JSON.stringify(wards));
+           (pre_code, pre_block_id, user_id, round_key, start_min, submitted_at, snapshot)
+         VALUES (?,?,?,?,?,?,?)`
+      ).run(`pb${preBlockId}`, preBlockId, userId, key, round.startMin, Date.now(), JSON.stringify(wards));
     } catch { /* duplicate round key — idempotent */ }
     await audit(userId, "round_submit", `pb${preBlockId}`, { roundKey: key });
     roundKeys.push(key);

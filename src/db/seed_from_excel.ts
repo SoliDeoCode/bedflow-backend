@@ -125,11 +125,6 @@ async function run() {
     console.log(`  Block ${w.block} ${w.floor.padEnd(3)} | ${w.name.padEnd(35)} ${w.beds.length} beds`);
   }
 
-  // ── 5. Shifts ────────────────────────────────────────────────────────────────
-  await db.prepare("INSERT INTO shifts (key, label, start_time, end_time) VALUES (?,?,?,?) ON CONFLICT DO NOTHING").run("morning", "Morning", "07:00", "14:00");
-  await db.prepare("INSERT INTO shifts (key, label, start_time, end_time) VALUES (?,?,?,?) ON CONFLICT DO NOTHING").run("evening", "Evening", "14:00", "21:00");
-  await db.prepare("INSERT INTO shifts (key, label, start_time, end_time) VALUES (?,?,?,?) ON CONFLICT DO NOTHING").run("night",   "Night",   "21:00", "07:00");
-
   console.log(`\nDone. ${wardCount} wards, ${bedTotal} beds inserted.`);
 }
 

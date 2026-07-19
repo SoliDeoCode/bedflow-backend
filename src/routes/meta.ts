@@ -4,13 +4,13 @@ import { authRequired } from "../middleware/auth.js";
 import { asyncH } from "../middleware/error.js";
 import { saveSubscription } from "../services/pushService.js";
 import { pushEnabled, env } from "../config/env.js";
-import { SHIFTS, COO_REMINDERS } from "../config/domain.js";
+import { COO_REMINDERS } from "../config/domain.js";
 import { listDepartments, listDoctors } from "../services/doctorDeptService.js";
 
 const router = Router();
 
 router.get("/meta", (_req, res) => {
-  res.json({ shifts: SHIFTS, cooReminders: COO_REMINDERS,
+  res.json({ cooReminders: COO_REMINDERS,
     pushEnabled, vapidPublic: env.VAPID_PUBLIC || null });
 });
 

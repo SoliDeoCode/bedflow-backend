@@ -12,6 +12,8 @@ export interface PatientAdmission {
   /** Manual free-text entry captured at admission — same "V1 manual, HIS later" pattern as ip_last6. */
   consultant_name: string | null;
   department_name: string | null;
+  doctor_id: number | null;
+  department_id: number | null;
   /** "IP" | "DAYCARE" — null only for admissions predating this field. */
   admission_type: string | null;
   status: "ACTIVE" | "DISCHARGED";
@@ -75,6 +77,57 @@ export async function createAdmission(opts: {
 
   await audit(opts.userId, "admission_create", String(opts.bedId), { ipLast6, admissionType, wardId: opts.wardId, consultantName, departmentName, doctorId, departmentId });
   return admission!;
+}
+
+/** Corrects details captured at admission time (typo in IP number, wrong consultant
+ *  picked, etc.) on the bed's currently active admission. Unlike createAdmission this
+ *  never changes bed_details.physical_status — the bed stays Occupied throughout, only
+ *  the patient_admissions row is touched. Every field is optional/independent so a
+ *  caller can send only what changed; omitted fields keep their current value. */
+export async function updateActiveAdmission(opts: {
+  bedId: number; userId: number;
+  ipLast6?: string; admissionType?: string;
+  consultantName?: string | null; departmentName?: string | null;
+  doctorId?: number | null; departmentId?: number | null;
+  payerType?: string | null;
+}): Promise<PatientAdmission> {
+  const admission = await getActiveAdmissionByBed(opts.bedId);
+  if (!admission) throw new HttpError(404, "No active admission on this bed.");
+
+  const ipLast6 = opts.ipLast6 !== undefined ? validateIpLast6(opts.ipLast6) : admission.ip_last6;
+  const admissionType = opts.admissionType !== undefined ? validateAdmissionType(opts.admissionType) : admission.admission_type;
+  const doctorId = opts.doctorId !== undefined ? opts.doctorId : admission.doctor_id;
+  const departmentId = opts.departmentId !== undefined ? opts.departmentId : admission.department_id;
+  const consultantName = opts.consultantName !== undefined ? (opts.consultantName?.toString().trim() || null) : admission.consultant_name;
+  const departmentName = opts.departmentName !== undefined ? (opts.departmentName?.toString().trim() || null) : admission.department_name;
+  if (!departmentId) throw new HttpError(400, "Department is required.");
+  if (!doctorId) throw new HttpError(400, "Consultant is required.");
+
+  const now = Date.now();
+  await db.prepare(
+    `UPDATE patient_admissions
+     SET ip_last6=?, admission_type=?, consultant_name=?, department_name=?, doctor_id=?, department_id=?, updated_at=?
+     WHERE id=? AND status='ACTIVE'`
+  ).run(ipLast6, admissionType, consultantName, departmentName, doctorId, departmentId, now, admission.id);
+
+  if (opts.payerType !== undefined) {
+    await db.prepare(
+      "UPDATE bed_details SET payer_type=?, updated_at=? WHERE id=?"
+    ).run(opts.payerType, now, opts.bedId);
+  }
+
+  await audit(opts.userId, "admission_update", String(opts.bedId), {
+    old: {
+      ipLast6: admission.ip_last6, admissionType: admission.admission_type,
+      consultantName: admission.consultant_name, departmentName: admission.department_name,
+      doctorId: admission.doctor_id, departmentId: admission.department_id,
+      payerType: opts.payerType !== undefined ? undefined : "(unchanged)",
+    },
+    new: { ipLast6, admissionType, consultantName, departmentName, doctorId, departmentId,
+           ...(opts.payerType !== undefined ? { payerType: opts.payerType } : {}) },
+  });
+
+  return (await getAdmissionById(admission.id))!;
 }
 
 /** Closes an admission — either a normal discharge completion or a manual/unexpected vacate. */

@@ -2,12 +2,14 @@ import { Router } from "express";
 import { z } from "zod";
 import { authRequired, requireRole } from "../middleware/auth.js";
 import { asyncH, HttpError } from "../middleware/error.js";
-import { wardsGroupedByBlock, summarize, updateWard, type WardView } from "../services/bedService.js";
-import { alarmState, setShift, userShift, submitRounds } from "../services/roundService.js";
+import { wardsGroupedByBlock, summarize, updateWard, allWardsLive, allBedDetailsLive, adminDashboard, adminDashboardHistory, consultantsLive, type WardView } from "../services/bedService.js";
+import { alarmState, submitRounds } from "../services/roundService.js";
 import { listBeds, updateBedStatus } from "../services/bedDetailService.js";
+import { updateActiveAdmission } from "../services/patientAdmissionService.js";
 import { listPayerTypes } from "../services/payerTypeService.js";
 import { listDestinations } from "../services/destinationService.js";
 import { emitUpdate } from "../websocket/io.js";
+import { audit } from "../services/auditService.js";
 import { db } from "../db/index.js";
 
 const router = Router();
@@ -29,10 +31,50 @@ async function myPreBlocks(req: { user?: { id: number } }) {
   return rows;
 }
 
+// ── Admin dashboard — hospital-wide, identical to the COO/Admin dashboard ───
+//
+// These five endpoints are deliberately NOT restricted to the caller's own PRE
+// Blocks: PRE's Home dashboard is meant to be the same hospital-wide read-only
+// view the Admin sees, so they mirror the /coo equivalents exactly (coo.ts).
+//
+// This is a read-only widening. Every *write* path and the ward/bed entry
+// screens below still resolve wards through myPreBlocks(), so a PRE user can
+// see the whole hospital here but can still only act on their own blocks.
+
+router.get("/live-wards", asyncH(async (_req, res) => {
+  res.json(await allWardsLive());
+}));
+
+router.get("/bed-details", asyncH(async (_req, res) => {
+  res.json(await allBedDetailsLive());
+}));
+
+router.get("/admin-dashboard", asyncH(async (req, res) => {
+  const unit = typeof req.query.unit === "string" ? req.query.unit : null;
+  res.json(await adminDashboard(unit));
+}));
+
+router.get("/admin-dashboard-history", asyncH(async (req, res) => {
+  const unit = typeof req.query.unit === "string" ? req.query.unit : null;
+  res.json({ snapshots: await adminDashboardHistory(48, unit) });
+}));
+
+router.get("/consultants", asyncH(async (_req, res) => {
+  res.json(await consultantsLive());
+}));
+
+router.get("/snapshots", asyncH(async (_req, res) => {
+  const rows = await db.prepare(
+    "SELECT ts,total,vacant,reserved,occupied,payer_snapshot FROM occupancy_snapshots ORDER BY ts DESC LIMIT 48"
+  ).all<{ ts: number; total: number; vacant: number; reserved: number; occupied: number; payer_snapshot: Record<string, number> | null }>();
+  // pg auto-parses the jsonb column; older rows predate this column and are NULL.
+  const snapshots = rows.reverse().map((r) => ({ ...r, payers: r.payer_snapshot || {} }));
+  res.json({ snapshots });
+}));
+
 router.get("/me", asyncH(async (req, res) => {
   const blocks  = await myPreBlocks(req);
   const grouped = await wardsGroupedByBlock(req.user!.id);
-  const shift   = await userShift(req.user!.id);
   const label   = blocks.map(b => b.name).join(", ");
   // Flat deduplicated ward list for summary + backwards compat
   const wardMap = new Map<number, WardView>();
@@ -49,14 +91,8 @@ router.get("/me", asyncH(async (req, res) => {
     blocks: grouped,   // grouped by block — used for section headers in Entry tab
     wards,             // flat deduped list — used for summary, alarmState, MyMap
     summary: summarize(wards),
-    alarm:   await alarmState(blocks.map(b => b.id), shift),
+    alarm:   await alarmState(blocks.map(b => b.id)),
   });
-}));
-
-router.post("/shift", asyncH(async (req, res) => {
-  const { shift } = z.object({ shift: z.enum(["morning", "night"]) }).parse(req.body);
-  await setShift(req.user!.id, shift);
-  res.json({ ok: true, shift });
 }));
 
 router.post("/ward", asyncH(async (req, res) => {
@@ -109,6 +145,52 @@ router.get("/wards/:id/beds", asyncH(async (req, res) => {
   const physicalStatus    = req.query.physical_status    as string | undefined;
   const reservationStatus = req.query.reservation_status as string | undefined;
   res.json({ beds: await listBeds(wardId, physicalStatus, reservationStatus, false) });
+}));
+
+// ── Review-confirm (manual "reviewed, nothing to update" stamp on one ward) ──
+// Mirrors Doctor's ward-level review exactly — independent of round submission,
+// never counts toward the alarm's "all wards submitted" gate.
+router.post("/wards/:id/review", asyncH(async (req, res) => {
+  const blocks = await myPreBlocks(req);
+  const blockIds = blocks.map(b => b.id);
+  const wardId = Number(req.params.id);
+  const ownRow = await db.prepare(
+    "SELECT pre_block_id FROM pre_block_wards WHERE ward_id=? AND pre_block_id = ANY(?)"
+  ).get<{ pre_block_id: number }>(wardId, blockIds);
+  if (!ownRow) throw new HttpError(403, "Ward not in your PRE Block");
+
+  // Cooldown — a ward can only be re-reviewed 5 minutes after its last review,
+  // enforced server-side (not just a disabled button) so the "reviewed" trail
+  // can't be spammed via repeated taps or direct API calls.
+  const REVIEW_COOLDOWN_MS = 5 * 60 * 1000;
+  const lastReview = await db.prepare(
+    "SELECT reviewed_at FROM pre_ward_reviews WHERE ward_id=? ORDER BY reviewed_at DESC LIMIT 1"
+  ).get<{ reviewed_at: number }>(wardId);
+  if (lastReview) {
+    const waitMs = REVIEW_COOLDOWN_MS - (Date.now() - Number(lastReview.reviewed_at));
+    if (waitMs > 0)
+      throw new HttpError(429, `You can review this ward again in ${Math.ceil(waitMs / 60000)}m`);
+  }
+
+  const t = Date.now();
+  await db.prepare(
+    "INSERT INTO pre_ward_reviews (pre_block_id, ward_id, user_id, reviewed_at) VALUES (?,?,?,?)"
+  ).run(ownRow.pre_block_id, wardId, req.user!.id, t);
+  await audit(req.user!.id, "pre_ward_review", String(wardId), { preBlockId: ownRow.pre_block_id });
+
+  const stationRow = await db.prepare(
+    "SELECT station_id FROM wards WHERE id=?"
+  ).get<{ station_id: number | null }>(wardId);
+
+  // pre: reaches the reviewing PRE's own Entry/Dashboard tabs (PRE sockets only
+  // join pre:<blockId> rooms, never ward:<id> — omitting this was the bug: the
+  // review saved fine, but the requester's own live view never got the event).
+  emitUpdate("bed:update", { preBlockId: ownRow.pre_block_id, wardId, reviewedAt: t }, {
+    pre: String(ownRow.pre_block_id),
+    stationId: stationRow?.station_id ?? undefined,
+    wardId,
+  });
+  res.json({ ok: true, reviewedAt: t });
 }));
 
 router.get("/payer-types", asyncH(async (_req, res) => {
@@ -167,6 +249,55 @@ router.patch("/beds/:id/status", asyncH(async (req, res) => {
     stationId: stationRow?.station_id ?? undefined,
   });
   res.json(result);
+}));
+
+/** Corrects IP/admission-type/consultant/department on a bed's already-active
+ *  admission — for fixing a data-entry mistake made at admission time, not for
+ *  changing physical/reservation status (use PATCH /beds/:id/status for that). */
+router.patch("/beds/:id/admission", asyncH(async (req, res) => {
+  const blocks = await myPreBlocks(req);
+  const blockIds = blocks.map(b => b.id);
+  const bedId = Number(req.params.id);
+  const { ip_last6, admission_type, consultant_name, department_name, doctor_id, department_id, payer_type } = z.object({
+    ip_last6:        z.string().length(6).optional(),
+    admission_type:  z.enum(["IP", "DAYCARE", "OPD"]).optional(),
+    consultant_name: z.string().max(120).nullable().optional(),
+    department_name: z.string().max(120).nullable().optional(),
+    doctor_id:       z.number().int().positive().optional(),
+    department_id:   z.number().int().positive().optional(),
+    payer_type:      z.string().max(100).nullable().optional(),
+  }).parse(req.body);
+
+  const owns = await db.prepare(
+    `SELECT bd.id, bd.ward_id, bd.physical_status, pbw.pre_block_id FROM bed_details bd
+     JOIN pre_block_wards pbw ON pbw.ward_id = bd.ward_id
+     WHERE bd.id = ? AND pbw.pre_block_id = ANY(?)`
+  ).get<{ id: number; ward_id: number; physical_status: string; pre_block_id: number }>(bedId, blockIds);
+  if (!owns) throw new HttpError(403, "Bed not in your PRE Block");
+  if (owns.physical_status !== "OCCUPIED") throw new HttpError(409, "Bed is not currently occupied.");
+
+  // updateActiveAdmission returns the fully-resolved admission row, but no caller
+  // reads it — the PRE client discards the PATCH response and refetches via
+  // onChanged(), and every client (including the sender) gets a bed:update socket
+  // event that triggers the same refetch. Sending it back would just be an unused,
+  // easily-misread-as-a-diff payload, so it's intentionally not part of the response.
+  await updateActiveAdmission({
+    bedId, userId: req.user!.id,
+    ipLast6: ip_last6, admissionType: admission_type,
+    consultantName: consultant_name, departmentName: department_name,
+    doctorId: doctor_id, departmentId: department_id,
+    payerType: payer_type,
+  });
+
+  const stationRow = await db.prepare(
+    "SELECT station_id FROM wards WHERE id=?"
+  ).get<{ station_id: number | null }>(owns.ward_id);
+  const blockName = blocks.find(b => b.id === owns.pre_block_id)?.name ?? "";
+  emitUpdate("bed:update", { bedId, wardId: owns.ward_id, floor: blockName }, {
+    pre: String(owns.pre_block_id),
+    stationId: stationRow?.station_id ?? undefined,
+  });
+  res.json({ ok: true });
 }));
 
 export default router;

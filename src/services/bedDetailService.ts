@@ -19,11 +19,16 @@ export async function _recalcWardTotals(wardId: number, actorId: number) {
   const counts = await db.prepare(`
     SELECT
       COUNT(*) AS total,
-      SUM(CASE WHEN operational_status AND physical_status='VACANT'   AND reservation_status='NONE'     THEN 1 ELSE 0 END) AS vacant,
-      SUM(CASE WHEN operational_status AND physical_status='VACANT'   AND reservation_status='RESERVED' THEN 1 ELSE 0 END) AS reserved,
-      SUM(CASE WHEN operational_status AND physical_status='OCCUPIED' AND reservation_status='NONE'     THEN 1 ELSE 0 END) AS occupied,
-      SUM(CASE WHEN operational_status AND physical_status='OCCUPIED' AND reservation_status='RESERVED' THEN 1 ELSE 0 END) AS occupied_reserved
-    FROM bed_details WHERE ward_id = ?
+      SUM(CASE WHEN bd.operational_status AND bd.physical_status='VACANT'   AND bd.reservation_status='NONE'     THEN 1 ELSE 0 END) AS vacant,
+      SUM(CASE WHEN bd.operational_status AND bd.physical_status='VACANT'   AND bd.reservation_status='RESERVED' THEN 1 ELSE 0 END) AS reserved,
+      SUM(CASE WHEN bd.operational_status AND bd.physical_status='OCCUPIED' AND bd.reservation_status='NONE'
+               AND (dt.id IS NULL OR dt.system_checkout_status != 'COMPLETED' OR dt.patient_left = TRUE)
+          THEN 1 ELSE 0 END) AS occupied,
+      SUM(CASE WHEN bd.operational_status AND bd.physical_status='OCCUPIED' AND bd.reservation_status='RESERVED' THEN 1 ELSE 0 END) AS occupied_reserved
+    FROM bed_details bd
+    LEFT JOIN patient_admissions pa ON pa.bed_id = bd.id AND pa.status = 'ACTIVE'
+    LEFT JOIN discharge_tracking dt ON dt.admission_id = pa.id
+    WHERE bd.ward_id = ?
   `).get<{ total: number; vacant: number; reserved: number; occupied: number; occupied_reserved: number }>(wardId);
   if (!counts) return;
   const total  = Math.max(0, counts.total || 0);
@@ -340,6 +345,26 @@ export async function updateBedStatus(opts: {
   if (isFreshAdmission) {
     validateIpLast6(opts.ipLast6);
     validateAdmissionType(opts.admissionType);
+  }
+
+  // Once a discharge has been planned or started for the bed's active admission,
+  // PRE/Nurse/Doctor can no longer manually flip it back to Vacant — the only way
+  // out is completing the discharge itself (System Checkout + Physical Checkout).
+  // Before any plan exists (or after it's Cancelled), manual vacate still works
+  // exactly as before — this only closes the gap where a discharge is in flight.
+  // This is app-level for a clean 409; a DB trigger on bed_details enforces the
+  // same rule as the actual authority, in case any other code path bypasses this.
+  const isManualVacate = changeReason === "MANUAL" && bed.physical_status === "OCCUPIED" && opts.physicalStatus === "VACANT";
+  if (isManualVacate) {
+    const gate = await db.prepare(`
+      SELECT dt.status, dt.system_checkout_status, dt.physical_checkout_status
+      FROM patient_admissions pa
+      JOIN discharge_tracking dt ON dt.admission_id = pa.id
+      WHERE pa.bed_id = ? AND pa.status = 'ACTIVE'
+    `).get<{ status: string; system_checkout_status: string; physical_checkout_status: string }>(opts.bedId);
+    const dischargeComplete = gate?.system_checkout_status === "COMPLETED" && gate?.physical_checkout_status === "COMPLETED";
+    if (gate && gate.status !== "CANCELLED" && !dischargeComplete)
+      throw new HttpError(409, "This bed has a discharge planned or in progress — it can only become vacant once System Checkout and Physical Checkout are both completed.");
   }
 
   // Determine new payer_type:

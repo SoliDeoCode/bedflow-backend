@@ -5,7 +5,9 @@ import { asyncH, HttpError } from "../middleware/error.js";
 import { listBeds, updateBedStatus } from "../services/bedDetailService.js";
 import { listPayerTypes } from "../services/payerTypeService.js";
 import { listDestinations } from "../services/destinationService.js";
+import { allWardsLive, allBedDetailsLive, adminDashboard } from "../services/bedService.js";
 import { emitUpdate } from "../websocket/io.js";
+import { audit } from "../services/auditService.js";
 import { db } from "../db/index.js";
 
 interface NaaAssignment { id: number; ward_id: number; access_type: string; bed_names: string; station_id: number | null; }
@@ -117,9 +119,49 @@ router.get("/me", asyncH(async (req, res) => {
     return w;
   });
 
+  // Per-ward "reviewed" stamp (see POST /wards/:id/review below) — merged in
+  // here so WardPage shows the right status the moment it opens, same as
+  // wardsForPreBlock() does for PRE.
+  const allWardIdsForReview = [...openWards, ...filteredAssigned].map(w => (w as { id: number }).id);
+  const reviewRows = allWardIdsForReview.length ? await db.prepare(
+    "SELECT ward_id, MAX(reviewed_at) AS reviewed_at FROM nurse_ward_reviews WHERE ward_id = ANY(?) GROUP BY ward_id"
+  ).all<{ ward_id: number; reviewed_at: number }>(allWardIdsForReview) : [];
+  const reviewedAtByWard = new Map(reviewRows.map(r => [Number(r.ward_id), Number(r.reviewed_at)]));
+  for (const w of [...openWards, ...filteredAssigned])
+    (w as { reviewedAt?: number | null }).reviewedAt = reviewedAtByWard.get((w as { id: number }).id) ?? null;
+
+  // Home's summary cards used to be computed client-side by reducing the whole
+  // `wards` array in the browser (calculateWardTotals in bedUtils.js) — that
+  // had no operational/Discharge-Lounge exclusion, so it silently double-
+  // counted non-operational wards and lounge holding-beds as real capacity
+  // (unlike the Dashboard, whose adminDashboard() SQL excludes both). Computed
+  // here instead, once, in the DB, with the exact same exclusion so Home and
+  // Dashboard numbers can't drift apart again.
+  const allWardIds = [...openWards, ...filteredAssigned].map(w => (w as { id: number }).id);
+  const totalsRows = allWardIds.length ? await db.prepare(`
+    SELECT w.station_id,
+      COUNT(*) FILTER (WHERE w.operational = true AND NOT w.is_discharge_lounge)::int AS wards,
+      COALESCE(SUM(CASE WHEN w.operational = true AND NOT w.is_discharge_lounge THEN w.total_beds ELSE 0 END), 0)::int AS total_beds,
+      COALESCE(SUM(CASE WHEN w.operational = true AND NOT w.is_discharge_lounge THEN COALESCE(b.vacant,0) + COALESCE(b.reserved,0) ELSE 0 END), 0)::int AS total_vacant,
+      COALESCE(SUM(CASE WHEN w.operational = true AND NOT w.is_discharge_lounge THEN COALESCE(b.occupied,0) + COALESCE(b.occupied_reserved,0) ELSE 0 END), 0)::int AS total_occupied
+    FROM wards w
+    LEFT JOIN beds b ON b.ward_id = w.id
+    WHERE w.id = ANY(?)
+    GROUP BY w.station_id
+  `).all<{ station_id: number; wards: number; total_beds: number; total_vacant: number; total_occupied: number }>(allWardIds) : [];
+
+  const byStation: Record<number, { wards: number; totalBeds: number; totalVacant: number; totalOccupied: number }> = {};
+  const grand = { wards: 0, totalBeds: 0, totalVacant: 0, totalOccupied: 0 };
+  for (const r of totalsRows) {
+    byStation[r.station_id] = { wards: r.wards, totalBeds: r.total_beds, totalVacant: r.total_vacant, totalOccupied: r.total_occupied };
+    grand.wards += r.wards; grand.totalBeds += r.total_beds;
+    grand.totalVacant += r.total_vacant; grand.totalOccupied += r.total_occupied;
+  }
+
   res.json({
     nursing_station: stations.map(s => s.name).join(", "), station_id: stationIds[0],
     stations, wards: [...openWards, ...filteredAssigned],
+    totals: { ...grand, byStation },
   });
 }));
 
@@ -151,6 +193,84 @@ router.get("/wards/:id/beds", asyncH(async (req, res) => {
   }
 
   res.json({ beds: await listBeds(wardId, physicalStatus, reservationStatus, false) });
+}));
+
+// ── Review-confirm (manual "reviewed, nothing to update" stamp on one ward) ──
+// Mirrors PRE's/Doctor's ward-level review exactly — same 5-minute cooldown,
+// same fanout convention (station + ward, so the reviewing nurse's own live
+// view refreshes — nurse sockets only join station:<id> rooms).
+router.post("/wards/:id/review", asyncH(async (req, res) => {
+  const stations = await getMyStations(req);
+  const stationIds = stations.map(s => s.id);
+  const wardId = Number(req.params.id);
+
+  const ward = await db.prepare("SELECT id, station_id FROM wards WHERE id=?")
+    .get<{ id: number; station_id: number | null }>(wardId);
+  if (!ward || ward.station_id == null || !stationIds.includes(ward.station_id))
+    throw new HttpError(403, "Ward not in your nursing station");
+
+  const assignments = await getNurseAssignments(req.user!.id);
+  if (stationsWithOverrides(assignments).has(ward.station_id) && !assignments.some(a => a.ward_id === wardId))
+    throw new HttpError(403, "Ward not in your assignments");
+
+  const REVIEW_COOLDOWN_MS = 5 * 60 * 1000;
+  const lastReview = await db.prepare(
+    "SELECT reviewed_at FROM nurse_ward_reviews WHERE ward_id=? ORDER BY reviewed_at DESC LIMIT 1"
+  ).get<{ reviewed_at: number }>(wardId);
+  if (lastReview) {
+    const waitMs = REVIEW_COOLDOWN_MS - (Date.now() - Number(lastReview.reviewed_at));
+    if (waitMs > 0)
+      throw new HttpError(429, `You can review this ward again in ${Math.ceil(waitMs / 60000)}m`);
+  }
+
+  const t = Date.now();
+  await db.prepare(
+    "INSERT INTO nurse_ward_reviews (ward_id, user_id, reviewed_at) VALUES (?,?,?)"
+  ).run(wardId, req.user!.id, t);
+  await audit(req.user!.id, "nurse_ward_review", String(wardId), { stationId: ward.station_id });
+
+  emitUpdate("bed:update", { wardId, reviewedAt: t }, { stationId: ward.station_id, wardId });
+  res.json({ ok: true, reviewedAt: t });
+}));
+
+/** Every ward id this nurse can see — full-station wards plus any per-ward
+ *  overrides — the hard access boundary for the "admin-style" dashboard
+ *  below. Same ward-level granularity /nurse/me already uses; a nurse with a
+ *  partial (BEDS-only) override still sees that ward's aggregate numbers
+ *  elsewhere, so scoping the dashboard the same way is consistent.
+ *  Always includes the Discharge Lounge ward, regardless of station — a
+ *  nurse can move a patient there from the discharge flow even if the lounge
+ *  isn't assigned to their own station, so they need to be able to see it. */
+async function myWardIds(req: { user?: { id: number } }): Promise<number[]> {
+  const stations = await getMyStations(req);
+  const stationIds = stations.map(s => s.id);
+  const assignments = await getNurseAssignments(req.user!.id);
+  const overriddenStations = stationsWithOverrides(assignments);
+  const openStationIds = stationIds.filter(id => !overriddenStations.has(id));
+  const overriddenWardIds = assignments.map(a => a.ward_id);
+
+  const openWardRows = openStationIds.length
+    ? await db.prepare("SELECT id FROM wards WHERE station_id = ANY(?)").all<{ id: number }>(openStationIds)
+    : [];
+  const wardIds = new Set([...openWardRows.map(r => r.id), ...overriddenWardIds]);
+  const lounge = await db.prepare("SELECT id FROM wards WHERE is_discharge_lounge=true").get<{ id: number }>();
+  if (lounge) wardIds.add(lounge.id);
+  return [...wardIds];
+}
+
+// ── Admin-style dashboard, scoped to the caller's own wards only ────────────
+
+router.get("/live-wards", asyncH(async (req, res) => {
+  res.json(await allWardsLive(await myWardIds(req)));
+}));
+
+router.get("/bed-details", asyncH(async (req, res) => {
+  res.json(await allBedDetailsLive(await myWardIds(req)));
+}));
+
+router.get("/admin-dashboard", asyncH(async (req, res) => {
+  const unit = typeof req.query.unit === "string" ? req.query.unit : null;
+  res.json(await adminDashboard(unit, await myWardIds(req)));
 }));
 
 router.get("/payer-types", asyncH(async (_req, res) => {

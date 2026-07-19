@@ -252,6 +252,18 @@ router.post("/wards/:id/review", asyncH(async (req, res) => {
   const doctorBlockId = await blockForWard(doctorId, wardId);
   if (!doctorBlockId) throw new HttpError(403, "This ward is not in your assigned Doctor Blocks");
 
+  // Cooldown — see the identical guard on PRE's /pre/wards/:id/review (pre.ts).
+  // Same shared Review button/component on both sides, same spam concern.
+  const REVIEW_COOLDOWN_MS = 5 * 60 * 1000;
+  const lastReview = await db.prepare(
+    "SELECT reviewed_at FROM doctor_block_reviews WHERE ward_id=? ORDER BY reviewed_at DESC LIMIT 1"
+  ).get<{ reviewed_at: number }>(wardId);
+  if (lastReview) {
+    const waitMs = REVIEW_COOLDOWN_MS - (Date.now() - Number(lastReview.reviewed_at));
+    if (waitMs > 0)
+      throw new HttpError(429, `You can review this ward again in ${Math.ceil(waitMs / 60000)}m`);
+  }
+
   const t = Date.now();
   await db.prepare(
     "INSERT INTO doctor_block_reviews (doctor_block_id, ward_id, user_id, reviewed_at) VALUES (?,?,?,?)"

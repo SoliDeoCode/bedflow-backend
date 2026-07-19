@@ -8,7 +8,6 @@ CREATE TABLE IF NOT EXISTS users (
   password_hash TEXT NOT NULL,
   role          TEXT NOT NULL CHECK (role IN ('PRE','COO','NURSE','DOCTOR')),
   name          TEXT NOT NULL,
-  shift         TEXT NOT NULL DEFAULT 'morning' CHECK (shift IN ('morning','night')),
   status        TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','inactive')),
   remarks       TEXT,
   created_at    INTEGER NOT NULL,
@@ -83,13 +82,13 @@ CREATE TABLE IF NOT EXISTS bed_status_updates (
 );
 CREATE INDEX IF NOT EXISTS idx_bsu_ward ON bed_status_updates(ward_id, created_at);
 
--- one row per completed 2-hour round submission
+-- one row per completed 2-hour round submission. Every PRE user is on duty
+-- 24/7 (no shift windows) — rounds are anchored at midnight IST.
 CREATE TABLE IF NOT EXISTS pre_rounds (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
   pre_code     TEXT NOT NULL,
   user_id      INTEGER REFERENCES users(id),
-  shift        TEXT NOT NULL,
-  round_key    TEXT NOT NULL UNIQUE,      -- pre|shift|YYYY-MM-DD|startMin
+  round_key    TEXT NOT NULL UNIQUE,      -- pre|YYYY-MM-DD|startMin
   start_min    INTEGER NOT NULL,
   submitted_at INTEGER NOT NULL,
   snapshot     TEXT                       -- JSON of ward counts at submit time
@@ -104,14 +103,6 @@ CREATE TABLE IF NOT EXISTS reminders (
   window_start TEXT NOT NULL,             -- 'HH:MM'
   window_end   TEXT NOT NULL,
   active       INTEGER NOT NULL DEFAULT 1
-);
-
-CREATE TABLE IF NOT EXISTS shifts (
-  id          INTEGER PRIMARY KEY AUTOINCREMENT,
-  key         TEXT NOT NULL UNIQUE,       -- 'morning' | 'night'
-  label       TEXT NOT NULL,
-  start_time  TEXT NOT NULL,
-  end_time    TEXT NOT NULL
 );
 
 -- immutable audit trail of all significant actions

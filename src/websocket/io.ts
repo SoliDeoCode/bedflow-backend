@@ -25,12 +25,13 @@ export function initWebsocket(server: HttpServer) {
     const user = (socket.data as { user: JwtPayload }).user;
     // FC is hospital-wide for the discharge module (billing isn't ward-scoped),
     // same as COO — reuses the existing broadcast room rather than adding a new one.
-    if (user.role === "COO" || user.role === "FC") socket.join("overview");
-    if (user.role === "PRE") {
-      const rows = await db.prepare("SELECT pre_block_id FROM user_pre_blocks WHERE user_id=?")
-        .all<{ pre_block_id: number }>(user.id);
-      for (const r of rows) socket.join(`pre:${r.pre_block_id}`);
-    }
+    //
+    // PRE joins it too: its Home dashboard is now the hospital-wide Admin view,
+    // so it has to refresh on any bed change, not just its own blocks'. This
+    // replaces the per-block `pre:<id>` joins rather than adding to them —
+    // emitUpdate() always emits to "overview", so it is a strict superset and
+    // keeping both would just refresh the client twice per event.
+    if (user.role === "COO" || user.role === "FC" || user.role === "PRE") socket.join("overview");
     if (user.role === "NURSE") {
       const rows = await db.prepare("SELECT station_id FROM nurse_stations WHERE nurse_id=?")
         .all<{ station_id: number }>(user.id);

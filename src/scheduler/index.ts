@@ -2,13 +2,15 @@ import { db } from "../db/index.js";
 import { pushToUser } from "../services/pushService.js";
 import { snapshotOccupancy, snapshotAdminDashboard, captureMidnightCensus } from "../services/bedService.js";
 import { emitUpdate } from "../websocket/io.js";
-import { COO_REMINDERS, hmToMin, minsNow, todayStr, currentRound, inShift, roundKey,
-         type ShiftKey } from "../config/domain.js";
+import { COO_REMINDERS, hmToMin, minsNow, todayStr, currentRound, roundKey } from "../config/domain.js";
+import { listPhaseConfig, computeWorkflow } from "../services/dischargeSlaService.js";
 
 const lastPush = new Map<string, number>();
 const REPUSH_MS = 5 * 60 * 1000;
 let lastCaptureDate   = "";
 let lastSnapshotHour  = -1;
+/** Admissions whose delay has already been broadcast — prevents a 30s re-emit loop. */
+const notifiedDelays = new Set<number>();
 
 async function tick() {
   const now  = Date.now();
@@ -21,23 +23,19 @@ async function tick() {
 
   // One row per (user, block) pair — a user assigned to N blocks yields N rows
   const pres = await db.prepare(
-    `SELECT u.id, u.username, u.shift, upb.pre_block_id, pb.name AS block_name
+    `SELECT u.id, u.username, upb.pre_block_id, pb.name AS block_name
      FROM users u
      JOIN user_pre_blocks upb ON upb.user_id = u.id
      JOIN pre_blocks pb ON pb.id = upb.pre_block_id
      JOIN pre_block_wards pbw ON pbw.pre_block_id = upb.pre_block_id
      WHERE u.role = 'PRE'
-     GROUP BY u.id, u.username, u.shift, upb.pre_block_id, pb.name`
-  ).all<{ id: number; username: string; shift: string; pre_block_id: number; block_name: string }>();
+     GROUP BY u.id, u.username, upb.pre_block_id, pb.name`
+  ).all<{ id: number; username: string; pre_block_id: number; block_name: string }>();
 
   if (pres.length > 0) {
-    // Compute round keys for all PRE users in JS — no DB call
-    const keyMeta = pres.map(u => {
-      const shift = (u.shift as ShiftKey) || "morning";
-      const round = currentRound(shift, mins);
-      const key   = roundKey(`pb${u.pre_block_id}`, shift, today, round.startMin);
-      return { u, shift, key };
-    });
+    // Every PRE user is on duty 24/7 — one global round, same for everyone.
+    const round = currentRound(mins);
+    const keyMeta = pres.map(u => ({ u, key: roundKey(`pb${u.pre_block_id}`, today, round.startMin) }));
 
     // Batch: which of the current round keys have been submitted
     const allKeys = keyMeta.map(m => m.key);
@@ -46,8 +44,7 @@ async function tick() {
     ).all<{ round_key: string }>(allKeys);
     const submittedKeys = new Set(submittedRows.map(r => r.round_key));
 
-    for (const { u, shift, key } of keyMeta) {
-      if (!inShift(shift, mins)) continue;
+    for (const { u, key } of keyMeta) {
       if (submittedKeys.has(key)) continue;
 
       const label = u.block_name ?? `PRE Block ${u.pre_block_id}`;
@@ -97,6 +94,46 @@ async function tick() {
     } else {
       emitUpdate("discharge:prompt", { admissionId: row.admission_id, bedId: row.bed_id, wardId: row.ward_id });
     }
+  }
+
+  // SLA delay sweep — a phase becomes Delayed by the clock passing its deadline,
+  // with nobody touching it, so without this nothing would tell the UI to
+  // re-render. Emit only on the transition into delay: `notifiedDelays` holds the
+  // admissions already announced, so a stuck phase doesn't re-fire every 30s.
+  {
+    const config = await listPhaseConfig();
+    const running = await db.prepare(
+      `SELECT dt.*, pa.ward_id, pa.bed_id, pa.id AS admission_id
+       FROM discharge_tracking dt
+       JOIN patient_admissions pa ON pa.id = dt.admission_id
+       WHERE dt.status IN ('DISCHARGE_INITIATED','IN_PROGRESS') AND pa.status='ACTIVE'`
+    ).all<Record<string, unknown>>();
+
+    const stillDelayed = new Set<number>();
+    for (const row of running) {
+      const wf = computeWorkflow(row as never, config, now);
+      if (!wf || wf.delayed.length === 0) continue;
+      const admissionId = Number(row.admission_id);
+      stillDelayed.add(admissionId);
+      if (notifiedDelays.has(admissionId)) continue;   // already announced
+
+      notifiedDelays.add(admissionId);
+      const wardId = Number(row.ward_id);
+      const preBlocks = await db.prepare("SELECT pre_block_id FROM pre_block_wards WHERE ward_id=?")
+        .all<{ pre_block_id: number }>(wardId);
+      const ward = await db.prepare("SELECT station_id FROM wards WHERE id=?")
+        .get<{ station_id: number | null }>(wardId);
+      emitUpdate("discharge:update", {
+        type: "delay", admissionId, bedId: Number(row.bed_id), wardId,
+        delayed: wf.delayed, eta: wf.eta,
+      }, {
+        wardId,
+        pre: preBlocks.map(b => String(b.pre_block_id)),
+        stationId: ward?.station_id ?? undefined,
+      });
+    }
+    // Drop admissions that recovered or finished, so a later delay re-announces.
+    for (const id of notifiedDelays) if (!stillDelayed.has(id)) notifiedDelays.delete(id);
   }
 
   // COO reminders at the top of each 3-hour slot

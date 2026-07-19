@@ -1,7 +1,7 @@
 import "dotenv/config";
 import bcrypt from "bcryptjs";
 import { db } from "./index.js";
-import { SHIFTS, PRE_INTERVAL_MIN } from "../config/domain.js";
+import { PRE_INTERVAL_MIN } from "../config/domain.js";
 
 // ── Hospital data (Image #11) ─────────────────────────────────────────────────
 // Columns 1-5 in image are floor numbers; total = Grand Total column.
@@ -101,7 +101,7 @@ async function wipe() {
       push_subscriptions, audit_logs, occupancy_snapshots,
       pre_rounds, beds, pre_assignments,
       saved_views, wards, users, blocks, floors,
-      reminders, shifts
+      reminders
     RESTART IDENTITY CASCADE
   `);
   console.log("Database wiped.");
@@ -166,31 +166,25 @@ async function run() {
       const blockId = blockIdFor[a.block.toUpperCase()] ?? null;
       await db.prepare(
         `INSERT INTO users
-           (username, password_hash, role, name, shift, block_id, created_at, updated_at)
-         VALUES (?,?,?,?,?,?,?,?)`
+           (username, password_hash, role, name, block_id, created_at, updated_at)
+         VALUES (?,?,?,?,?,?,?)`
       ).run(
         a.username,
         bcrypt.hashSync(`${a.username}123`, 10),
-        "PRE", a.name, "morning", blockId, now, now,
+        "PRE", a.name, blockId, now, now,
       );
     }
 
     await db.prepare(
-      `INSERT INTO users (username, password_hash, role, name, shift, block_id, created_at, updated_at)
-       VALUES (?,?,?,?,?,NULL,?,?)`
-    ).run("manager", bcrypt.hashSync("manager123", 10), "COO", "Ward Manager", "morning", now, now);
+      `INSERT INTO users (username, password_hash, role, name, block_id, created_at, updated_at)
+       VALUES (?,?,?,?,NULL,?,?)`
+    ).run("manager", bcrypt.hashSync("manager123", 10), "COO", "Ward Manager", now, now);
     await db.prepare(
-      `INSERT INTO users (username, password_hash, role, name, shift, block_id, created_at, updated_at)
-       VALUES (?,?,?,?,?,NULL,?,?)`
-    ).run("admin1", bcrypt.hashSync("admin123", 10), "COO", "Administrator", "morning", now, now);
+      `INSERT INTO users (username, password_hash, role, name, block_id, created_at, updated_at)
+       VALUES (?,?,?,?,NULL,?,?)`
+    ).run("admin1", bcrypt.hashSync("admin123", 10), "COO", "Administrator", now, now);
 
-    // ── 4. Shifts + reminders ─────────────────────────────────────────────────
-    for (const [key, s] of Object.entries(SHIFTS)) {
-      await db.prepare(
-        "INSERT INTO shifts (key, label, start_time, end_time) VALUES (?,?,?,?)"
-      ).run(key, s.label, s.start, s.end);
-    }
-
+    // ── 4. Reminders ─────────────────────────────────────────────────────────
     await db.prepare(
       "INSERT INTO reminders (target_role, interval_min, window_start, window_end, active) VALUES (?,?,?,?,1)"
     ).run("PRE", PRE_INTERVAL_MIN, "09:00", "18:30");

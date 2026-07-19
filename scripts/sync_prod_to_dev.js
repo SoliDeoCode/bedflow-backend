@@ -21,7 +21,7 @@ const devPool  = new Pool({ connectionString: devEnv.DIRECT_URL || devEnv.DATABA
 
 const PREFERRED_ORDER = [
   "building_blocks", "blocks", "floors", "nursing_stations",
-  "shifts", "payer_types", "pre_blocks", "users",
+  "payer_types", "pre_blocks", "users",
   "wards", "beds", "bed_details", "pre_block_wards",
   "nurse_access_assignments", "bed_status_updates",
   "pre_rounds", "pre_assignments",
@@ -64,14 +64,18 @@ async function run() {
   const tablesToCopy = PREFERRED_ORDER.filter(t => prodTables.has(t) && devTables.has(t));
 
   // ── 1. READ from prod ────────────────────────────────────────────────────
+  // Every table reads only columns present in BOTH prod and dev — schemas drift
+  // (dev gets new columns first, or — as with the shift/night-shift removal —
+  // dev drops columns prod still has) and a plain SELECT * would either insert
+  // into nonexistent dev columns or omit new dev-only ones from being cleared.
   console.log("📥  Reading data from production...");
   const prodData = {};
   for (const table of tablesToCopy) {
-    const res = await prodPool.query(`SELECT * FROM "${table}"`);
-    prodData[table] = res.rows;
-    console.log(`    ${table}: ${res.rows.length} rows`);
+    const cols = await getColumnsInBoth(prodPool, devPool, table);
+    const res  = await prodPool.query(`SELECT ${cols.map(c => `"${c}"`).join(",")} FROM "${table}"`);
+    prodData[table] = { cols, rows: res.rows };
+    console.log(`    ${table}: ${res.rows.length} rows (${cols.length} shared cols)`);
   }
-  // bed_movements: only shared columns (dev has extra nullable ones)
   if (prodTables.has("bed_movements") && devTables.has("bed_movements")) {
     const cols = await getColumnsInBoth(prodPool, devPool, "bed_movements");
     const res  = await prodPool.query(`SELECT ${cols.map(c=>`"${c}"`).join(",")} FROM "bed_movements"`);
@@ -102,9 +106,8 @@ async function run() {
     // Insert regular tables
     console.log("📤  Inserting into dev...");
     for (const table of tablesToCopy) {
-      const rows = prodData[table];
+      const { cols, rows } = prodData[table];
       if (rows.length === 0) { console.log(`    ${table}: 0 — skipped`); continue; }
-      const cols    = Object.keys(rows[0]);
       const colList = cols.map(c => `"${c}"`).join(", ");
       const vals    = cols.map((_, i) => `$${i + 1}`).join(", ");
       for (const row of rows)

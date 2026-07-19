@@ -17,7 +17,6 @@ model User {
   password_hash String
   role          String  @db.VarChar(20)
   name          String
-  shift         String  @default("morning") @db.VarChar(20)
   created_at    BigInt
   updated_at    BigInt
   block_id         Int?
@@ -154,7 +153,6 @@ model PreRound {
   id           Int     @id @default(autoincrement())
   pre_code     String
   user_id      Int?
-  shift        String  @db.VarChar(20)
   round_key    String  @unique
   start_min    Int
   submitted_at BigInt
@@ -177,16 +175,6 @@ model Reminder {
   active       Int    @default(1)
 
   @@map("reminders")
-}
-
-model Shift {
-  id         Int    @id @default(autoincrement())
-  key        String @unique
-  label      String
-  start_time String @db.VarChar(10)
-  end_time   String @db.VarChar(10)
-
-  @@map("shifts")
 }
 
 model AuditLog {

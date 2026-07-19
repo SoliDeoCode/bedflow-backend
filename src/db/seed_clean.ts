@@ -9,7 +9,7 @@ async function run() {
       nurse_access_assignments, bed_movements, bed_details, bed_status_updates,
       push_subscriptions, audit_logs, occupancy_snapshots, midnight_census,
       pre_rounds, beds, pre_assignments, pre_block_wards, pre_blocks,
-      saved_views, reminders, shifts,
+      saved_views, reminders,
       wards, nursing_stations, floors, blocks, building_blocks,
       users
     RESTART IDENTITY CASCADE
@@ -31,22 +31,11 @@ async function run() {
   for (const u of users) {
     const hash = bcrypt.hashSync(u.password, 10);
     await db.prepare(
-      `INSERT INTO users (username, password_hash, role, name, shift, created_at, updated_at)
-       VALUES (?, ?, ?, ?, 'morning', ?, ?)`
+      `INSERT INTO users (username, password_hash, role, name, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?)`
     ).run(u.username, hash, u.role, u.name, now, now);
     console.log(`  Created: ${u.username.padEnd(12)} (${u.role})`);
   }
-
-  // Shifts (required for app to function)
-  await db.prepare(
-    "INSERT INTO shifts (key, label, start_time, end_time) VALUES (?,?,?,?)"
-  ).run("morning", "Morning", "07:00", "14:00");
-  await db.prepare(
-    "INSERT INTO shifts (key, label, start_time, end_time) VALUES (?,?,?,?)"
-  ).run("evening", "Evening", "14:00", "21:00");
-  await db.prepare(
-    "INSERT INTO shifts (key, label, start_time, end_time) VALUES (?,?,?,?)"
-  ).run("night", "Night", "21:00", "07:00");
 
   console.log("\nDone. All users created.");
 }

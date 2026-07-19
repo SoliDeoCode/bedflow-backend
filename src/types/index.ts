@@ -1,7 +1,8 @@
 // COO is the single management role, presented in the UI as "Admin".
 // The former MANAGER role was merged into COO (migration 20260621000000).
 // DOCTOR updates beds in assigned Doctor Blocks (migration 20260622000000).
-export type Role = "PRE" | "COO" | "NURSE" | "DOCTOR" | "FC";
+// CONSULTANT — portal login for named consultants; read-only hospital view + discharge summary.
+export type Role = "PRE" | "COO" | "NURSE" | "DOCTOR" | "FC" | "CONSULTANT";
 
 export interface User {
   id: number;
@@ -9,7 +10,6 @@ export interface User {
   password_hash: string;
   role: Role;
   name: string;
-  shift: "morning" | "night";
   block_id: number | null;       // legacy — kept for old tokens
   floor_id: number | null;       // legacy physical floor (no longer used for PRE)
   nursing_station: string | null;

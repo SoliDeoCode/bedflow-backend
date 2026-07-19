@@ -1,3 +1,4 @@
+import bcrypt from "bcryptjs";
 import { Router } from "express";
 import { z } from "zod";
 import { authRequired, requireRole } from "../middleware/auth.js";
@@ -8,7 +9,7 @@ import {
   listBuildingBlocks, createBuildingBlock, editBuildingBlock, deleteBuildingBlock,
   listFloors, createFloor, editFloor, deleteFloor,
   createWard, editWard, deleteWard,
-  createPre, editPre, setPreShift, deletePre,
+  createPre, editPre, deletePre,
   createNurse, editNurse, deleteNurse, addNurseStation, removeNurseStation,
   createDoctor, editDoctor, deleteDoctor,
   listNursingStations, createNursingStation, editNursingStation, deleteNursingStation, assignWardsToStation,
@@ -27,6 +28,7 @@ import {
   generateBeds, addSingleBed, listBeds, renameBed, deleteBed, updateBedMaster,
 } from "../services/bedDetailService.js";
 import { midnightCensusFor } from "../services/bedService.js";
+import { listPhaseConfig, updatePhaseConfig, reorderPhaseConfig } from "../services/dischargeSlaService.js";
 import {
   listPayerTypes, createPayerType, updatePayerType, reorderPayerType, deletePayerType,
 } from "../services/payerTypeService.js";
@@ -258,7 +260,7 @@ router.delete("/wards/:id", asyncH(async (req, res) => {
 
 router.get("/users", asyncH(async (_req, res) => {
   const users = await db.prepare(
-    `SELECT u.id, u.username, u.role, u.name, u.shift, u.status, u.remarks,
+    `SELECT u.id, u.username, u.role, u.name, u.status, u.remarks,
             u.station_id, u.nursing_station,
             ns.name AS station_name,
             COALESCE(upb.pre_block_ids,   ARRAY[]::int[])  AS pre_block_ids,
@@ -303,7 +305,6 @@ router.post("/pre", asyncH(async (req, res) => {
     password:     z.string().min(8, "Password must be at least 8 characters.").max(72, "Password is too long."),
     name:         z.string().min(1, "Display name is required.").max(80, "Display name is too long."),
     preBlockIds:  z.array(z.number().int()).optional(),
-    shift:        z.enum(["morning", "night"]).optional(),
   }).parse(req.body);
   res.status(201).json(await createPre({ ...b, managerId: req.user!.id }));
 }));
@@ -312,15 +313,9 @@ router.put("/pre/:id", asyncH(async (req, res) => {
   const b = z.object({
     name:         z.string().min(1, "Display name is required.").max(80, "Display name is too long.").optional(),
     password:     z.string().min(8, "Password must be at least 8 characters.").max(72, "Password is too long.").optional(),
-    shift:        z.enum(["morning", "night"]).optional(),
     preBlockIds:  z.array(z.number().int()).optional(),
   }).parse(req.body);
   res.json(await editPre({ userId: Number(req.params.id), ...b, managerId: req.user!.id }));
-}));
-
-router.post("/pre/:id/shift", asyncH(async (req, res) => {
-  const { shift } = z.object({ shift: z.enum(["morning", "night"]) }).parse(req.body);
-  res.json(await setPreShift(Number(req.params.id), shift, req.user!.id));
 }));
 
 router.delete("/pre/:id", asyncH(async (req, res) => {
@@ -924,6 +919,119 @@ router.post("/discharge-lounge", asyncH(async (req, res) => {
 router.put("/discharge-lounge", asyncH(async (req, res) => {
   const { name } = z.object({ name: z.string().min(1).max(150) }).parse(req.body);
   res.json(await renameDischargeLounge({ name, managerId: req.user!.id }));
+}));
+
+// ── Consultant Logins — COO creates portal credentials for named consultants ──
+// Each CONSULTANT user's `name` must match a doctors_master entry so "My Patients"
+// can filter bed entries by consultant_name = user.name on the backend.
+
+router.get("/consultant-logins", asyncH(async (_req, res) => {
+  const rows = await db.prepare(
+    `SELECT u.id, u.username, u.name,
+            dm.id AS doctor_master_id, u.status
+     FROM users u
+     LEFT JOIN doctors_master dm ON dm.name = u.name
+     WHERE u.role = 'CONSULTANT'
+     ORDER BY u.name`
+  ).all<{ id: number; username: string; name: string; doctor_master_id: number | null; status: string }>();
+  res.json({ logins: rows });
+}));
+
+router.post("/consultant-logins", asyncH(async (req, res) => {
+  const { doctor_master_id, username, password } = z.object({
+    doctor_master_id: z.number().int().positive(),
+    username:         z.string().min(1).max(60).regex(/^[a-z0-9._-]+$/i, "Username may only contain letters, numbers, dots, hyphens, underscores"),
+    password:         z.string().min(6, "Password must be at least 6 characters").max(72),
+  }).parse(req.body);
+
+  // Look up the doctor's display name — this becomes the login user's name
+  const doctor = await db.prepare("SELECT id, name FROM doctors_master WHERE id=?").get<{ id: number; name: string }>(doctor_master_id);
+  if (!doctor) throw new HttpError(404, "Doctor not found.");
+
+  // Prevent duplicate usernames
+  const clash = await db.prepare("SELECT id FROM users WHERE username=?").get<{ id: number }>(username.trim().toLowerCase());
+  if (clash) throw new HttpError(409, "This username is already taken. Please choose another.");
+
+  // Prevent a second login for the same doctor name
+  const existing = await db.prepare("SELECT id FROM users WHERE role='CONSULTANT' AND name=?").get<{ id: number }>(doctor.name);
+  if (existing) throw new HttpError(409, "A consultant login already exists for this doctor. Edit the existing login instead.");
+
+  const hash = bcrypt.hashSync(password, 12);
+  const now = Date.now();
+
+  const row = await db.prepare(
+    `INSERT INTO users (username, password_hash, role, name, status, created_at, updated_at)
+     VALUES (?, ?, 'CONSULTANT', ?, 'active', ?, ?)
+     RETURNING id, username, name, role, status`
+  ).get<{ id: number; username: string; name: string; role: string; status: string }>(
+    username.trim().toLowerCase(), hash, doctor.name, now, now
+  );
+
+  res.status(201).json({ login: { ...row, doctor_master_id } });
+}));
+
+router.put("/consultant-logins/:id", asyncH(async (req, res) => {
+  const id = Number(req.params.id);
+  const { username, password } = z.object({
+    username: z.string().min(1).max(60).regex(/^[a-z0-9._-]+$/i, "Invalid username format").optional(),
+    password: z.string().min(6, "Password must be at least 6 characters").max(72).optional(),
+  }).parse(req.body);
+
+  const user = await db.prepare("SELECT id FROM users WHERE id=? AND role='CONSULTANT'").get<{ id: number }>(id);
+  if (!user) throw new HttpError(404, "Consultant login not found.");
+
+  if (username) {
+    const clash = await db.prepare("SELECT id FROM users WHERE username=? AND id<>?").get<{ id: number }>(username.trim().toLowerCase(), id);
+    if (clash) throw new HttpError(409, "This username is already taken.");
+    await db.prepare("UPDATE users SET username=?, updated_at=? WHERE id=?").run(username.trim().toLowerCase(), Date.now(), id);
+  }
+  if (password) {
+    const bcrypt = await import("bcryptjs");
+    const hash = bcrypt.hashSync(password, 12);
+    await db.prepare("UPDATE users SET password_hash=?, updated_at=? WHERE id=?").run(hash, Date.now(), id);
+  }
+
+  const updated = await db.prepare("SELECT id, username, name, role, status FROM users WHERE id=?").get<{ id: number; username: string; name: string; role: string; status: string }>(id);
+  res.json({ login: updated });
+}));
+
+router.delete("/consultant-logins/:id", asyncH(async (req, res) => {
+  const id = Number(req.params.id);
+  const user = await db.prepare("SELECT id FROM users WHERE id=? AND role='CONSULTANT'").get<{ id: number }>(id);
+  if (!user) throw new HttpError(404, "Consultant login not found.");
+  await db.prepare("DELETE FROM users WHERE id=? AND role='CONSULTANT'").run(id);
+  res.json({ ok: true });
+}));
+
+// ── Discharge Phase SLAs ─────────────────────────────────────────────────────
+// The COO sets expected duration per phase; these are the hospital's SLAs and
+// drive deadline/delay detection and the ETA shown to every role. Phase keys are
+// fixed (they map to discharge_tracking columns) — only label, department and
+// duration are editable, so there is no create/delete here.
+
+router.get("/discharge-phases", asyncH(async (_req, res) => {
+  res.json({ phases: await listPhaseConfig() });
+}));
+
+router.put("/discharge-phases/:id", asyncH(async (req, res) => {
+  const { label, department, expected_minutes } = z.object({
+    label:            z.string().min(1).max(100).optional(),
+    department:       z.string().max(100).nullable().optional(),
+    expected_minutes: z.number().int().min(0).max(1440).optional(),
+  }).parse(req.body);
+  const result = await updatePhaseConfig({
+    id: Number(req.params.id), label, department,
+    expectedMinutes: expected_minutes, userId: req.user!.id,
+  });
+  emitUpdate("discharge:update", { type: "phase-config" });
+  res.json(result);
+}));
+
+router.patch("/discharge-phases/:id/order", asyncH(async (req, res) => {
+  const { direction } = z.object({ direction: z.enum(["up", "down"]) }).parse(req.body);
+  const result = await reorderPhaseConfig({ id: Number(req.params.id), direction, userId: req.user!.id });
+  emitUpdate("discharge:update", { type: "phase-config" });
+  res.json(result);
 }));
 
 export default router;

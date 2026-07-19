@@ -2,9 +2,9 @@ import { Router } from "express";
 import { authRequired, requireRole } from "../middleware/auth.js";
 import { asyncH } from "../middleware/error.js";
 import { z } from "zod";
-import { orgOverview, allWardsLive, allBedDetailsLive, adminDashboard, adminDashboardHistory } from "../services/bedService.js";
-import { COO_REMINDERS, hmToMin, minsNow, todayStr, startOfDayIST, PRE_INTERVAL_MIN, SHIFTS,
-         currentRound, inShift, roundKey, type ShiftKey } from "../config/domain.js";
+import { orgOverview, allWardsLive, allBedDetailsLive, adminDashboard, adminDashboardHistory, consultantsLive } from "../services/bedService.js";
+import { COO_REMINDERS, hmToMin, minsNow, todayStr, startOfDayIST, PRE_INTERVAL_MIN,
+         currentRound, roundKey } from "../config/domain.js";
 import { recentAudit, queryActivity } from "../services/auditService.js";
 import { db } from "../db/index.js";
 import { HttpError } from "../middleware/error.js";
@@ -31,14 +31,14 @@ router.get("/overview", asyncH(async (_req, res) => {
     ).all<{ pre_block_id: number; n: number }>(floorIds);
     const wardCountByBlock = new Map(wardCountRows.map(r => [Number(r.pre_block_id), Number(r.n)]));
 
-    // Compute current round keys for all floors (pure JS, no DB)
-    const keyMeta = new Map<number, { shift: ShiftKey; round: ReturnType<typeof currentRound>; key: string }>();
+    // Compute current round keys for all floors (pure JS, no DB) — every PRE user
+    // is on duty 24/7, so the round is the same global 2-hour slot for everyone.
+    const round = currentRound(mins);
+    const keyMeta = new Map<number, { key: string }>();
     const allKeys: string[] = [];
     for (const p of allPres) {
-      const shift = (p.assignedUser?.shift as ShiftKey) || "morning";
-      const round = currentRound(shift, mins);
-      const key   = roundKey(`pb${p.floor_id}`, shift, today, round.startMin);
-      keyMeta.set(p.floor_id, { shift, round, key });
+      const key = roundKey(`pb${p.floor_id}`, today, round.startMin);
+      keyMeta.set(p.floor_id, { key });
       allKeys.push(key);
     }
 
@@ -49,13 +49,12 @@ router.get("/overview", asyncH(async (_req, res) => {
     const submittedKeys = new Set(submittedRows.map(r => r.round_key));
 
     for (const p of allPres) {
-      const { shift, round, key } = keyMeta.get(p.floor_id)!;
-      const onDuty   = inShift(shift, mins);
+      const { key } = keyMeta.get(p.floor_id)!;
       const hasWards = (wardCountByBlock.get(p.floor_id) ?? 0) > 0;
       const submitted = submittedKeys.has(key);
       alarmByFloorId.set(p.floor_id, {
-        shift, onDuty, round, key, submitted, hasWards,
-        alarmActive: onDuty && hasWards && !submitted,
+        round, key, submitted, hasWards,
+        alarmActive: hasWards && !submitted,
       });
     }
   }
@@ -94,6 +93,10 @@ router.get("/admin-dashboard-history", asyncH(async (req, res) => {
   res.json({ snapshots: await adminDashboardHistory(48, unit) });
 }));
 
+router.get("/consultants", asyncH(async (_req, res) => {
+  res.json(await consultantsLive());
+}));
+
 router.get("/audit", asyncH(async (_req, res) => {
   res.json({ logs: await recentAudit(150) });
 }));
@@ -125,7 +128,8 @@ router.get("/activity", asyncH(async (req, res) => {
 }));
 
 // Rounds are submitted per PRE Block — compliance is scored per active PRE
-// Block with wards, using the assigned PRE user's shift.
+// Block with wards. Every PRE user is on duty 24/7, so "expected" is simply how
+// many 2-hour rounds have elapsed since midnight IST, capped at 12/day.
 router.get("/compliance", asyncH(async (_req, res) => {
   const today = todayStr();
   const mins  = minsNow();
@@ -145,11 +149,11 @@ router.get("/compliance", asyncH(async (_req, res) => {
 
   // Batch: one representative PRE user per block (lowest id wins)
   const userRows = await db.prepare(
-    `SELECT DISTINCT ON (upb.pre_block_id) u.id, u.shift, u.name, upb.pre_block_id
+    `SELECT DISTINCT ON (upb.pre_block_id) u.id, u.name, upb.pre_block_id
      FROM user_pre_blocks upb
      JOIN users u ON u.id = upb.user_id
      WHERE upb.pre_block_id = ANY(?) ORDER BY upb.pre_block_id, u.id`
-  ).all<{ id: number; shift: string; name: string; pre_block_id: number }>(blockIds);
+  ).all<{ id: number; name: string; pre_block_id: number }>(blockIds);
   const userByBlock = new Map(userRows.map(u => [Number(u.pre_block_id), u]));
 
   // Batch: submitted round counts per block since start of day
@@ -159,16 +163,11 @@ router.get("/compliance", asyncH(async (_req, res) => {
   ).all<{ pre_block_id: number; c: number }>(blockIds, dayStart);
   const countByBlock = new Map(countRows.map(r => [Number(r.pre_block_id), Number(r.c)]));
 
+  const roundsPerDay = 1440 / PRE_INTERVAL_MIN;
+  const expected = Math.max(0, Math.min(Math.floor(mins / PRE_INTERVAL_MIN) + 1, roundsPerDay));
+
   const rows = blocks.map(block => {
     const user      = userByBlock.get(block.id);
-    const shift     = (user?.shift as keyof typeof SHIFTS) || "morning";
-    const s         = SHIFTS[shift];
-    const start     = hmToMin(s.start);
-    let elapsed     = mins - start; if (elapsed < 0) elapsed += 1440; // cross-midnight shift
-    const expected  = Math.max(0, Math.min(
-      Math.floor(elapsed / PRE_INTERVAL_MIN) + 1,
-      Math.floor((hmToMin(s.end) - start + 1440) % 1440 / PRE_INTERVAL_MIN)
-    ));
     const submitted = countByBlock.get(block.id) ?? 0;
     const score     = expected > 0
       ? Math.round((Math.min(submitted, expected) / expected) * 100)
@@ -179,7 +178,7 @@ router.get("/compliance", asyncH(async (_req, res) => {
       floor: block.name, block: block.name,
       name:   user?.name ?? block.name,
       hasPre: !!user,
-      shift, expected, submitted, score,
+      expected, submitted, score,
     };
   });
   res.json({ date: today, compliance: rows });
@@ -198,11 +197,11 @@ router.get("/pre-activity", asyncH(async (_req, res) => {
   const blockIds = blocks.map(b => b.id);
 
   const userRows = await db.prepare(
-    `SELECT DISTINCT ON (upb.pre_block_id) u.id, u.name, u.shift, upb.pre_block_id
+    `SELECT DISTINCT ON (upb.pre_block_id) u.id, u.name, upb.pre_block_id
      FROM user_pre_blocks upb
      JOIN users u ON u.id = upb.user_id
      WHERE upb.pre_block_id = ANY(?) ORDER BY upb.pre_block_id, u.id`
-  ).all<{ id: number; name: string; shift: string; pre_block_id: number }>(blockIds);
+  ).all<{ id: number; name: string; pre_block_id: number }>(blockIds);
   const userByBlock = new Map(userRows.map(u => [Number(u.pre_block_id), u]));
 
   const wardRows = await db.prepare(
@@ -230,22 +229,19 @@ router.get("/pre-activity", asyncH(async (_req, res) => {
   ).all<{ pre_block_id: number; c: number; last_at: number }>(blockIds, today);
   const roundsByBlock = new Map(roundRows.map(r => [Number(r.pre_block_id), r]));
 
+  // Every PRE user is on duty 24/7 — expected rounds is just how many 2-hour
+  // slots have elapsed since midnight IST, same for every block.
+  const roundsPerDay = 1440 / PRE_INTERVAL_MIN;
+  const expected = Math.max(0, Math.min(Math.floor(mins / PRE_INTERVAL_MIN) + 1, roundsPerDay));
+
   const result = blocks.map(block => {
-    const user     = userByBlock.get(block.id);
-    const shift    = (user?.shift as keyof typeof SHIFTS) || "morning";
-    const s        = SHIFTS[shift];
-    const start    = hmToMin(s.start);
-    let   elapsed  = mins - start; if (elapsed < 0) elapsed = 0;
-    const expected = Math.max(0, Math.min(
-      Math.floor(elapsed / PRE_INTERVAL_MIN) + 1,
-      Math.floor((hmToMin(s.end) - start + 1440) % 1440 / PRE_INTERVAL_MIN)
-    ));
+    const user      = userByBlock.get(block.id);
     const rounds    = roundsByBlock.get(block.id);
     const submitted = Number(rounds?.c ?? 0);
     const score     = expected > 0 ? Math.round((Math.min(submitted, expected) / expected) * 100) : 100;
     return {
       id: block.id, name: block.name, status: block.status,
-      assignedUser:    user ? { id: user.id, name: user.name, shift: user.shift } : null,
+      assignedUser:    user ? { id: user.id, name: user.name } : null,
       wards:           wardsByBlock.get(block.id) ?? [],
       roundsToday:     submitted,
       lastSubmittedAt: rounds?.last_at ?? null,

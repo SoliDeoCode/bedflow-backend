@@ -7,10 +7,11 @@ import { emitUpdate } from "../websocket/io.js";
 import type { Role } from "../types/index.js";
 import {
   planDischarge, reschedule, cancelPlan, initiateDischarge, cancelAfterInitiation,
-  updateStep, dashboardCounts, historyForAdmission, getDischargeForBed, dischargesForWard, listPendingByStep, listActiveDischarges,
+  updateStep, dashboardCounts, historyForAdmission, getDischargeForBed, dischargesForWard, listPendingByStep, listActiveDischarges, listCancelledToday, listPatientLeft, listCompletedToday, listAdmittedToday,
   type StepKey,
 } from "../services/dischargeService.js";
 import { getAdmissionById } from "../services/patientAdmissionService.js";
+import { listPhaseConfig, computeWorkflow, decorateMany } from "../services/dischargeSlaService.js";
 import { listTransferCandidates, transferBed, moveToDischargeLounge } from "../services/bedTransferService.js";
 import { canNurseAccessBed, getMyStations } from "./nurse.js";
 import { accessibleWards, blockForWard } from "./doctor.js";
@@ -57,15 +58,36 @@ async function assertWardAccess(userId: number, role: Role, wardId: number) {
   }
 }
 
-async function assertBedAccess(userId: number, role: Role, bedId: number) {
-  if (role === "NURSE") {
-    const stations = await getMyStations({ user: { id: userId } });
-    const allowed = await canNurseAccessBed(userId, bedId, stations.map(s => s.id));
+/** A CONSULTANT owns only the beds whose ACTIVE admission carries their name —
+ *  ward-level access means nothing for them, so every write must check this. */
+async function consultantOwnsBed(name: string, bedId: number): Promise<boolean> {
+  const row = await db.prepare(
+    "SELECT 1 FROM patient_admissions WHERE bed_id=? AND status='ACTIVE' AND consultant_name=?"
+  ).get(bedId, name);
+  return !!row;
+}
+
+async function consultantOwnsAdmission(name: string, admissionId: number): Promise<boolean> {
+  const row = await db.prepare(
+    "SELECT 1 FROM patient_admissions WHERE id=? AND consultant_name=?"
+  ).get(admissionId, name);
+  return !!row;
+}
+
+async function assertBedAccess(user: { id: number; role: Role; name: string }, bedId: number) {
+  if (user.role === "NURSE") {
+    const stations = await getMyStations({ user: { id: user.id } });
+    const allowed = await canNurseAccessBed(user.id, bedId, stations.map(s => s.id));
     if (!allowed) throw new HttpError(403, "You do not have access to this bed");
     return;
   }
+  if (user.role === "CONSULTANT") {
+    if (!(await consultantOwnsBed(user.name, bedId)))
+      throw new HttpError(403, "This patient is not under your care");
+    return;
+  }
   const wardId = await bedWard(bedId);
-  await assertWardAccess(userId, role, wardId);
+  await assertWardAccess(user.id, user.role, wardId);
 }
 
 async function admissionWard(admissionId: number): Promise<{ wardId: number; bedId: number }> {
@@ -74,10 +96,14 @@ async function admissionWard(admissionId: number): Promise<{ wardId: number; bed
   return { wardId: admission.ward_id, bedId: admission.bed_id };
 }
 
-async function assertAdmissionAccess(userId: number, role: Role, admissionId: number): Promise<number> {
+async function assertAdmissionAccess(user: { id: number; role: Role; name: string }, admissionId: number): Promise<number> {
   const { wardId, bedId } = await admissionWard(admissionId);
-  if (role === "NURSE") await assertBedAccess(userId, role, bedId);
-  else await assertWardAccess(userId, role, wardId);
+  if (user.role === "NURSE") await assertBedAccess(user, bedId);
+  else if (user.role === "CONSULTANT") {
+    if (!(await consultantOwnsAdmission(user.name, admissionId)))
+      throw new HttpError(403, "This patient is not under your care");
+  }
+  else await assertWardAccess(user.id, user.role, wardId);
   return wardId;
 }
 
@@ -118,7 +144,7 @@ router.post("/plan", asyncH(async (req, res) => {
   }).parse(req.body);
 
   const wardId = await bedWard(bedId);
-  await assertWardAccess(req.user!.id, req.user!.role, wardId);
+  await assertBedAccess(req.user!, bedId);
 
   const tracking = await planDischarge({
     bedId, plannedDate: planned_date, plannedTime: planned_time, userId: req.user!.id, role: req.user!.role,
@@ -135,7 +161,7 @@ router.post("/:admissionId/reschedule", asyncH(async (req, res) => {
     reason: z.string().max(500).nullable().optional(),
   }).parse(req.body);
 
-  const wardId = await assertAdmissionAccess(req.user!.id, req.user!.role, admissionId);
+  const wardId = await assertAdmissionAccess(req.user!, admissionId);
   const tracking = await reschedule({
     admissionId, plannedDate: planned_date, plannedTime: planned_time, reason, userId: req.user!.id, role: req.user!.role,
   });
@@ -147,7 +173,7 @@ router.post("/:admissionId/cancel-plan", asyncH(async (req, res) => {
   const admissionId = Number(req.params.admissionId);
   const { reason } = z.object({ reason: z.string().max(500).nullable().optional() }).parse(req.body);
 
-  const wardId = await assertAdmissionAccess(req.user!.id, req.user!.role, admissionId);
+  const wardId = await assertAdmissionAccess(req.user!, admissionId);
   await cancelPlan({ admissionId, reason, userId: req.user!.id, role: req.user!.role });
   emitUpdate("discharge:update", { type: "cancel-plan", admissionId, wardId }, await fanout(wardId));
   res.json({ ok: true });
@@ -155,7 +181,7 @@ router.post("/:admissionId/cancel-plan", asyncH(async (req, res) => {
 
 router.post("/:admissionId/initiate", asyncH(async (req, res) => {
   const admissionId = Number(req.params.admissionId);
-  const wardId = await assertAdmissionAccess(req.user!.id, req.user!.role, admissionId);
+  const wardId = await assertAdmissionAccess(req.user!, admissionId);
   const tracking = await initiateDischarge({ admissionId, userId: req.user!.id, role: req.user!.role });
   emitUpdate("discharge:update", { type: "initiate", admissionId, wardId, tracking }, await fanout(wardId));
   res.json({ ok: true, tracking });
@@ -165,7 +191,7 @@ router.post("/:admissionId/cancel", asyncH(async (req, res) => {
   const admissionId = Number(req.params.admissionId);
   const { reason } = z.object({ reason: z.string().max(500).nullable().optional() }).parse(req.body);
 
-  const wardId = await assertAdmissionAccess(req.user!.id, req.user!.role, admissionId);
+  const wardId = await assertAdmissionAccess(req.user!, admissionId);
   await cancelAfterInitiation({ admissionId, reason, userId: req.user!.id, role: req.user!.role });
   emitUpdate("discharge:update", { type: "cancel", admissionId, wardId }, await fanout(wardId));
   res.json({ ok: true });
@@ -193,7 +219,7 @@ router.patch("/:admissionId/step", asyncH(async (req, res) => {
   if (req.user!.role === "FC") {
     ({ wardId } = await admissionWard(admissionId));
   } else {
-    wardId = await assertAdmissionAccess(req.user!.id, req.user!.role, admissionId);
+    wardId = await assertAdmissionAccess(req.user!, admissionId);
   }
 
   const tracking = await updateStep({
@@ -207,8 +233,10 @@ router.patch("/:admissionId/step", asyncH(async (req, res) => {
 
 router.get("/bed/:bedId", asyncH(async (req, res) => {
   const bedId = Number(req.params.bedId);
-  await assertBedAccess(req.user!.id, req.user!.role, bedId);
-  res.json(await getDischargeForBed(bedId));
+  await assertBedAccess(req.user!, bedId);
+  const r = await getDischargeForBed(bedId);
+  const config = await listPhaseConfig();
+  res.json({ ...r, workflow: computeWorkflow(r.tracking as never, config) });
 }));
 
 router.get("/dashboard", asyncH(async (req, res) => {
@@ -217,15 +245,18 @@ router.get("/dashboard", asyncH(async (req, res) => {
 }));
 
 router.get("/active", asyncH(async (req, res) => {
+  // A CONSULTANT's list is scoped by admission ownership, not ward — they see
+  // only their own patients, whether the request is ward-filtered or not.
+  const mine = req.user!.role === "CONSULTANT" ? req.user!.name : null;
   const wardIdParam = req.query.wardId as string | undefined;
   if (wardIdParam) {
     const wardId = Number(wardIdParam);
-    await assertWardAccess(req.user!.id, req.user!.role, wardId);
-    res.json({ discharges: await listActiveDischarges([wardId]) });
+    if (!mine) await assertWardAccess(req.user!.id, req.user!.role, wardId);
+    res.json({ discharges: await decorateMany(await listActiveDischarges([wardId], mine) as never[]) });
     return;
   }
   const wardIds = await myWardScope(req.user!.id, req.user!.role);
-  res.json({ discharges: await listActiveDischarges(wardIds) });
+  res.json({ discharges: await decorateMany(await listActiveDischarges(wardIds, mine) as never[]) });
 }));
 
 router.get("/ward/:wardId", asyncH(async (req, res) => {
@@ -240,10 +271,30 @@ router.get("/pending", asyncH(async (req, res) => {
   res.json({ discharges: await listPendingByStep(step, wardIds) });
 }));
 
+router.get("/cancelled-today", asyncH(async (req, res) => {
+  const wardIds = await myWardScope(req.user!.id, req.user!.role);
+  res.json({ discharges: await listCancelledToday(wardIds) });
+}));
+
+router.get("/completed-today", asyncH(async (req, res) => {
+  const wardIds = await myWardScope(req.user!.id, req.user!.role);
+  res.json({ discharges: await listCompletedToday(wardIds) });
+}));
+
+router.get("/admitted-today", asyncH(async (req, res) => {
+  const wardIds = await myWardScope(req.user!.id, req.user!.role);
+  res.json({ admissions: await listAdmittedToday(wardIds) });
+}));
+
+router.get("/patient-left", asyncH(async (req, res) => {
+  const wardIds = await myWardScope(req.user!.id, req.user!.role);
+  res.json({ discharges: await listPatientLeft(wardIds) });
+}));
+
 router.get("/history/:admissionId", asyncH(async (req, res) => {
   const admissionId = Number(req.params.admissionId);
   if (req.user!.role !== "FC" && req.user!.role !== "COO")
-    await assertAdmissionAccess(req.user!.id, req.user!.role, admissionId);
+    await assertAdmissionAccess(req.user!, admissionId);
   res.json(await historyForAdmission(admissionId));
 }));
 
@@ -271,8 +322,19 @@ router.post("/transfer", asyncH(async (req, res) => {
   await assertWardAccess(req.user!.id, req.user!.role, toWardId);
 
   const result = await transferBed({ fromBedId, toWardId, toBedId, reason, userId: req.user!.id });
-  emitUpdate("discharge:update", { type: "transfer", ...result, fromWardId, toWardId }, await fanout(fromWardId));
-  emitUpdate("discharge:update", { type: "transfer", ...result, fromWardId, toWardId }, await fanout(toWardId));
+  // One merged emit instead of two separate ones — emitUpdate always also hits the
+  // "overview" room regardless of opts, so calling it twice (once per ward) doubled
+  // every connected client's refresh for this single transfer, worst-case (same-ward
+  // transfer) sending the exact same event twice to the exact same rooms.
+  const fromFan = await fanout(fromWardId);
+  const toFan = fromWardId === toWardId ? fromFan : await fanout(toWardId);
+  const preRooms = [...new Set([fromFan.pre, toFan.pre].filter((v): v is string => !!v))];
+  const stationRooms = [...new Set([fromFan.stationId, toFan.stationId].filter((v): v is number => v != null))];
+  emitUpdate("discharge:update", { type: "transfer", ...result, fromWardId, toWardId }, {
+    pre: preRooms.length ? preRooms : undefined,
+    stationId: stationRooms.length ? stationRooms : undefined,
+    wardId: [...new Set([fromWardId, toWardId])],
+  });
   res.json(result);
 }));
 
@@ -282,12 +344,18 @@ router.post("/transfer", asyncH(async (req, res) => {
 router.post("/:admissionId/move-to-lounge", asyncH(async (req, res) => {
   if (req.user!.role !== "PRE") throw new HttpError(403, "Only PRE can move a bed to the Discharge Lounge");
   const admissionId = Number(req.params.admissionId);
-  const fromWardId = await assertAdmissionAccess(req.user!.id, req.user!.role, admissionId);
+  const fromWardId = await assertAdmissionAccess(req.user!, admissionId);
   const { bedId: fromBedId } = await admissionWard(admissionId);
 
   const result = await moveToDischargeLounge({ admissionId, fromBedId, userId: req.user!.id });
   emitUpdate("discharge:update", { type: "lounge_move", ...result, fromWardId }, await fanout(fromWardId));
   res.json(result);
+}));
+
+// ── Phase SLA config (readable by everyone, so each app can label its own
+//    phases and show the expected duration; COO edits it via /manager) ────────
+router.get("/phase-config", asyncH(async (_req, res) => {
+  res.json({ phases: await listPhaseConfig() });
 }));
 
 export default router;

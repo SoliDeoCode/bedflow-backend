@@ -10,6 +10,19 @@ function isUniqueViolation(err: unknown): boolean {
   return /unique/i.test(String((err as { message?: string })?.message ?? ""));
 }
 
+const ROLE_LABEL: Record<string, string> = {
+  PRE: "PRE", NURSE: "Nurse", COO: "Admin", DOCTOR: "Doctor", FC: "FC", CONSULTANT: "Consultant",
+};
+
+async function guardUniqueUsername(username: string) {
+  const existing = await db.prepare("SELECT role FROM users WHERE username=?")
+    .get<{ role: string }>(username);
+  if (existing) {
+    const label = ROLE_LABEL[existing.role] || existing.role;
+    throw new HttpError(409, `Username "${username}" is already in use by a ${label} account.`);
+  }
+}
+
 // Format a list of names for a user-facing message: "A", "A" and "B",
 // "A", "B" and "C" (caps the list so the message stays readable).
 function quoteList(names: string[], max = 4): string {
@@ -115,8 +128,7 @@ export async function listFloors() {
             bb.name AS block_name, bb.label AS block_label,
             (SELECT COUNT(*)::int FROM wards w WHERE w.floor_id = f.id) AS ward_count,
             (SELECT id   FROM users u WHERE u.floor_id = f.id AND u.role = 'PRE' LIMIT 1) AS pre_user_id,
-            (SELECT name FROM users u WHERE u.floor_id = f.id AND u.role = 'PRE' LIMIT 1) AS pre_user_name,
-            (SELECT shift FROM users u WHERE u.floor_id = f.id AND u.role = 'PRE' LIMIT 1) AS pre_user_shift
+            (SELECT name FROM users u WHERE u.floor_id = f.id AND u.role = 'PRE' LIMIT 1) AS pre_user_name
      FROM floors f
      LEFT JOIN building_blocks bb ON bb.id = f.building_block_id
      ORDER BY bb.sort_order, bb.name, f.sort_order, f.name`
@@ -417,13 +429,12 @@ export async function deleteWard(wardId: number, managerId: number) {
 
 export async function createPre(opts: {
   username: string; password: string; name: string;
-  preBlockIds?: number[]; shift?: "morning" | "night"; managerId: number;
+  preBlockIds?: number[]; managerId: number;
 }) {
   const username = opts.username.trim().toLowerCase();
   if (!/^[a-z0-9_]+$/.test(username))
     throw new HttpError(400, "Username can only contain letters, numbers, and underscores — no spaces or special characters.");
-  if (await db.prepare("SELECT 1 FROM users WHERE username=?").get(username))
-    throw new HttpError(409, "Username already taken");
+  await guardUniqueUsername(username);
 
   const blockIds = opts.preBlockIds ?? [];
   for (const pbId of blockIds) {
@@ -432,10 +443,9 @@ export async function createPre(opts: {
   }
 
   const t = now();
-  const shift = opts.shift || "morning";
   const r = await db.prepare(
-    "INSERT INTO users (username,password_hash,role,name,shift,created_at,updated_at) VALUES (?,?,?,?,?,?,?) RETURNING id"
-  ).run(username, bcrypt.hashSync(opts.password, 10), "PRE", opts.name, shift, t, t);
+    "INSERT INTO users (username,password_hash,role,name,created_at,updated_at) VALUES (?,?,?,?,?,?) RETURNING id"
+  ).run(username, bcrypt.hashSync(opts.password, 10), "PRE", opts.name, t, t);
   const userId = Number(r.lastInsertRowid);
 
   for (const pbId of blockIds)
@@ -448,13 +458,13 @@ export async function createPre(opts: {
           .then(r => r?.name ?? String(id))
       ))).join(", ")
     : "unassigned";
-  await audit(opts.managerId, "pre_create", blockNames, { username, name: opts.name, shift });
+  await audit(opts.managerId, "pre_create", blockNames, { username, name: opts.name });
   return { ok: true, id: userId, username };
 }
 
 export async function editPre(opts: {
   userId: number; name?: string; password?: string;
-  shift?: "morning" | "night"; preBlockIds?: number[]; managerId: number;
+  preBlockIds?: number[]; managerId: number;
 }) {
   const user = await db.prepare("SELECT id, role FROM users WHERE id=?")
     .get<{id: number; role: string}>(opts.userId);
@@ -474,8 +484,6 @@ export async function editPre(opts: {
     if (opts.password)
       await db.prepare("UPDATE users SET password_hash=?, updated_at=? WHERE id=?")
         .run(bcrypt.hashSync(opts.password, 10), t, opts.userId);
-    if (opts.shift)
-      await db.prepare("UPDATE users SET shift=?, updated_at=? WHERE id=?").run(opts.shift, t, opts.userId);
     if (opts.preBlockIds !== undefined) {
       await db.prepare("DELETE FROM user_pre_blocks WHERE user_id=?").run(opts.userId);
       for (const pbId of opts.preBlockIds)
@@ -485,15 +493,6 @@ export async function editPre(opts: {
   });
   await audit(opts.managerId, "pre_edit", null, { userId: opts.userId });
   return { ok: true };
-}
-
-export async function setPreShift(userId: number, shift: "morning" | "night", managerId: number) {
-  const user = await db.prepare("SELECT id,role FROM users WHERE id=?")
-    .get<{id: number; role: string}>(userId);
-  if (!user || user.role !== "PRE") throw new HttpError(404, "PRE user not found.");
-  await db.prepare("UPDATE users SET shift=?,updated_at=? WHERE id=?").run(shift, now(), userId);
-  await audit(managerId, "pre_shift", null, { userId, shift });
-  return { ok: true, shift };
 }
 
 export async function deletePre(userId: number, managerId: number) {
@@ -543,8 +542,7 @@ export async function createNurse(opts: {
   const username = opts.username.trim().toLowerCase();
   if (!/^[a-z0-9_]+$/.test(username))
     throw new HttpError(400, "Username can only contain letters, numbers, and underscores — no spaces or special characters.");
-  if (await db.prepare("SELECT 1 FROM users WHERE username=?").get(username))
-    throw new HttpError(409, "Username already taken");
+  await guardUniqueUsername(username);
 
   const stationIds = [...new Set(opts.stationIds ?? [])];
   const nameById = await validateStationIds(stationIds);
@@ -556,11 +554,11 @@ export async function createNurse(opts: {
   await db.transaction(async () => {
     const r = await db.prepare(
       `INSERT INTO users
-         (username,password_hash,role,name,shift,nursing_station,station_id,
+         (username,password_hash,role,name,nursing_station,station_id,
           employee_id,phone,email,created_at,updated_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id`
+       VALUES (?,?,?,?,?,?,?,?,?,?,?) RETURNING id`
     ).run(username, bcrypt.hashSync(opts.password, 10), "NURSE", opts.name.trim(),
-          "morning", primaryName, primaryId,
+          primaryName, primaryId,
           opts.employeeId?.trim() || null, opts.phone?.trim() || null, opts.email?.trim() || null,
           t, t);
     nurseId = Number(r.lastInsertRowid);
@@ -670,16 +668,15 @@ export async function createDoctor(opts: {
   const username = opts.username.trim().toLowerCase();
   if (!/^[a-z0-9_]+$/.test(username))
     throw new HttpError(400, "Username can only contain letters, numbers, and underscores — no spaces or special characters.");
-  if (await db.prepare("SELECT 1 FROM users WHERE username=?").get(username))
-    throw new HttpError(409, "Username already taken");
+  await guardUniqueUsername(username);
 
   const t = now();
   const status = opts.status ?? "active";
   const r = await db.prepare(
-    `INSERT INTO users (username,password_hash,role,name,shift,status,remarks,created_at,updated_at)
-     VALUES (?,?,?,?,?,?,?,?,?) RETURNING id`
+    `INSERT INTO users (username,password_hash,role,name,status,remarks,created_at,updated_at)
+     VALUES (?,?,?,?,?,?,?,?) RETURNING id`
   ).run(username, bcrypt.hashSync(opts.password, 10), "DOCTOR", opts.name.trim(),
-        "morning", status, opts.remarks?.trim() || null, t, t);
+        status, opts.remarks?.trim() || null, t, t);
   await audit(opts.adminId, "doctor_create", username, { name: opts.name, status });
   return { ok: true, id: Number(r.lastInsertRowid), username };
 }
@@ -856,9 +853,10 @@ export async function deleteNursingStation(stationId: number, managerId: number)
 export async function availableDates(): Promise<string[]> {
   // Postgres rejects DISTINCT + ORDER BY on a non-selected column; round_key
   // dates are YYYY-MM-DD so sorting them directly gives newest-first.
+  // round_key format is "block|date|startMin" (no shift segment).
   const [roundRows, censusRows] = await Promise.all([
     db.prepare(
-      "SELECT DISTINCT SPLIT_PART(round_key, '|', 3) AS date FROM pre_rounds WHERE round_key LIKE '%|%|%|%'"
+      "SELECT DISTINCT SPLIT_PART(round_key, '|', 2) AS date FROM pre_rounds WHERE round_key LIKE '%|%|%'"
     ).all<{ date: string }>(),
     db.prepare("SELECT census_date FROM midnight_census").all<{ census_date: string }>(),
   ]);
@@ -882,7 +880,7 @@ export async function historyForDate(date: string, preBlockId?: number) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) throw new HttpError(400, "Invalid date format. Use YYYY-MM-DD.");
   let sql =
     `SELECT pr.pre_block_id, pb.name AS block_name,
-            pr.shift, pr.start_min AS "startMin", pr.submitted_at AS "submittedAt", pr.snapshot
+            pr.start_min AS "startMin", pr.submitted_at AS "submittedAt", pr.snapshot
      FROM pre_rounds pr
      LEFT JOIN pre_blocks pb ON pb.id = pr.pre_block_id
      WHERE pr.round_key LIKE ?`;
@@ -892,7 +890,7 @@ export async function historyForDate(date: string, preBlockId?: number) {
 
   const rows = await db.prepare(sql).all<{
     pre_block_id: number; block_name: string | null;
-    shift: string; startMin: number; submittedAt: number; snapshot: string;
+    startMin: number; submittedAt: number; snapshot: string;
   }>(...params);
 
   return rows.map(r => ({
@@ -901,7 +899,6 @@ export async function historyForDate(date: string, preBlockId?: number) {
     floorCode:  r.block_name || `PB${r.pre_block_id}`,
     blockName:  r.block_name,
     floorName:  r.block_name || `PRE Block ${r.pre_block_id}`,
-    shift:      r.shift,
     submittedAt: r.submittedAt,
     startMin:   r.startMin,
     wards: (() => { try { return JSON.parse(r.snapshot || "[]"); } catch { return []; } })(),

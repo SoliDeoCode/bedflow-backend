@@ -8,7 +8,6 @@ const router = Router();
 const loginSchema = z.object({
   username: z.string().min(1, "Please enter your username."),
   password: z.string().min(1, "Please enter your password."),
-  role: z.enum(["PRE", "COO", "NURSE", "DOCTOR", "FC"]).optional(),
 });
 
 router.post("/login", asyncH(async (req, res) => {
@@ -22,9 +21,9 @@ router.post("/login", asyncH(async (req, res) => {
     }
     throw e;
   }
-  const { username, password, role } = body;
+  const { username, password } = body;
   try {
-    const result = await login(username, password, role);
+    const result = await login(username, password);
     await audit(result.user.id, "login", "user", { username });
     res.json(result);
   } catch (e) {
