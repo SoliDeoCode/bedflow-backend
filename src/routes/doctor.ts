@@ -3,6 +3,7 @@ import { z } from "zod";
 import { authRequired, requireRole } from "../middleware/auth.js";
 import { asyncH, HttpError } from "../middleware/error.js";
 import { listBeds, updateBedStatus } from "../services/bedDetailService.js";
+import { allWardsLive, allBedDetailsLive, adminDashboard, adminDashboardHistory, consultantsLive } from "../services/bedService.js";
 import { listPayerTypes } from "../services/payerTypeService.js";
 import { listDestinations } from "../services/destinationService.js";
 import { audit } from "../services/auditService.js";
@@ -46,6 +47,40 @@ async function fanoutRooms(wardId: number) {
     stationId: ward?.station_id ?? undefined,
   };
 }
+
+// ── Hospital-wide dashboard (read-only, mirrors /pre/* equivalents) ───────────
+// Doctors see the same hospital-wide Admin dashboard as PRE and COO.
+// Every *write* path still enforces doctor-block membership below.
+
+router.get("/live-wards", asyncH(async (_req, res) => {
+  res.json(await allWardsLive());
+}));
+
+router.get("/bed-details", asyncH(async (_req, res) => {
+  res.json(await allBedDetailsLive());
+}));
+
+router.get("/admin-dashboard", asyncH(async (req, res) => {
+  const unit = typeof req.query.unit === "string" ? req.query.unit : null;
+  res.json(await adminDashboard(unit));
+}));
+
+router.get("/admin-dashboard-history", asyncH(async (req, res) => {
+  const unit = typeof req.query.unit === "string" ? req.query.unit : null;
+  res.json({ snapshots: await adminDashboardHistory(48, unit) });
+}));
+
+router.get("/consultants", asyncH(async (_req, res) => {
+  res.json(await consultantsLive());
+}));
+
+router.get("/snapshots", asyncH(async (_req, res) => {
+  const rows = await db.prepare(
+    "SELECT ts,total,vacant,reserved,occupied,payer_snapshot FROM occupancy_snapshots ORDER BY ts DESC LIMIT 48"
+  ).all<{ ts: number; total: number; vacant: number; reserved: number; occupied: number; payer_snapshot: Record<string, number> | null }>();
+  const snapshots = rows.reverse().map((r) => ({ ...r, payers: r.payer_snapshot || {} }));
+  res.json({ snapshots });
+}));
 
 // ── Dashboard / blocks ────────────────────────────────────────────────────────
 

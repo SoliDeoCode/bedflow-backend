@@ -5,7 +5,7 @@ import { asyncH, HttpError } from "../middleware/error.js";
 import { listBeds, updateBedStatus } from "../services/bedDetailService.js";
 import { listPayerTypes } from "../services/payerTypeService.js";
 import { listDestinations } from "../services/destinationService.js";
-import { allWardsLive, allBedDetailsLive, adminDashboard } from "../services/bedService.js";
+import { allWardsLive, allBedDetailsLive, adminDashboard, adminDashboardHistory, consultantsLive } from "../services/bedService.js";
 import { emitUpdate } from "../websocket/io.js";
 import { audit } from "../services/auditService.js";
 import { db } from "../db/index.js";
@@ -328,6 +328,78 @@ router.patch("/beds/:id/status", asyncH(async (req, res) => {
     pre: preBlockRow ? String(preBlockRow.pre_block_id) : undefined,
   });
   res.json(result);
+}));
+
+// ── Hospital-wide dashboard (read-only) — same full-hospital view as PRE/COO ──
+router.get("/hospital/live-wards", asyncH(async (_req, res) => {
+  res.json(await allWardsLive());
+}));
+
+router.get("/hospital/bed-details", asyncH(async (_req, res) => {
+  res.json(await allBedDetailsLive());
+}));
+
+router.get("/hospital/admin-dashboard", asyncH(async (req, res) => {
+  const unit = typeof req.query.unit === "string" ? req.query.unit : null;
+  res.json(await adminDashboard(unit));
+}));
+
+router.get("/hospital/admin-dashboard-history", asyncH(async (req, res) => {
+  const unit = typeof req.query.unit === "string" ? req.query.unit : null;
+  res.json({ snapshots: await adminDashboardHistory(48, unit) });
+}));
+
+router.get("/hospital/consultants", asyncH(async (_req, res) => {
+  res.json(await consultantsLive());
+}));
+
+router.get("/hospital/snapshots", asyncH(async (_req, res) => {
+  const rows = await db.prepare(
+    "SELECT ts,total,vacant,reserved,occupied,payer_snapshot FROM occupancy_snapshots ORDER BY ts DESC LIMIT 48"
+  ).all<{ ts: number; total: number; vacant: number; reserved: number; occupied: number; payer_snapshot: Record<string, number> | null }>();
+  const snapshots = rows.reverse().map((r) => ({ ...r, payers: r.payer_snapshot || {} }));
+  res.json({ snapshots });
+}));
+
+// ── Overstay alerts scoped to this nurse's stations ──────────────────────────
+router.get("/overstay", asyncH(async (req, res) => {
+  const stations    = await getMyStations(req);
+  const stationIds  = stations.map(s => s.id);
+  const IST         = 5.5 * 3600 * 1000;
+  const todayIST    = new Date(Date.now() + IST).toISOString().slice(0, 10);
+
+  const rows = await db.prepare(`
+    SELECT
+      pa.id                                                          AS admission_id,
+      pa.ip_last6,
+      pa.admitted_at,
+      COALESCE(dm.name, pa.consultant_name, 'Unknown')              AS doctor,
+      w.name                                                         AS ward,
+      bd.bed_name                                                    AS bed,
+      dt.planned_date,
+      dt.status                                                      AS discharge_status,
+      (CURRENT_DATE - dt.planned_date::date)                        AS days_overdue
+    FROM patient_admissions pa
+    JOIN discharge_tracking dt ON dt.admission_id = pa.id
+    JOIN wards w ON w.id = pa.ward_id
+    JOIN bed_details bd ON bd.id = pa.bed_id
+    LEFT JOIN doctors_master dm ON dm.id = pa.doctor_id
+    WHERE pa.status = 'ACTIVE'
+      AND w.station_id = ANY(?)
+      AND dt.status NOT IN ('COMPLETED', 'CANCELLED')
+      AND dt.planned_date < ?
+    ORDER BY days_overdue DESC, pa.admitted_at ASC
+  `).all<{
+    admission_id: number; ip_last6: string; admitted_at: number;
+    doctor: string; ward: string; bed: string;
+    planned_date: string; discharge_status: string; days_overdue: number;
+  }>(stationIds, todayIST);
+
+  const total = rows.length;
+  const tier1 = rows.filter(r => Number(r.days_overdue) === 1).length;
+  const tier2 = rows.filter(r => Number(r.days_overdue) >= 2 && Number(r.days_overdue) <= 3).length;
+  const tier3 = rows.filter(r => Number(r.days_overdue) >= 4).length;
+  res.json({ total, tier1, tier2, tier3, rows });
 }));
 
 export default router;

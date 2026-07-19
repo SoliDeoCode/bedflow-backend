@@ -300,4 +300,52 @@ router.patch("/beds/:id/admission", asyncH(async (req, res) => {
   res.json({ ok: true });
 }));
 
+// ── Overstay alerts scoped to this PRE user's blocks ─────────────────────────
+router.get("/overstay", asyncH(async (req, res) => {
+  const blocks   = await myPreBlocks(req);
+  const blockIds = blocks.map(b => b.id);
+  const IST      = 5.5 * 3600 * 1000;
+  const todayIST = new Date(Date.now() + IST).toISOString().slice(0, 10);
+
+  const wardRows = await db.prepare(
+    `SELECT ward_id FROM pre_block_wards WHERE pre_block_id = ANY(?)`
+  ).all<{ ward_id: number }>(blockIds);
+  const wardIds = wardRows.map(r => r.ward_id);
+
+  if (wardIds.length === 0) return res.json({ total: 0, tier1: 0, tier2: 0, tier3: 0, rows: [] });
+
+  const rows = await db.prepare(`
+    SELECT
+      pa.id                                                          AS admission_id,
+      pa.ip_last6,
+      pa.admitted_at,
+      COALESCE(dm.name, pa.consultant_name, 'Unknown')              AS doctor,
+      w.name                                                         AS ward,
+      bd.bed_name                                                    AS bed,
+      dt.planned_date,
+      dt.status                                                      AS discharge_status,
+      (CURRENT_DATE - dt.planned_date::date)                        AS days_overdue
+    FROM patient_admissions pa
+    JOIN discharge_tracking dt ON dt.admission_id = pa.id
+    JOIN wards w ON w.id = pa.ward_id
+    JOIN bed_details bd ON bd.id = pa.bed_id
+    LEFT JOIN doctors_master dm ON dm.id = pa.doctor_id
+    WHERE pa.status = 'ACTIVE'
+      AND pa.ward_id = ANY(?)
+      AND dt.status NOT IN ('COMPLETED', 'CANCELLED')
+      AND dt.planned_date < ?
+    ORDER BY days_overdue DESC, pa.admitted_at ASC
+  `).all<{
+    admission_id: number; ip_last6: string; admitted_at: number;
+    doctor: string; ward: string; bed: string;
+    planned_date: string; discharge_status: string; days_overdue: number;
+  }>(wardIds, todayIST);
+
+  const total = rows.length;
+  const tier1 = rows.filter(r => Number(r.days_overdue) === 1).length;
+  const tier2 = rows.filter(r => Number(r.days_overdue) >= 2 && Number(r.days_overdue) <= 3).length;
+  const tier3 = rows.filter(r => Number(r.days_overdue) >= 4).length;
+  res.json({ total, tier1, tier2, tier3, rows });
+}));
+
 export default router;

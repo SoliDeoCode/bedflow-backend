@@ -16,6 +16,7 @@ export interface DischargeTracking {
   prompted_at: number | null;
   initiated_at: number | null;
   discharge_summary_status: string;
+  discharge_doc_status: string;
   drug_return_status: string;
   pharmacy_clearance_status: string;
   procedure_reconciliation_status: string;
@@ -32,11 +33,12 @@ export interface DischargeTracking {
 }
 
 export type StepKey =
-  | "DISCHARGE_SUMMARY" | "DRUG_RETURN" | "PHARMACY_CLEARANCE" | "PROCEDURE_RECONCILIATION"
+  | "DISCHARGE_SUMMARY" | "DISCHARGE_DOC" | "DRUG_RETURN" | "PHARMACY_CLEARANCE" | "PROCEDURE_RECONCILIATION"
   | "BILLING_STARTED" | "AUDIT" | "BILL_READY" | "PAYMENT" | "SYSTEM_CHECKOUT" | "PHYSICAL_CHECKOUT";
 
 const STEP_COLUMN: Record<StepKey, string> = {
   DISCHARGE_SUMMARY: "discharge_summary_status",
+  DISCHARGE_DOC: "discharge_doc_status",
   DRUG_RETURN: "drug_return_status",
   PHARMACY_CLEARANCE: "pharmacy_clearance_status",
   PROCEDURE_RECONCILIATION: "procedure_reconciliation_status",
@@ -53,6 +55,7 @@ const STEP_COLUMN: Record<StepKey, string> = {
 // ordering here, only who is allowed to touch a given step.
 export const STEP_PERMISSIONS: Record<StepKey, Role[]> = {
   DISCHARGE_SUMMARY: ["DOCTOR", "CONSULTANT"],
+  DISCHARGE_DOC: ["DOCTOR", "CONSULTANT"],
   DRUG_RETURN: ["PRE", "NURSE"],
   PHARMACY_CLEARANCE: ["PRE", "NURSE"],
   PROCEDURE_RECONCILIATION: ["PRE"],
@@ -65,7 +68,8 @@ export const STEP_PERMISSIONS: Record<StepKey, Role[]> = {
 };
 
 const STEP_LABELS: Record<StepKey, string> = {
-  DISCHARGE_SUMMARY: "Discharge Summary",
+  DISCHARGE_SUMMARY: "Discharge Initiate",
+  DISCHARGE_DOC: "Discharge Summary",
   DRUG_RETURN: "Drug Return",
   PHARMACY_CLEARANCE: "Pharmacy Clearance",
   PROCEDURE_RECONCILIATION: "Procedure Reconciliation",
@@ -80,12 +84,13 @@ const STEP_LABELS: Record<StepKey, string> = {
 // Every step System Checkout must wait on — everything except itself and Physical
 // Checkout (which happens after/parallel to it, not before it).
 const PRE_SYSTEM_CHECKOUT_STEPS: StepKey[] = [
-  "DISCHARGE_SUMMARY", "DRUG_RETURN", "PHARMACY_CLEARANCE", "PROCEDURE_RECONCILIATION",
+  "DISCHARGE_SUMMARY", "DISCHARGE_DOC", "DRUG_RETURN", "PHARMACY_CLEARANCE", "PROCEDURE_RECONCILIATION",
   "BILLING_STARTED", "AUDIT", "BILL_READY", "PAYMENT",
 ];
 
 const STEP_VALUES: Record<StepKey, string[]> = {
   DISCHARGE_SUMMARY: ["PENDING", "COMPLETED"],
+  DISCHARGE_DOC: ["PENDING", "COMPLETED"],
   DRUG_RETURN: ["PENDING", "COMPLETED"],
   PHARMACY_CLEARANCE: ["PENDING", "COMPLETED"],
   PROCEDURE_RECONCILIATION: ["PENDING", "COMPLETED", "NOT_APPLICABLE"],
@@ -170,7 +175,7 @@ export async function listActiveDischarges(wardIds: number[] | null, consultantN
 
   return db.prepare(`
     SELECT dt.*, pa.id AS admission_id, pa.bed_id, pa.ward_id, pa.ip_last6,
-           bd.bed_name, w.name AS ward_name
+           bd.bed_name, bd.payer_type, w.name AS ward_name
     FROM discharge_tracking dt
     JOIN patient_admissions pa ON pa.id = dt.admission_id
     JOIN bed_details bd ON bd.id = pa.bed_id
@@ -282,12 +287,23 @@ export async function initiateDischarge(opts: { admissionId: number; userId: num
     throw new HttpError(409, `Cannot start — discharge is already ${tracking.status}`);
 
   const now = Date.now();
+
+  // Snapshot payer_type from the bed at initiation time — after discharge the
+  // bed is vacated and bed_details.payer_type is cleared to NULL, so we need
+  // to capture it now while the patient is still in the bed.
+  const admRow = await db.prepare(
+    `SELECT bd.payer_type FROM patient_admissions pa
+     JOIN bed_details bd ON bd.id = pa.bed_id
+     WHERE pa.id = ?`
+  ).get<{ payer_type: string | null }>(opts.admissionId);
+  const payerType = admRow?.payer_type ?? null;
+
   // Starting the discharge opens every group-leading phase at once — that start
   // stamp is what the SLA deadline and ETA are measured from.
   const { sql: startSql, params: startParams } = initialStartSql(now);
   await db.prepare(
-    `UPDATE discharge_tracking SET status='DISCHARGE_INITIATED', initiated_at=?, ${startSql}, updated_at=? WHERE id=?`
-  ).run(now, ...startParams, now, tracking.id);
+    `UPDATE discharge_tracking SET status='DISCHARGE_INITIATED', initiated_at=?, payer_type=?, ${startSql}, updated_at=? WHERE id=?`
+  ).run(now, payerType, ...startParams, now, tracking.id);
   await logHistory({
     admissionId: opts.admissionId, trackingId: tracking.id, field: "status",
     oldValue: tracking.status, newValue: "DISCHARGE_INITIATED", userId: opts.userId,
@@ -317,7 +333,7 @@ async function resetAndCancelTracking(tracking: DischargeTracking, userId: numbe
   await db.prepare(`
     UPDATE discharge_tracking SET
       status='CANCELLED',
-      discharge_summary_status='PENDING', drug_return_status='PENDING', pharmacy_clearance_status='PENDING',
+      discharge_summary_status='PENDING', discharge_doc_status='PENDING', drug_return_status='PENDING', pharmacy_clearance_status='PENDING',
       procedure_reconciliation_status='PENDING', billing_started_status='PENDING', audit_status='PENDING',
       bill_ready_status='PENDING', payment_status='PENDING', system_checkout_status='PENDING', physical_checkout_status='PENDING',
       ${clearSla},

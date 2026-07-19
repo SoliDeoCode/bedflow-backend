@@ -5,15 +5,15 @@
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
-    "dev": "NODE_ENV=development tsx watch src/index.ts",
+    "dev": "cross-env NODE_ENV=development tsx watch src/index.ts",
     "build": "tsc",
-    "start": "NODE_ENV=production node dist/index.js",
-    "start:dev": "NODE_ENV=development node dist/index.js",
-    "seed": "NODE_ENV=development tsx src/db/seed.ts",
-    "db:migrate": "NODE_ENV=development prisma migrate deploy",
-    "db:migrate:prod": "NODE_ENV=production prisma migrate deploy",
+    "start": "cross-env NODE_ENV=production node dist/index.js",
+    "start:dev": "cross-env NODE_ENV=development node dist/index.js",
+    "seed": "cross-env NODE_ENV=development tsx src/db/seed.ts",
+    "db:migrate": "cross-env NODE_ENV=development prisma migrate deploy",
+    "db:migrate:prod": "cross-env NODE_ENV=production prisma migrate deploy",
     "db:generate": "prisma generate",
-    "db:seed": "NODE_ENV=development tsx src/db/seed.ts",
+    "db:seed": "cross-env NODE_ENV=development tsx src/db/seed.ts",
     "db:studio": "prisma studio"
   },
   "dependencies": {
@@ -38,6 +38,7 @@
     "@types/jsonwebtoken": "^9.0.6",
     "@types/node": "^22.5.0",
     "@types/web-push": "^3.6.4",
+    "cross-env": "^7.0.3",
     "prisma": "^7.8.0",
     "tsx": "^4.19.0",
     "typescript": "^5.5.4"

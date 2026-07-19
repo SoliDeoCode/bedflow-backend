@@ -25,6 +25,7 @@ export interface PhaseConfig {
 /** Parallel groups — mirrors DischargeTab.jsx GROUP_LABELS. */
 export const STEP_GROUP: Record<StepKey, number> = {
   DISCHARGE_SUMMARY: 1,
+  DISCHARGE_DOC: 1,
   DRUG_RETURN: 2,
   PHARMACY_CLEARANCE: 2,
   PROCEDURE_RECONCILIATION: 2,
@@ -38,7 +39,7 @@ export const STEP_GROUP: Record<StepKey, number> = {
 
 /** Phases in group order — the sequence a phase unlocks within its own group. */
 export const GROUP_STEPS: Record<number, StepKey[]> = {
-  1: ["DISCHARGE_SUMMARY"],
+  1: ["DISCHARGE_SUMMARY", "DISCHARGE_DOC"],
   2: ["DRUG_RETURN", "PHARMACY_CLEARANCE", "PROCEDURE_RECONCILIATION"],
   3: ["BILLING_STARTED", "AUDIT", "BILL_READY", "PAYMENT"],
   4: ["SYSTEM_CHECKOUT"],
@@ -58,6 +59,61 @@ export const statusCol    = (k: StepKey) => `${snake(k)}_status`;
 
 let cache: { rows: PhaseConfig[]; at: number } | null = null;
 const CACHE_MS = 30_000;
+
+// ── Payer TAT config ─────────────────────────────────────────────────────────
+
+export interface PayerTatRow {
+  id: number;
+  payer_type: string;
+  phase_key: string | null;
+  target_minutes: number;
+}
+
+let payerCache: { rows: PayerTatRow[]; at: number } | null = null;
+
+export function invalidatePayerTatCache() { payerCache = null; }
+
+export async function listPayerTatConfig(): Promise<PayerTatRow[]> {
+  if (payerCache && Date.now() - payerCache.at < CACHE_MS) return payerCache.rows;
+  const rows = await db.prepare(
+    `SELECT id, payer_type, phase_key, target_minutes FROM payer_tat_config ORDER BY payer_type, phase_key NULLS FIRST`
+  ).all<PayerTatRow>();
+  payerCache = { rows, at: Date.now() };
+  return rows;
+}
+
+/** Splits a flat payer_tat_config list into two lookup maps. */
+export function buildPayerMaps(rows: PayerTatRow[]): {
+  stepOverrides: Map<string, Map<string, number>>;
+  overallTargets: Map<string, number>;
+} {
+  const stepOverrides = new Map<string, Map<string, number>>();
+  const overallTargets = new Map<string, number>();
+  for (const r of rows) {
+    if (r.phase_key === null) {
+      overallTargets.set(r.payer_type, r.target_minutes);
+    } else {
+      if (!stepOverrides.has(r.payer_type)) stepOverrides.set(r.payer_type, new Map());
+      stepOverrides.get(r.payer_type)!.set(r.phase_key, r.target_minutes);
+    }
+  }
+  return { stepOverrides, overallTargets };
+}
+
+/** Returns a new config array with payer-specific step SLA overrides applied. */
+export function applyPayerConfig(
+  config: PhaseConfig[],
+  payerType: string | null,
+  stepOverrides: Map<string, Map<string, number>>,
+): PhaseConfig[] {
+  if (!payerType) return config;
+  const overrides = stepOverrides.get(payerType);
+  if (!overrides || overrides.size === 0) return config;
+  return config.map(c => {
+    const ov = overrides.get(c.phase_key);
+    return ov !== undefined ? { ...c, expected_minutes: ov } : c;
+  });
+}
 
 export function invalidatePhaseConfigCache() { cache = null; }
 
@@ -151,6 +207,10 @@ export interface WorkflowView {
   done: number;
   total: number;
   pct: number;
+  /** Payer type of this admission (from bed_details). Set by decorateMany. */
+  payerType?: string | null;
+  /** Overall TAT benchmark for this payer (minutes). Reporting use only — colours the TAT Leaderboard. */
+  payerTargetMinutes?: number | null;
 }
 
 type TrackingRow = Record<string, unknown> & { status?: string };
@@ -247,11 +307,22 @@ export function withWorkflow<T extends TrackingRow>(row: T, config: PhaseConfig[
   return { ...row, workflow: computeWorkflow(row, config, now) };
 }
 
-/** Decorate a list of rows with one config fetch. */
-export async function decorateMany<T extends TrackingRow>(rows: T[]) {
-  const config = await listPhaseConfig();
+/** Decorate a list of rows with one config fetch, applying per-row payer overrides. */
+export async function decorateMany<T extends TrackingRow & { payer_type?: string | null }>(rows: T[]) {
+  const [config, payerRows] = await Promise.all([listPhaseConfig(), listPayerTatConfig()]);
+  const { stepOverrides, overallTargets } = buildPayerMaps(payerRows);
   const now = Date.now();
-  return rows.map(r => withWorkflow(r, config, now));
+  return rows.map(r => {
+    const pt = (r.payer_type as string | null) ?? null;
+    const effectiveConfig = applyPayerConfig(config, pt, stepOverrides);
+    const wf = computeWorkflow(r, effectiveConfig, now);
+    const workflow: WorkflowView | null = wf ? {
+      ...wf,
+      payerType: pt,
+      payerTargetMinutes: pt ? (overallTargets.get(pt) ?? null) : null,
+    } : null;
+    return { ...r, workflow };
+  });
 }
 
 // ── Phase start bookkeeping ──────────────────────────────────────────────────

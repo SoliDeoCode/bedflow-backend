@@ -3,7 +3,7 @@ import { pushToUser } from "../services/pushService.js";
 import { snapshotOccupancy, snapshotAdminDashboard, captureMidnightCensus } from "../services/bedService.js";
 import { emitUpdate } from "../websocket/io.js";
 import { COO_REMINDERS, hmToMin, minsNow, todayStr, currentRound, roundKey } from "../config/domain.js";
-import { listPhaseConfig, computeWorkflow } from "../services/dischargeSlaService.js";
+import { listPhaseConfig, computeWorkflow, listPayerTatConfig, buildPayerMaps, applyPayerConfig } from "../services/dischargeSlaService.js";
 
 const lastPush = new Map<string, number>();
 const REPUSH_MS = 5 * 60 * 1000;
@@ -101,17 +101,21 @@ async function tick() {
   // re-render. Emit only on the transition into delay: `notifiedDelays` holds the
   // admissions already announced, so a stuck phase doesn't re-fire every 30s.
   {
-    const config = await listPhaseConfig();
+    const [config, payerRows] = await Promise.all([listPhaseConfig(), listPayerTatConfig()]);
+    const { stepOverrides } = buildPayerMaps(payerRows);
     const running = await db.prepare(
-      `SELECT dt.*, pa.ward_id, pa.bed_id, pa.id AS admission_id
+      `SELECT dt.*, pa.ward_id, pa.bed_id, pa.id AS admission_id, bd.payer_type
        FROM discharge_tracking dt
        JOIN patient_admissions pa ON pa.id = dt.admission_id
+       JOIN bed_details bd ON bd.id = pa.bed_id
        WHERE dt.status IN ('DISCHARGE_INITIATED','IN_PROGRESS') AND pa.status='ACTIVE'`
     ).all<Record<string, unknown>>();
 
     const stillDelayed = new Set<number>();
     for (const row of running) {
-      const wf = computeWorkflow(row as never, config, now);
+      const pt = (row.payer_type as string | null) ?? null;
+      const effectiveConfig = applyPayerConfig(config, pt, stepOverrides);
+      const wf = computeWorkflow(row as never, effectiveConfig, now);
       if (!wf || wf.delayed.length === 0) continue;
       const admissionId = Number(row.admission_id);
       stillDelayed.add(admissionId);

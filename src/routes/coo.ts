@@ -483,4 +483,197 @@ router.delete("/views/:id", asyncH(async (req, res) => {
   res.json({ ok: true });
 }));
 
+// ── Discharge TAT Leaderboard ──────────────────────────────────────────────────
+// range: "today" | "7d" | "30d" | "90d"  (default 7d)
+// Returns per-doctor and per-ward leaderboards for completed discharges.
+router.get("/discharge-tat", asyncH(async (req, res) => {
+  const rangeStr = String(req.query.range || "7d");
+  const IST = 5.5 * 3600 * 1000;
+  const nowIST = Date.now() + IST;
+  const startOfTodayIST = Math.floor(nowIST / 86400000) * 86400000 - IST;
+  const rangeMs: Record<string, number> = {
+    today: 0,    // filled below
+    "7d":  6 * 86400000,
+    "30d": 29 * 86400000,
+    "90d": 89 * 86400000,
+  };
+  const since = rangeStr === "today" ? startOfTodayIST : Date.now() - (rangeMs[rangeStr] ?? rangeMs["7d"]);
+
+  const byDoctor = await db.prepare(`
+    SELECT
+      COALESCE(dm.name, pa.consultant_name, 'Unknown') AS name,
+      COUNT(*)::int                                     AS total,
+      ROUND(AVG((dt.updated_at - dt.initiated_at) / 60000.0))::int AS avg_min,
+      ROUND(MIN((dt.updated_at - dt.initiated_at) / 60000.0))::int AS best_min,
+      ROUND(MAX((dt.updated_at - dt.initiated_at) / 60000.0))::int AS worst_min
+    FROM discharge_tracking dt
+    JOIN patient_admissions pa ON pa.id = dt.admission_id
+    LEFT JOIN doctors_master dm ON dm.id = pa.doctor_id
+    WHERE dt.status = 'COMPLETED'
+      AND dt.initiated_at IS NOT NULL
+      AND dt.updated_at >= ?
+    GROUP BY COALESCE(dm.name, pa.consultant_name, 'Unknown')
+    ORDER BY avg_min ASC
+    LIMIT 20
+  `).all<{ name: string; total: number; avg_min: number; best_min: number; worst_min: number }>(since);
+
+  const byWard = await db.prepare(`
+    SELECT
+      w.name                                            AS name,
+      COUNT(*)::int                                     AS total,
+      ROUND(AVG((dt.updated_at - dt.initiated_at) / 60000.0))::int AS avg_min,
+      ROUND(MIN((dt.updated_at - dt.initiated_at) / 60000.0))::int AS best_min,
+      ROUND(MAX((dt.updated_at - dt.initiated_at) / 60000.0))::int AS worst_min
+    FROM discharge_tracking dt
+    JOIN patient_admissions pa ON pa.id = dt.admission_id
+    JOIN wards w ON w.id = pa.ward_id
+    WHERE dt.status = 'COMPLETED'
+      AND dt.initiated_at IS NOT NULL
+      AND dt.updated_at >= ?
+    GROUP BY w.name
+    ORDER BY avg_min ASC
+    LIMIT 20
+  `).all<{ name: string; total: number; avg_min: number; best_min: number; worst_min: number }>(since);
+
+  const byPayer = await db.prepare(`
+    SELECT
+      COALESCE(dt.payer_type, 'Unknown')               AS payer_type,
+      COUNT(*)::int                                     AS total,
+      ROUND(AVG((dt.updated_at - dt.initiated_at) / 60000.0))::int AS avg_min,
+      ROUND(MIN((dt.updated_at - dt.initiated_at) / 60000.0))::int AS best_min,
+      ROUND(MAX((dt.updated_at - dt.initiated_at) / 60000.0))::int AS worst_min
+    FROM discharge_tracking dt
+    WHERE dt.status = 'COMPLETED'
+      AND dt.initiated_at IS NOT NULL
+      AND dt.updated_at >= ?
+    GROUP BY COALESCE(dt.payer_type, 'Unknown')
+    ORDER BY payer_type ASC
+  `).all<{ payer_type: string; total: number; avg_min: number; best_min: number; worst_min: number }>(since);
+
+  const targetRows = await db.prepare(
+    `SELECT payer_type, target_minutes FROM payer_tat_config WHERE phase_key IS NULL ORDER BY payer_type`
+  ).all<{ payer_type: string; target_minutes: number }>();
+  const targets = Object.fromEntries(targetRows.map(t => [t.payer_type, t.target_minutes]));
+
+  res.json({ range: rangeStr, since, byDoctor, byWard, byPayer, targets });
+}));
+
+// ── Payer TAT drill-down ───────────────────────────────────────────────────────
+// Per-doctor and per-ward breakdown scoped to one payer type.
+router.get("/discharge-tat-payer", asyncH(async (req, res) => {
+  const rangeStr = String(req.query.range || "7d");
+  const payerType = String(req.query.payer || "");
+  if (!payerType) throw new HttpError(400, "payer query param required");
+
+  const IST = 5.5 * 3600 * 1000;
+  const nowIST = Date.now() + IST;
+  const startOfTodayIST = Math.floor(nowIST / 86400000) * 86400000 - IST;
+  const rangeMs: Record<string, number> = {
+    today: 0,
+    "7d":  6 * 86400000,
+    "30d": 29 * 86400000,
+    "90d": 89 * 86400000,
+  };
+  const since = rangeStr === "today" ? startOfTodayIST : Date.now() - (rangeMs[rangeStr] ?? rangeMs["7d"]);
+
+  const [byDoctor, byWard, summary] = await Promise.all([
+    db.prepare(`
+      SELECT COALESCE(dm.name, pa.consultant_name, 'Unknown') AS name,
+        COUNT(*)::int AS total,
+        ROUND(AVG((dt.updated_at - dt.initiated_at) / 60000.0))::int AS avg_min,
+        ROUND(MIN((dt.updated_at - dt.initiated_at) / 60000.0))::int AS best_min,
+        ROUND(MAX((dt.updated_at - dt.initiated_at) / 60000.0))::int AS worst_min
+      FROM discharge_tracking dt
+      JOIN patient_admissions pa ON pa.id = dt.admission_id
+      LEFT JOIN doctors_master dm ON dm.id = pa.doctor_id
+      WHERE dt.status = 'COMPLETED'
+        AND dt.initiated_at IS NOT NULL
+        AND dt.updated_at >= ?
+        AND COALESCE(dt.payer_type, 'Unknown') = ?
+      GROUP BY COALESCE(dm.name, pa.consultant_name, 'Unknown')
+      ORDER BY avg_min ASC LIMIT 20
+    `).all<{ name: string; total: number; avg_min: number; best_min: number; worst_min: number }>(since, payerType),
+
+    db.prepare(`
+      SELECT w.name AS name,
+        COUNT(*)::int AS total,
+        ROUND(AVG((dt.updated_at - dt.initiated_at) / 60000.0))::int AS avg_min,
+        ROUND(MIN((dt.updated_at - dt.initiated_at) / 60000.0))::int AS best_min,
+        ROUND(MAX((dt.updated_at - dt.initiated_at) / 60000.0))::int AS worst_min
+      FROM discharge_tracking dt
+      JOIN patient_admissions pa ON pa.id = dt.admission_id
+      JOIN wards w ON w.id = pa.ward_id
+      WHERE dt.status = 'COMPLETED'
+        AND dt.initiated_at IS NOT NULL
+        AND dt.updated_at >= ?
+        AND COALESCE(dt.payer_type, 'Unknown') = ?
+      GROUP BY w.name ORDER BY avg_min ASC LIMIT 20
+    `).all<{ name: string; total: number; avg_min: number; best_min: number; worst_min: number }>(since, payerType),
+
+    db.prepare(`
+      SELECT COUNT(*)::int AS total,
+        ROUND(AVG((dt.updated_at - dt.initiated_at) / 60000.0))::int AS avg_min,
+        ROUND(MIN((dt.updated_at - dt.initiated_at) / 60000.0))::int AS best_min,
+        ROUND(MAX((dt.updated_at - dt.initiated_at) / 60000.0))::int AS worst_min
+      FROM discharge_tracking dt
+      WHERE dt.status = 'COMPLETED'
+        AND dt.initiated_at IS NOT NULL
+        AND dt.updated_at >= ?
+        AND COALESCE(dt.payer_type, 'Unknown') = ?
+    `).get<{ total: number; avg_min: number; best_min: number; worst_min: number }>(since, payerType),
+  ]);
+
+  const targetRow = await db.prepare(
+    "SELECT target_minutes FROM payer_tat_config WHERE payer_type=? AND phase_key IS NULL"
+  ).get<{ target_minutes: number }>(payerType);
+
+  res.json({
+    payerType, range: rangeStr, since,
+    summary: summary ?? { total: 0, avg_min: null, best_min: null, worst_min: null },
+    targetMinutes: targetRow?.target_minutes ?? null,
+    byDoctor, byWard,
+  });
+}));
+
+// ── Overstay Alert Panel ───────────────────────────────────────────────────────
+// Returns active patients whose planned_date is in the past and discharge
+// is not yet completed or cancelled.
+router.get("/overstay", asyncH(async (_req, res) => {
+  const IST = 5.5 * 3600 * 1000;
+  const todayIST = new Date(Date.now() + IST).toISOString().slice(0, 10);
+
+  const rows = await db.prepare(`
+    SELECT
+      pa.id                                                          AS admission_id,
+      pa.ip_last6,
+      pa.admitted_at,
+      COALESCE(dm.name, pa.consultant_name, 'Unknown')              AS doctor,
+      w.name                                                         AS ward,
+      bd.bed_name                                                    AS bed,
+      dt.planned_date,
+      dt.status                                                      AS discharge_status,
+      (CURRENT_DATE - dt.planned_date::date)                        AS days_overdue
+    FROM patient_admissions pa
+    JOIN discharge_tracking dt ON dt.admission_id = pa.id
+    JOIN wards w ON w.id = pa.ward_id
+    JOIN bed_details bd ON bd.id = pa.bed_id
+    LEFT JOIN doctors_master dm ON dm.id = pa.doctor_id
+    WHERE pa.status = 'ACTIVE'
+      AND dt.status NOT IN ('COMPLETED', 'CANCELLED')
+      AND dt.planned_date < ?
+    ORDER BY days_overdue DESC, pa.admitted_at ASC
+  `).all<{
+    admission_id: number; ip_last6: string; admitted_at: number;
+    doctor: string; ward: string; bed: string;
+    planned_date: string; discharge_status: string; days_overdue: number;
+  }>(todayIST);
+
+  const total = rows.length;
+  const tier1 = rows.filter(r => Number(r.days_overdue) === 1).length;
+  const tier2 = rows.filter(r => Number(r.days_overdue) >= 2 && Number(r.days_overdue) <= 3).length;
+  const tier3 = rows.filter(r => Number(r.days_overdue) >= 4).length;
+
+  res.json({ total, tier1, tier2, tier3, rows });
+}));
+
 export default router;

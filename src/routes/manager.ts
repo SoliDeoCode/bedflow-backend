@@ -28,7 +28,7 @@ import {
   generateBeds, addSingleBed, listBeds, renameBed, deleteBed, updateBedMaster,
 } from "../services/bedDetailService.js";
 import { midnightCensusFor } from "../services/bedService.js";
-import { listPhaseConfig, updatePhaseConfig, reorderPhaseConfig } from "../services/dischargeSlaService.js";
+import { listPhaseConfig, updatePhaseConfig, reorderPhaseConfig, listPayerTatConfig, invalidatePayerTatCache } from "../services/dischargeSlaService.js";
 import {
   listPayerTypes, createPayerType, updatePayerType, reorderPayerType, deletePayerType,
 } from "../services/payerTypeService.js";
@@ -1032,6 +1032,55 @@ router.patch("/discharge-phases/:id/order", asyncH(async (req, res) => {
   const result = await reorderPhaseConfig({ id: Number(req.params.id), direction, userId: req.user!.id });
   emitUpdate("discharge:update", { type: "phase-config" });
   res.json(result);
+}));
+
+// ── Payer TAT config ─────────────────────────────────────────────────────────
+
+router.get("/payer-tat", asyncH(async (_req, res) => {
+  res.json({ rows: await listPayerTatConfig() });
+}));
+
+router.post("/payer-tat", asyncH(async (req, res) => {
+  const { payer_type, phase_key, target_minutes } = z.object({
+    payer_type:     z.string().min(1).max(100),
+    phase_key:      z.string().max(50).nullable().optional().default(null),
+    target_minutes: z.number().int().min(0).max(1440),
+  }).parse(req.body);
+
+  const pk = phase_key ?? null;
+  const existing = pk
+    ? await db.prepare("SELECT id FROM payer_tat_config WHERE payer_type=? AND phase_key=?").get<{ id: number }>(payer_type, pk)
+    : await db.prepare("SELECT id FROM payer_tat_config WHERE payer_type=? AND phase_key IS NULL").get<{ id: number }>(payer_type);
+  if (existing) throw new HttpError(409, "A config already exists for this payer / step combination");
+
+  const now = Date.now();
+  const r = await db.prepare(
+    "INSERT INTO payer_tat_config (payer_type, phase_key, target_minutes, created_at, updated_at) VALUES (?,?,?,?,?) RETURNING id"
+  ).run(payer_type, pk, target_minutes, now, now);
+  invalidatePayerTatCache();
+  res.status(201).json({ ok: true, id: r.lastInsertRowid });
+}));
+
+router.put("/payer-tat/:id", asyncH(async (req, res) => {
+  const id = Number(req.params.id);
+  const { target_minutes } = z.object({
+    target_minutes: z.number().int().min(0).max(1440),
+  }).parse(req.body);
+  const row = await db.prepare("SELECT id FROM payer_tat_config WHERE id=?").get<{ id: number }>(id);
+  if (!row) throw new HttpError(404, "Payer TAT config not found");
+  await db.prepare("UPDATE payer_tat_config SET target_minutes=?, updated_at=? WHERE id=?")
+    .run(target_minutes, Date.now(), id);
+  invalidatePayerTatCache();
+  res.json({ ok: true });
+}));
+
+router.delete("/payer-tat/:id", asyncH(async (req, res) => {
+  const id = Number(req.params.id);
+  const row = await db.prepare("SELECT id FROM payer_tat_config WHERE id=?").get<{ id: number }>(id);
+  if (!row) throw new HttpError(404, "Payer TAT config not found");
+  await db.prepare("DELETE FROM payer_tat_config WHERE id=?").run(id);
+  invalidatePayerTatCache();
+  res.json({ ok: true });
 }));
 
 export default router;
