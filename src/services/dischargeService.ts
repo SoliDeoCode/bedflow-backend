@@ -3,7 +3,7 @@ import { HttpError } from "../middleware/error.js";
 import { audit } from "./auditService.js";
 import { updateBedStatus } from "./bedDetailService.js";
 import { getActiveAdmissionByBed, getAdmissionById, closeAdmission, type PatientAdmission } from "./patientAdmissionService.js";
-import { initialStartSql, nextPhaseToStart, startedCol, completedCol, ALL_STEPS } from "./dischargeSlaService.js";
+import { initialStartSql, nextPhasesToStart, startedCol, completedCol, ALL_STEPS } from "./dischargeSlaService.js";
 import type { Role } from "../types/index.js";
 
 export interface DischargeTracking {
@@ -56,13 +56,13 @@ const STEP_COLUMN: Record<StepKey, string> = {
 export const STEP_PERMISSIONS: Record<StepKey, Role[]> = {
   DISCHARGE_SUMMARY: ["DOCTOR", "CONSULTANT"],
   DISCHARGE_DOC: ["DOCTOR", "CONSULTANT"],
-  DRUG_RETURN: ["PRE", "NURSE"],
-  PHARMACY_CLEARANCE: ["PRE", "NURSE"],
-  PROCEDURE_RECONCILIATION: ["PRE"],
-  BILLING_STARTED: ["PRE"],
-  AUDIT: ["PRE"],
-  BILL_READY: ["FC"],
-  PAYMENT: ["FC"],
+  DRUG_RETURN: ["PRE", "NURSE", "PHARMACY", "MASTER_PHARMACY"],
+  PHARMACY_CLEARANCE: ["PRE", "NURSE", "PHARMACY", "MASTER_PHARMACY"],
+  PROCEDURE_RECONCILIATION: ["PRE", "PHARMACY", "MASTER_PHARMACY"],
+  BILLING_STARTED: ["PRE", "FC", "MASTER_FC"],
+  AUDIT: ["PRE", "FC", "MASTER_FC"],
+  BILL_READY: ["FC", "MASTER_FC"],
+  PAYMENT: ["FC", "MASTER_FC"],
   SYSTEM_CHECKOUT: ["PRE"],
   PHYSICAL_CHECKOUT: ["PRE", "NURSE"],
 };
@@ -189,6 +189,26 @@ export async function listActiveDischarges(wardIds: number[] | null, consultantN
 /** Admissions where the given step is PENDING and the discharge is actually running —
  *  the actionable queue behind FC's Bill Finalized / Payment Status screen (and reusable for any
  *  other role's "what do I need to act on" list). wardIds = null is hospital-wide. */
+export async function listByStepStatus(step: StepKey, status: string, wardIds: number[] | null) {
+  const col = STEP_COLUMN[step];
+  if (!col) throw new HttpError(400, `Unknown discharge step: ${step}`);
+  const allowed = STEP_VALUES[step];
+  if (!allowed.includes(status)) throw new HttpError(400, `Invalid status for ${step}`);
+  const scopeClause = wardIds ? "AND pa.ward_id = ANY(?)" : "";
+  const params: unknown[] = [status, ...(wardIds ? [wardIds] : [])];
+
+  return db.prepare(`
+    SELECT dt.*, pa.id AS admission_id, pa.bed_id, pa.ward_id, pa.ip_last6, bd.bed_name, w.name AS ward_name
+    FROM discharge_tracking dt
+    JOIN patient_admissions pa ON pa.id = dt.admission_id
+    JOIN bed_details bd ON bd.id = pa.bed_id
+    JOIN wards w ON w.id = pa.ward_id
+    WHERE pa.status='ACTIVE' AND dt.status IN ('DISCHARGE_INITIATED','IN_PROGRESS')
+      AND dt.${col} = ? ${scopeClause}
+    ORDER BY dt.updated_at ASC
+  `).all(...params);
+}
+
 export async function listPendingByStep(step: StepKey, wardIds: number[] | null) {
   const col = STEP_COLUMN[step];
   if (!col) throw new HttpError(400, `Unknown discharge step: ${step}`);
@@ -205,6 +225,36 @@ export async function listPendingByStep(step: StepKey, wardIds: number[] | null)
       AND dt.${col} = 'PENDING' ${scopeClause}
     ORDER BY dt.updated_at ASC
   `).all(...params);
+}
+
+export async function listBillingPipeline(wardIds: number[] | null) {
+  const scopeClause = wardIds ? "AND pa.ward_id = ANY(?)" : "";
+  const params: unknown[] = wardIds ? [wardIds] : [];
+
+  const rows = await db.prepare(`
+    SELECT dt.*, pa.id AS admission_id, pa.bed_id, pa.ward_id, pa.ip_last6,
+           bd.bed_name, w.name AS ward_name, pa.admitted_at
+    FROM discharge_tracking dt
+    JOIN patient_admissions pa ON pa.id = dt.admission_id
+    JOIN bed_details bd ON bd.id = pa.bed_id
+    JOIN wards w ON w.id = pa.ward_id
+    WHERE pa.status='ACTIVE' AND dt.status IN ('DISCHARGE_INITIATED','IN_PROGRESS')
+      AND dt.payment_status != 'COMPLETED'
+      ${scopeClause}
+    ORDER BY dt.updated_at ASC
+  `).all(...params);
+
+  const buckets: Record<string, typeof rows> = {
+    BILLING_STARTED: [], AUDIT: [], BILL_READY: [], PAYMENT: [],
+  };
+  for (const r of rows) {
+    const row = r as Record<string, unknown>;
+    if (row.billing_started_status === "PENDING") buckets.BILLING_STARTED.push(r);
+    else if (row.audit_status === "PENDING") buckets.AUDIT.push(r);
+    else if (row.bill_ready_status === "PENDING") buckets.BILL_READY.push(r);
+    else if (row.payment_status === "PENDING") buckets.PAYMENT.push(r);
+  }
+  return buckets;
 }
 
 export async function planDischarge(opts: {
@@ -300,10 +350,16 @@ export async function initiateDischarge(opts: { admissionId: number; userId: num
 
   // Starting the discharge opens every group-leading phase at once — that start
   // stamp is what the SLA deadline and ETA are measured from.
+  // DISCHARGE_SUMMARY is auto-completed at initiation — the "Initiate Now"
+  // action IS the discharge initiation step, so it's instantly done.
   const { sql: startSql, params: startParams } = initialStartSql(now);
   await db.prepare(
-    `UPDATE discharge_tracking SET status='DISCHARGE_INITIATED', initiated_at=?, payer_type=?, ${startSql}, updated_at=? WHERE id=?`
-  ).run(now, payerType, ...startParams, now, tracking.id);
+    `UPDATE discharge_tracking SET status='DISCHARGE_INITIATED', initiated_at=?, payer_type=?,
+     discharge_summary_status='COMPLETED',
+     discharge_summary_completed_at=COALESCE(discharge_summary_completed_at, ?),
+     discharge_doc_started_at=COALESCE(discharge_doc_started_at, ?),
+     ${startSql}, updated_at=? WHERE id=?`
+  ).run(now, payerType, now, now, ...startParams, now, tracking.id);
   await logHistory({
     admissionId: opts.admissionId, trackingId: tracking.id, field: "status",
     oldValue: tracking.status, newValue: "DISCHARGE_INITIATED", userId: opts.userId,
@@ -453,8 +509,8 @@ export async function updateStep(opts: {
     // A phase can be completed before it was ever formally started (out-of-order
     // edits are allowed) — stamp a start so duration/ETA maths stay sane.
     slaSets.push(`${startedCol(opts.step)}=COALESCE(${startedCol(opts.step)}, ?)`); slaParams.push(now);
-    const next = nextPhaseToStart(opts.step, tracking as unknown as Record<string, unknown>);
-    if (next) { slaSets.push(`${startedCol(next)}=COALESCE(${startedCol(next)}, ?)`); slaParams.push(now); }
+    const nexts = nextPhasesToStart(opts.step, tracking as unknown as Record<string, unknown>);
+    for (const next of nexts) { slaSets.push(`${startedCol(next)}=COALESCE(${startedCol(next)}, ?)`); slaParams.push(now); }
   } else {
     slaSets.push(`${completedCol(opts.step)}=NULL`);
   }
@@ -502,6 +558,7 @@ export interface DischargeDashboardCounts {
   /** Initiated today but NOT scheduled for today — no plan at all, or planned for
    *  a different date (future planned but pushed early). */
   unplannedToday: number;
+  unplannedPending: number;
   /** Cancelled today specifically (updated_at >= todayStart). */
   cancelledToday: number;
   /** Patient physically left before system checkout was completed — billing risk. */
@@ -524,43 +581,47 @@ export async function dashboardCounts(wardIds: number[] | null): Promise<Dischar
 
   const row = await db.prepare(`
     SELECT
-      COUNT(*) FILTER (WHERE dt.status='PLANNED' AND dt.planned_date=?) AS planned_today,
-      COUNT(*) FILTER (WHERE dt.status='PLANNED' AND dt.planned_date=?) AS planned_tomorrow,
-      COUNT(*) FILTER (WHERE dt.status IN ('DISCHARGE_INITIATED','IN_PROGRESS') AND dt.planned_date=?) AS scheduled_ongoing_today,
-      COUNT(*) FILTER (WHERE dt.status='DISCHARGE_INITIATED') AS initiated,
-      COUNT(*) FILTER (WHERE dt.status='IN_PROGRESS') AS pending,
-      COUNT(*) FILTER (WHERE dt.status='CANCELLED') AS cancelled,
-      COUNT(*) FILTER (WHERE dt.status IN ('DISCHARGE_INITIATED','IN_PROGRESS') AND dt.drug_return_status='PENDING') AS drug_return_pending,
-      COUNT(*) FILTER (WHERE dt.status IN ('DISCHARGE_INITIATED','IN_PROGRESS') AND dt.drug_return_status='COMPLETED') AS drug_return_completed,
-      COUNT(*) FILTER (WHERE dt.status IN ('DISCHARGE_INITIATED','IN_PROGRESS') AND dt.pharmacy_clearance_status='PENDING') AS pharmacy_pending,
-      COUNT(*) FILTER (WHERE dt.status IN ('DISCHARGE_INITIATED','IN_PROGRESS') AND dt.pharmacy_clearance_status='COMPLETED') AS pharmacy_completed,
-      COUNT(*) FILTER (WHERE dt.status IN ('DISCHARGE_INITIATED','IN_PROGRESS') AND dt.procedure_reconciliation_status='PENDING') AS procedure_pending,
-      COUNT(*) FILTER (WHERE dt.status IN ('DISCHARGE_INITIATED','IN_PROGRESS') AND dt.procedure_reconciliation_status='COMPLETED') AS procedure_completed,
-      COUNT(*) FILTER (WHERE dt.status IN ('DISCHARGE_INITIATED','IN_PROGRESS') AND dt.billing_started_status='PENDING') AS billing_started,
-      COUNT(*) FILTER (WHERE dt.status IN ('DISCHARGE_INITIATED','IN_PROGRESS') AND dt.billing_started_status='COMPLETED') AS billing_started_completed,
-      COUNT(*) FILTER (WHERE dt.status IN ('DISCHARGE_INITIATED','IN_PROGRESS') AND dt.audit_status='PENDING') AS audit_pending,
-      COUNT(*) FILTER (WHERE dt.status IN ('DISCHARGE_INITIATED','IN_PROGRESS') AND dt.audit_status='COMPLETED') AS audit_completed,
-      COUNT(*) FILTER (WHERE dt.status IN ('DISCHARGE_INITIATED','IN_PROGRESS') AND dt.bill_ready_status='PENDING') AS bill_ready,
-      COUNT(*) FILTER (WHERE dt.status IN ('DISCHARGE_INITIATED','IN_PROGRESS') AND dt.bill_ready_status='COMPLETED') AS bill_ready_completed,
-      COUNT(*) FILTER (WHERE dt.status IN ('DISCHARGE_INITIATED','IN_PROGRESS') AND dt.payment_status='PENDING') AS payment_pending,
-      COUNT(*) FILTER (WHERE dt.status IN ('DISCHARGE_INITIATED','IN_PROGRESS') AND dt.payment_status='COMPLETED') AS payment_completed,
-      COUNT(*) FILTER (WHERE dt.status IN ('DISCHARGE_INITIATED','IN_PROGRESS') AND dt.system_checkout_status='PENDING') AS system_checkout_pending,
-      COUNT(*) FILTER (WHERE dt.status IN ('DISCHARGE_INITIATED','IN_PROGRESS') AND dt.system_checkout_status='COMPLETED') AS system_checkout_completed,
-      COUNT(*) FILTER (WHERE dt.status IN ('DISCHARGE_INITIATED','IN_PROGRESS') AND dt.physical_checkout_status='PENDING') AS physical_checkout_pending,
-      COUNT(*) FILTER (WHERE dt.status IN ('DISCHARGE_INITIATED','IN_PROGRESS') AND dt.physical_checkout_status='COMPLETED') AS physical_checkout_completed,
-      COUNT(*) FILTER (WHERE dt.status IN ('DISCHARGE_INITIATED','IN_PROGRESS') AND dt.system_checkout_status='COMPLETED' AND dt.physical_checkout_status<>'COMPLETED') AS awaiting_patient_leave,
+      COUNT(*) FILTER (WHERE pa.status='ACTIVE' AND dt.status='PLANNED' AND dt.planned_date=?) AS planned_today,
+      COUNT(*) FILTER (WHERE pa.status='ACTIVE' AND dt.status='PLANNED' AND dt.planned_date=?) AS planned_tomorrow,
+      COUNT(*) FILTER (WHERE pa.status='ACTIVE' AND dt.status IN ('DISCHARGE_INITIATED','IN_PROGRESS') AND dt.planned_date=? AND dt.created_at < ?) AS scheduled_ongoing_today,
+      COUNT(*) FILTER (WHERE pa.status='ACTIVE' AND dt.status='DISCHARGE_INITIATED') AS initiated,
+      COUNT(*) FILTER (WHERE pa.status='ACTIVE' AND dt.status='IN_PROGRESS') AS pending,
+      COUNT(*) FILTER (WHERE pa.status='ACTIVE' AND dt.status='CANCELLED') AS cancelled,
+      COUNT(*) FILTER (WHERE pa.status='ACTIVE' AND dt.status IN ('DISCHARGE_INITIATED','IN_PROGRESS') AND dt.drug_return_status='PENDING') AS drug_return_pending,
+      COUNT(*) FILTER (WHERE dt.status IN ('DISCHARGE_INITIATED','IN_PROGRESS','COMPLETED') AND dt.drug_return_status='COMPLETED' AND dt.initiated_at >= ?) AS drug_return_completed,
+      COUNT(*) FILTER (WHERE pa.status='ACTIVE' AND dt.status IN ('DISCHARGE_INITIATED','IN_PROGRESS') AND dt.pharmacy_clearance_status='PENDING') AS pharmacy_pending,
+      COUNT(*) FILTER (WHERE dt.status IN ('DISCHARGE_INITIATED','IN_PROGRESS','COMPLETED') AND dt.pharmacy_clearance_status='COMPLETED' AND dt.initiated_at >= ?) AS pharmacy_completed,
+      COUNT(*) FILTER (WHERE pa.status='ACTIVE' AND dt.status IN ('DISCHARGE_INITIATED','IN_PROGRESS') AND dt.procedure_reconciliation_status='PENDING') AS procedure_pending,
+      COUNT(*) FILTER (WHERE dt.status IN ('DISCHARGE_INITIATED','IN_PROGRESS','COMPLETED') AND dt.procedure_reconciliation_status IN ('COMPLETED','NOT_APPLICABLE') AND dt.initiated_at >= ?) AS procedure_completed,
+      COUNT(*) FILTER (WHERE pa.status='ACTIVE' AND dt.status IN ('DISCHARGE_INITIATED','IN_PROGRESS') AND dt.billing_started_status='PENDING') AS billing_started,
+      COUNT(*) FILTER (WHERE dt.status IN ('DISCHARGE_INITIATED','IN_PROGRESS','COMPLETED') AND dt.billing_started_status='COMPLETED' AND dt.initiated_at >= ?) AS billing_started_completed,
+      COUNT(*) FILTER (WHERE pa.status='ACTIVE' AND dt.status IN ('DISCHARGE_INITIATED','IN_PROGRESS') AND dt.audit_status='PENDING') AS audit_pending,
+      COUNT(*) FILTER (WHERE dt.status IN ('DISCHARGE_INITIATED','IN_PROGRESS','COMPLETED') AND dt.audit_status='COMPLETED' AND dt.initiated_at >= ?) AS audit_completed,
+      COUNT(*) FILTER (WHERE pa.status='ACTIVE' AND dt.status IN ('DISCHARGE_INITIATED','IN_PROGRESS') AND dt.bill_ready_status='PENDING') AS bill_ready,
+      COUNT(*) FILTER (WHERE dt.status IN ('DISCHARGE_INITIATED','IN_PROGRESS','COMPLETED') AND dt.bill_ready_status='COMPLETED' AND dt.initiated_at >= ?) AS bill_ready_completed,
+      COUNT(*) FILTER (WHERE pa.status='ACTIVE' AND dt.status IN ('DISCHARGE_INITIATED','IN_PROGRESS') AND dt.payment_status='PENDING') AS payment_pending,
+      COUNT(*) FILTER (WHERE dt.status IN ('DISCHARGE_INITIATED','IN_PROGRESS','COMPLETED') AND dt.payment_status='COMPLETED' AND dt.initiated_at >= ?) AS payment_completed,
+      COUNT(*) FILTER (WHERE pa.status='ACTIVE' AND dt.status IN ('DISCHARGE_INITIATED','IN_PROGRESS') AND dt.system_checkout_status='PENDING') AS system_checkout_pending,
+      COUNT(*) FILTER (WHERE dt.status IN ('DISCHARGE_INITIATED','IN_PROGRESS','COMPLETED') AND dt.system_checkout_status='COMPLETED' AND dt.initiated_at >= ?) AS system_checkout_completed,
+      COUNT(*) FILTER (WHERE pa.status='ACTIVE' AND dt.status IN ('DISCHARGE_INITIATED','IN_PROGRESS') AND dt.physical_checkout_status='PENDING') AS physical_checkout_pending,
+      COUNT(*) FILTER (WHERE dt.status IN ('DISCHARGE_INITIATED','IN_PROGRESS','COMPLETED') AND dt.physical_checkout_status='COMPLETED' AND dt.initiated_at >= ?) AS physical_checkout_completed,
+      COUNT(*) FILTER (WHERE pa.status='ACTIVE' AND dt.status IN ('DISCHARGE_INITIATED','IN_PROGRESS') AND dt.system_checkout_status='COMPLETED' AND dt.physical_checkout_status<>'COMPLETED') AS awaiting_patient_leave,
       COUNT(*) FILTER (WHERE dt.status='COMPLETED' AND dt.updated_at >= ?) AS completed_today,
-      COUNT(*) FILTER (WHERE dt.status='PLANNED' AND dt.planned_date < ?) AS overdue_planned,
-      COUNT(*) FILTER (WHERE dt.status IN ('DISCHARGE_INITIATED','IN_PROGRESS') AND dt.initiated_at >= ?) AS initiated_today,
-      COUNT(*) FILTER (WHERE dt.status IN ('DISCHARGE_INITIATED','IN_PROGRESS') AND dt.initiated_at >= ?
-                       AND (dt.planned_date IS NULL OR dt.planned_date != ?)) AS unplanned_today,
+      COUNT(*) FILTER (WHERE pa.status='ACTIVE' AND dt.status='PLANNED' AND dt.planned_date < ?) AS overdue_planned,
+      COUNT(*) FILTER (WHERE dt.status IN ('DISCHARGE_INITIATED','IN_PROGRESS','COMPLETED') AND dt.initiated_at >= ?) AS initiated_today,
+      COUNT(*) FILTER (WHERE dt.status IN ('DISCHARGE_INITIATED','IN_PROGRESS','COMPLETED') AND dt.initiated_at >= ?
+                       AND dt.planned_date = ? AND dt.created_at >= ?) AS unplanned_today,
+      COUNT(*) FILTER (WHERE pa.status='ACTIVE' AND dt.status IN ('DISCHARGE_INITIATED','IN_PROGRESS')
+                       AND dt.planned_date = ? AND dt.created_at >= ?) AS unplanned_pending,
       COUNT(*) FILTER (WHERE dt.status='CANCELLED' AND dt.updated_at >= ?) AS cancelled_today,
-      COUNT(*) FILTER (WHERE dt.patient_left = TRUE AND dt.system_checkout_status != 'COMPLETED') AS patient_left,
-      COUNT(*) FILTER (WHERE dt.status IN ('DISCHARGE_INITIATED','IN_PROGRESS') AND dt.physical_checkout_status='COMPLETED' AND dt.system_checkout_status!='COMPLETED') AS in_discharge_lounge
+      COUNT(*) FILTER (WHERE pa.status='ACTIVE' AND dt.patient_left = TRUE AND dt.system_checkout_status != 'COMPLETED') AS patient_left,
+      COUNT(*) FILTER (WHERE pa.status='ACTIVE' AND dt.status IN ('DISCHARGE_INITIATED','IN_PROGRESS') AND dt.physical_checkout_status='COMPLETED' AND dt.system_checkout_status!='COMPLETED') AS in_discharge_lounge
     FROM discharge_tracking dt
     JOIN patient_admissions pa ON pa.id = dt.admission_id
     WHERE pa.status IN ('ACTIVE','DISCHARGED') ${scopeClause}
-  `).get<Record<string, number>>(today, tomorrow, today, Date.now() - 24 * 60 * 60 * 1000, today, todayStartMs, todayStartMs, today, todayStartMs, ...params);
+  `).get<Record<string, number>>(today, tomorrow, today, todayStartMs,
+    todayStartMs, todayStartMs, todayStartMs, todayStartMs, todayStartMs, todayStartMs, todayStartMs, todayStartMs, todayStartMs,
+    todayStartMs, today, todayStartMs, todayStartMs, today, todayStartMs, today, todayStartMs, todayStartMs, ...params);
 
   return {
     plannedToday: Number(row?.planned_today || 0),
@@ -592,6 +653,7 @@ export async function dashboardCounts(wardIds: number[] | null): Promise<Dischar
     overduePlanned: Number(row?.overdue_planned || 0),
     initiatedToday: Number(row?.initiated_today || 0),
     unplannedToday: Number(row?.unplanned_today || 0),
+    unplannedPending: Number(row?.unplanned_pending || 0),
     cancelledToday: Number(row?.cancelled_today || 0),
     patientLeft: Number(row?.patient_left || 0),
     inDischargeLounge: Number(row?.in_discharge_lounge || 0),
@@ -632,6 +694,17 @@ export async function listAdmittedToday(wardIds: number[] | null) {
     WHERE pa.admitted_at >= ? AND pa.admitted_at < ? ${scopeClause}
     ORDER BY pa.admitted_at DESC
   `).all(todayStart, todayEnd, ...params);
+}
+
+export async function listInitiatedToday(wardIds: number[] | null) {
+  const nowIst = new Date(Date.now() + 5.5 * 60 * 60 * 1000);
+  const todayStartMs = new Date(nowIst.toISOString().slice(0, 10) + "T00:00:00+05:30").getTime();
+  const scopeClause = wardIds ? "AND pa.ward_id = ANY(?)" : "";
+  const params: unknown[] = wardIds ? [wardIds] : [];
+  return db.prepare(
+    `${DISCHARGE_LIST_SELECT} WHERE dt.status IN ('DISCHARGE_INITIATED','IN_PROGRESS','COMPLETED')
+     AND dt.initiated_at >= ? ${scopeClause} ORDER BY dt.initiated_at DESC`
+  ).all(todayStartMs, ...params);
 }
 
 export async function listCompletedToday(wardIds: number[] | null) {

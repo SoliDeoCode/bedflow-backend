@@ -5,7 +5,7 @@ import { asyncH } from "../middleware/error.js";
 import { saveSubscription } from "../services/pushService.js";
 import { pushEnabled, env } from "../config/env.js";
 import { COO_REMINDERS } from "../config/domain.js";
-import { listDepartments, listDoctors } from "../services/doctorDeptService.js";
+import { listDepartments, listDoctors, listDoctorsWithDepartments } from "../services/doctorDeptService.js";
 
 const router = Router();
 
@@ -20,7 +20,11 @@ router.get("/departments", authRequired, asyncH(async (_req, res) => {
 
 router.get("/doctors", authRequired, asyncH(async (req, res) => {
   const deptId = req.query.department_id ? Number(req.query.department_id) : undefined;
-  res.json({ doctors: await listDoctors(deptId, true) });
+  if (deptId) {
+    res.json({ doctors: await listDoctors(deptId, true) });
+  } else {
+    res.json({ doctors: await listDoctorsWithDepartments(true) });
+  }
 }));
 
 router.post("/push/subscribe", authRequired, asyncH(async (req, res) => {

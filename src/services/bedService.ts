@@ -312,6 +312,7 @@ export async function allWardsLive(restrictWardIds?: number[] | null) {
             b.vacant, b.reserved, b.occupied, b.occupied_reserved,
             b.updated_at AS "updatedAt",
             u_beds.role AS updated_by_role,
+            u_beds.name AS updated_by_name,
             rv.reviewed_at AS "reviewedAt"
      FROM wards w
      JOIN beds b ON b.ward_id = w.id
@@ -349,7 +350,7 @@ export async function allWardsLive(restrictWardIds?: number[] | null) {
      ) rv ON rv.ward_id = w.id
      WHERE w.operational = true ${restrictWardIds ? "AND w.id = ANY(?)" : ""}
      ORDER BY w.name`
-  ).all<WardView & { bed_type: string | null; room_type: string | null; block_name: string | null; floor_name: string | null; reviewedAt: number | null; is_discharge_lounge: boolean; updated_by_role: string | null }>(...(restrictWardIds ? [restrictWardIds] : []));
+  ).all<WardView & { bed_type: string | null; room_type: string | null; block_name: string | null; floor_name: string | null; reviewedAt: number | null; is_discharge_lounge: boolean; updated_by_role: string | null; updated_by_name: string | null }>(...(restrictWardIds ? [restrictWardIds] : []));
 
   const allBedRow = await db.prepare(
     `SELECT COALESCE(SUM(total_beds),0) AS all_beds,
@@ -369,12 +370,13 @@ export async function allWardsLive(restrictWardIds?: number[] | null) {
   const d30Ms = Date.now() - 30 * 86400000;
   const y1Ms = Date.now() - 365 * 86400000;
   const wardIds = wards.map((w) => w.id);
-  const [liveP, admitP, admitTypeP, overstayP, loungeP] = wardIds.length === 0
-    ? [[], [], [], [], []]
+  const [liveP, admitP, admitTypeP, overstayP, loungeP, deptLiveP] = wardIds.length === 0
+    ? [[], [], [], [], [], []]
     : await Promise.all([
       db.prepare(
         `SELECT ward_id, payer_type, COUNT(*)::int AS n FROM bed_details
-          WHERE payer_type IS NOT NULL AND ward_id = ANY(?) GROUP BY ward_id, payer_type`
+          WHERE payer_type IS NOT NULL AND physical_status = 'OCCUPIED' AND reservation_status = 'NONE'
+            AND ward_id = ANY(?) GROUP BY ward_id, payer_type`
       ).all<{ ward_id: number; payer_type: string; n: number }>(wardIds),
       db.prepare(
         `SELECT ward_id, payer_type,
@@ -427,6 +429,16 @@ export async function allWardsLive(restrictWardIds?: number[] | null) {
           WHERE pa.status = 'ACTIVE' AND bd_from.ward_id = ANY(?)
           GROUP BY bd_from.ward_id`
       ).all<{ origin_ward_id: number; n: number }>(wardIds),
+      // Per-ward department breakdown (on-bed occupied beds by department name, excludes occ+res).
+      db.prepare(
+        `SELECT bd.ward_id, pa.department_name, COUNT(*)::int AS n
+           FROM bed_details bd
+           JOIN patient_admissions pa ON pa.bed_id = bd.id AND pa.status = 'ACTIVE'
+          WHERE pa.department_name IS NOT NULL AND bd.operational_status = true
+            AND bd.physical_status = 'OCCUPIED' AND bd.reservation_status = 'NONE'
+            AND bd.ward_id = ANY(?)
+          GROUP BY bd.ward_id, pa.department_name`
+      ).all<{ ward_id: number; department_name: string; n: number }>(wardIds),
     ]);
   const liveByWard = new Map<number, Record<string, number>>();
   for (const row of liveP) {
@@ -450,6 +462,10 @@ export async function allWardsLive(restrictWardIds?: number[] | null) {
   for (const row of overstayP) overstayByWard.set(row.ward_id, row.n);
   const loungeByWard = new Map<number, number>();
   for (const row of loungeP) loungeByWard.set(row.origin_ward_id, row.n);
+  const deptLiveByWard = new Map<number, Record<string, number>>();
+  for (const row of deptLiveP) {
+    const m = deptLiveByWard.get(row.ward_id) ?? {}; m[row.department_name] = row.n; deptLiveByWard.set(row.ward_id, m);
+  }
   for (const w of wards) {
     const wr = w as unknown as Record<string, unknown>;
     wr.payersLive = liveByWard.get(w.id) ?? {};
@@ -457,6 +473,7 @@ export async function allWardsLive(restrictWardIds?: number[] | null) {
     wr.admissionTypes = admitTypeByWard.get(w.id) ?? {};
     wr.overstayCount = overstayByWard.get(w.id) ?? 0;
     wr.loungeCount = loungeByWard.get(w.id) ?? 0;
+    wr.departmentsLive = deptLiveByWard.get(w.id) ?? {};
   }
 
   let v = 0, r = 0, o = 0, or_ = 0, total = 0;
@@ -501,7 +518,7 @@ export async function allBedDetailsLive(restrictWardIds?: number[] | null) {
             bd.bed_name, bd.physical_status, bd.reservation_status, bd.payer_type,
             bd.destination, bd.reservation_note, bd.operational_status,
             bd.updated_at, u.name AS updated_by_name, row_to_json(dt.*) AS discharge_tracking,
-            pa.admission_type
+            pa.admission_type, pa.ip_last6
      FROM bed_details bd
      JOIN wards w ON w.id = bd.ward_id
      LEFT JOIN users u ON u.id = bd.updated_by
@@ -678,12 +695,12 @@ export async function adminDashboard(unitType?: string | null, restrictWardIds?:
   const snapshotRow = await db.prepare(`
     SELECT
       COUNT(*) FILTER (WHERE w.bed_type IN ('Census','Non-Census')) AS total_beds,
-      COUNT(*) FILTER (WHERE w.bed_type IN ('Census','Non-Census') AND bd.operational_status) AS operational_beds,
-      COUNT(*) FILTER (WHERE w.bed_type='Census') AS census_beds,
-      COUNT(*) FILTER (WHERE w.bed_type='Non-Census') AS non_census_beds
+      COUNT(*) FILTER (WHERE w.bed_type IN ('Census','Non-Census') AND w.operational AND bd.operational_status) AS operational_beds,
+      COUNT(*) FILTER (WHERE w.bed_type='Census' AND w.operational) AS census_beds,
+      COUNT(*) FILTER (WHERE w.bed_type='Non-Census' AND w.operational) AS non_census_beds
     FROM bed_details bd
     JOIN wards w ON w.id = bd.ward_id
-    WHERE w.operational = true ${wardIds ? "AND w.id = ANY(?)" : ""}
+    ${wardIds ? "WHERE w.id = ANY(?)" : ""}
   `).get<Record<string, number>>(...(wardIds ? [wardIds] : []));
 
   const onbed = sum(r => r.state === "onbed");
@@ -691,7 +708,7 @@ export async function adminDashboard(unitType?: string | null, restrictWardIds?:
   const loungePatients = sum(r => r.state === "lounge");
   const loungeOrigin = await loungeOriginBreakdown(wardIds);
   const loungeBy = (bedType: string) => loungeOrigin.find(r => r.origin_bed_type === bedType)?.c ?? 0;
-  const allAdmittedStates = ["onbed", "overstay", "occ_res", "lounge"];
+  const allAdmittedStates = ["onbed", "overstay", "lounge"];
 
   const todayStart = startOfDayIST();
   const todayEnd = todayStart + 24 * 60 * 60 * 1000;
@@ -761,8 +778,10 @@ export async function adminDashboard(unitType?: string | null, restrictWardIds?:
       completedToday: discharge.completedToday,
       plannedTotal: discharge.plannedToday,
       scheduledOngoingToday: discharge.scheduledOngoingToday,
-      initiated: discharge.initiatedToday,
+      initiated: discharge.initiated,
+      initiatedToday: discharge.initiatedToday,
       unplannedToday: discharge.unplannedToday,
+      unplannedPending: discharge.unplannedPending,
       pendingInitiated: discharge.plannedToday,
       overduePlanned: discharge.overduePlanned,
       pending: discharge.pending,
@@ -830,25 +849,27 @@ export async function consultantsLive() {
     SELECT
       COALESCE(dm.name, pa.consultant_name, 'Unknown') AS name,
       bd.payer_type,
+      pa.department_name,
       COUNT(*)::int AS n
     FROM patient_admissions pa
     JOIN bed_details bd ON bd.id = pa.bed_id
     LEFT JOIN doctors_master dm ON dm.id = pa.doctor_id
     WHERE pa.status = 'ACTIVE'
       AND (pa.doctor_id IS NOT NULL OR pa.consultant_name IS NOT NULL)
-    GROUP BY COALESCE(dm.name, pa.consultant_name, 'Unknown'), bd.payer_type
+    GROUP BY COALESCE(dm.name, pa.consultant_name, 'Unknown'), bd.payer_type, pa.department_name
     ORDER BY name, payer_type
-  `).all<{ name: string; payer_type: string; n: number }>();
+  `).all<{ name: string; payer_type: string; department_name: string | null; n: number }>();
 
   const payerTypeSet = new Set<string>();
   for (const r of rows) if (r.payer_type) payerTypeSet.add(r.payer_type);
   const payerTypes = [...payerTypeSet].sort();
 
-  const byName = new Map<string, { name: string; total: number; payers: Record<string, number> }>();
+  const byName = new Map<string, { name: string; total: number; payers: Record<string, number>; departments: Record<string, number> }>();
   for (const r of rows) {
-    if (!byName.has(r.name)) byName.set(r.name, { name: r.name, total: 0, payers: {} });
+    if (!byName.has(r.name)) byName.set(r.name, { name: r.name, total: 0, payers: {}, departments: {} });
     const entry = byName.get(r.name)!;
-    entry.payers[r.payer_type] = r.n;
+    entry.payers[r.payer_type] = (entry.payers[r.payer_type] ?? 0) + r.n;
+    if (r.department_name) entry.departments[r.department_name] = (entry.departments[r.department_name] ?? 0) + r.n;
     entry.total += r.n;
   }
 

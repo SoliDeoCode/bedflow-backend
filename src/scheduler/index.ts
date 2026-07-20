@@ -11,6 +11,8 @@ let lastCaptureDate   = "";
 let lastSnapshotHour  = -1;
 /** Admissions whose delay has already been broadcast — prevents a 30s re-emit loop. */
 const notifiedDelays = new Set<number>();
+const notifiedOverstays = new Set<number>();
+const OVERSTAY_THRESHOLD_MS = 60 * 60 * 1000; // 60 minutes
 
 async function tick() {
   const now  = Date.now();
@@ -138,6 +140,58 @@ async function tick() {
     }
     // Drop admissions that recovered or finished, so a later delay re-announces.
     for (const id of notifiedDelays) if (!stillDelayed.has(id)) notifiedDelays.delete(id);
+  }
+
+  // Overstay sweep — 60 minutes after System Checkout is completed, if Physical
+  // Checkout hasn't been done yet, the bed is overstaying. Emit once per admission
+  // so the UI can show alerts and push notifications to the relevant PRE users.
+  {
+    const overstayRows = await db.prepare(
+      `SELECT dt.id, dt.admission_id, pa.ward_id, pa.bed_id, bd.bed_name, w.name AS ward_name
+       FROM discharge_tracking dt
+       JOIN patient_admissions pa ON pa.id = dt.admission_id
+       JOIN bed_details bd ON bd.id = pa.bed_id
+       JOIN wards w ON w.id = pa.ward_id
+       WHERE dt.system_checkout_status = 'COMPLETED'
+         AND dt.physical_checkout_status != 'COMPLETED'
+         AND pa.status = 'ACTIVE'
+         AND dt.status NOT IN ('COMPLETED', 'CANCELLED')
+         AND dt.system_checkout_completed_at IS NOT NULL
+         AND (? - dt.system_checkout_completed_at) >= ?`
+    ).all<{ id: number; admission_id: number; ward_id: number; bed_id: number; bed_name: string; ward_name: string }>(now, OVERSTAY_THRESHOLD_MS);
+
+    const stillOverstay = new Set<number>();
+    for (const row of overstayRows) {
+      stillOverstay.add(row.admission_id);
+      if (notifiedOverstays.has(row.admission_id)) continue;
+
+      notifiedOverstays.add(row.admission_id);
+      const preBlocks = await db.prepare("SELECT pre_block_id FROM pre_block_wards WHERE ward_id=?")
+        .all<{ pre_block_id: number }>(row.ward_id);
+      const ward = await db.prepare("SELECT station_id FROM wards WHERE id=?")
+        .get<{ station_id: number | null }>(row.ward_id);
+      emitUpdate("discharge:overstay", {
+        admissionId: row.admission_id, bedId: row.bed_id, wardId: row.ward_id,
+        bedName: row.bed_name, wardName: row.ward_name,
+      }, {
+        wardId: row.ward_id,
+        pre: preBlocks.map(b => String(b.pre_block_id)),
+        stationId: ward?.station_id ?? undefined,
+      });
+
+      if (preBlocks.length > 0) {
+        const preUsers = await db.prepare(
+          "SELECT DISTINCT user_id FROM user_pre_blocks WHERE pre_block_id = ANY(?)"
+        ).all<{ user_id: number }>(preBlocks.map(b => b.pre_block_id));
+        for (const u of preUsers)
+          void pushToUser(u.user_id, {
+            title: `⚠ Overstay — ${row.bed_name} (${row.ward_name})`,
+            body: "System Checkout completed 60+ min ago but patient has not physically left.",
+            tag: `overstay-${row.admission_id}`, requireInteraction: true,
+          });
+      }
+    }
+    for (const id of notifiedOverstays) if (!stillOverstay.has(id)) notifiedOverstays.delete(id);
   }
 
   // COO reminders at the top of each 3-hour slot

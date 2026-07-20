@@ -2,21 +2,17 @@ import { Router } from "express";
 import { asyncH } from "../middleware/error.js";
 import { db } from "../db/index.js";
 import {
-  listPhaseConfig, computeWorkflow, ALL_STEPS,
+  listPhaseConfig, computeWorkflow, ALL_STEPS, STEP_GROUP,
   statusCol, startedCol, completedCol,
 } from "../services/dischargeSlaService.js";
 
 const router = Router();
 
-// Every phase column the SLA engine needs, built from the step list so adding a
-// phase never means editing this SELECT by hand.
 const PHASE_COLUMNS = ALL_STEPS
   .flatMap(k => [statusCol(k), startedCol(k), completedCol(k)])
   .map(c => `dt.${c}`)
   .join(",\n      ");
 
-/** Public — no auth. Patient looks up their discharge status by their 6-digit IP number.
- *  Returns only their own data; no ward/bed details that identify others. */
 router.get("/status", asyncH(async (req, res) => {
   const ip = (req.query.ip as string | undefined)?.trim();
   if (!ip || !/^\d{6}$/.test(ip))
@@ -34,6 +30,8 @@ router.get("/status", asyncH(async (req, res) => {
       dt.planned_date,
       dt.planned_time,
       dt.initiated_at,
+      dt.system_checkout_status,
+      dt.physical_checkout_status,
       ${PHASE_COLUMNS}
     FROM patient_admissions pa
     JOIN bed_details bd ON bd.id = pa.bed_id
@@ -46,12 +44,25 @@ router.get("/status", asyncH(async (req, res) => {
 
   if (!row) return res.json({ found: false, reason: "No active admission found for this patient number." });
 
-  // The patient sees the same backend-computed ETA every staff role sees. Phase
-  // internals are trimmed to what's meaningful to them: what's happening now,
-  // who is doing it, and when it should be done — no deadlines or overdue
-  // counters, which would read as blame rather than information.
   const config = await listPhaseConfig();
   const wf = computeWorkflow({ ...row, status: row.discharge_status } as never, config);
+
+  // Critical-path expected time: groups 1-3 run in parallel, then 4+5 in parallel.
+  let totalExpectedMinutes: number | null = null;
+  let expectedEta: number | null = null;
+  if (wf) {
+    const groupTotals: Record<number, number> = {};
+    for (const p of wf.phases) {
+      if (p.state === "NOT_APPLICABLE") continue;
+      const g = STEP_GROUP[p.key as keyof typeof STEP_GROUP] ?? 0;
+      groupTotals[g] = (groupTotals[g] ?? 0) + p.expectedMinutes;
+    }
+    const head = Math.max(groupTotals[1] ?? 0, groupTotals[2] ?? 0, groupTotals[3] ?? 0);
+    const tail = Math.max(groupTotals[4] ?? 0, groupTotals[5] ?? 0);
+    totalExpectedMinutes = head + tail;
+    const init = Number(row.initiated_at);
+    if (init > 0) expectedEta = init + totalExpectedMinutes * 60_000;
+  }
 
   const workflow = wf && {
     state: wf.state,
@@ -60,11 +71,15 @@ router.get("/status", asyncH(async (req, res) => {
     done: wf.done,
     total: wf.total,
     pct: wf.pct,
+    totalExpectedMinutes,
+    expectedEta,
     phases: wf.phases.map(p => ({
       key: p.key,
       label: p.label,
       department: p.department,
       state: p.state === "DELAYED" ? "IN_PROGRESS" : p.state,
+      onTime: p.state !== "DELAYED",
+      expectedMinutes: p.expectedMinutes,
       startedAt: p.startedAt,
       completedAt: p.completedAt,
     })),

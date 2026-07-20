@@ -48,6 +48,9 @@ export const GROUP_STEPS: Record<number, StepKey[]> = {
 
 export const ALL_STEPS = Object.keys(STEP_GROUP) as StepKey[];
 
+/** Steps that complete automatically at initiation — excluded from delayed warnings and progress counts. */
+const AUTO_STEPS = new Set<StepKey>(["DISCHARGE_SUMMARY"]);
+
 const snake = (k: StepKey) => k.toLowerCase();
 export const startedCol   = (k: StepKey) => `${snake(k)}_started_at`;
 export const completedCol = (k: StepKey) => `${snake(k)}_completed_at`;
@@ -266,14 +269,22 @@ export function computeWorkflow(
 
   const isDone = (p: PhaseView) => p.state === "COMPLETED" || p.state === "NOT_APPLICABLE";
 
-  // Remaining minutes for a group: the in-flight phase contributes only its
-  // leftover time, phases that haven't started contribute their full SLA.
+  // Remaining minutes for a group: phases within a group are sequential, so
+  // every incomplete phase contributes to the group's remaining time.
+  // Overdue phases contribute their original SLA — "once acted on, it'll
+  // take the normal time" — instead of the overdue duration which would
+  // make the ETA grow unboundedly (e.g. Physical Checkout idle 30h).
   const groupRemaining = (group: number): number => {
     let mins = 0;
     for (const p of phases) {
       if (p.group !== group || isDone(p)) continue;
       if (p.startedAt !== null && p.deadline !== null) {
-        mins += Math.max(0, Math.ceil((p.deadline - now) / 60_000));
+        const left = Math.ceil((p.deadline - now) / 60_000);
+        if (left > 0) {
+          mins += left;
+        } else {
+          mins += p.expectedMinutes;
+        }
       } else {
         mins += p.expectedMinutes;
       }
@@ -286,11 +297,11 @@ export function computeWorkflow(
   const tail = Math.max(groupRemaining(4), groupRemaining(5));
   const etaMinutes = parallelHead + tail;
 
-  const counted = phases.filter(p => p.state !== "NOT_APPLICABLE");
+  const counted = phases.filter(p => p.state !== "NOT_APPLICABLE" && !AUTO_STEPS.has(p.key));
   const done = counted.filter(p => p.state === "COMPLETED").length;
   const total = counted.length;
-  const delayed = phases.filter(p => p.state === "DELAYED").map(p => p.key);
-  const current = phases.filter(p => p.state === "IN_PROGRESS" || p.state === "DELAYED").map(p => p.key);
+  const delayed = phases.filter(p => p.state === "DELAYED" && !AUTO_STEPS.has(p.key)).map(p => p.key);
+  const current = phases.filter(p => (p.state === "IN_PROGRESS" || p.state === "DELAYED") && !AUTO_STEPS.has(p.key)).map(p => p.key);
 
   return {
     phases, current, delayed,
@@ -339,25 +350,55 @@ export function initialStartSql(now: number): { sql: string; params: unknown[] }
 }
 
 /**
- * The phase that should start when `completed` finishes: the next unstarted
- * phase in the same group. System Checkout is special — it opens only when
- * every group 1-3 phase is done.
+ * Phases that fan out from a single predecessor — when `from` completes,
+ * all listed successors start in parallel (instead of the default sequential
+ * "next sibling in the group array" behaviour).
  */
-export function nextPhaseToStart(completed: StepKey, tracking: TrackingRow): StepKey | null {
-  const group = STEP_GROUP[completed];
-  const siblings = GROUP_STEPS[group] ?? [];
-  const idx = siblings.indexOf(completed);
-  const next = siblings[idx + 1];
-  if (next && tracking[startedCol(next)] == null) return next;
+const PARALLEL_SUCCESSORS: Partial<Record<StepKey, StepKey[]>> = {
+  DRUG_RETURN: ["PHARMACY_CLEARANCE", "PROCEDURE_RECONCILIATION"],
+};
 
-  // Nothing left in this group — does that unlock System Checkout?
+/**
+ * The phase(s) that should start when `completed` finishes. Returns an array
+ * because some steps fan out to multiple parallel successors.
+ * System Checkout is special — it opens only when every group 1-3 phase is done.
+ */
+export function nextPhasesToStart(completed: StepKey, tracking: TrackingRow): StepKey[] {
+  const result: StepKey[] = [];
+
+  // Check for explicit parallel fan-out first
+  const parallel = PARALLEL_SUCCESSORS[completed];
+  if (parallel) {
+    for (const k of parallel) {
+      if (tracking[startedCol(k)] == null) result.push(k);
+    }
+  } else {
+    // Default: next sequential sibling in the same group
+    const group = STEP_GROUP[completed];
+    const siblings = GROUP_STEPS[group] ?? [];
+    const idx = siblings.indexOf(completed);
+    const next = siblings[idx + 1];
+    // Skip if this step fans out to parallel successors (already handled above)
+    if (next && tracking[startedCol(next)] == null && !Object.values(PARALLEL_SUCCESSORS).some(arr => arr.includes(next))) {
+      result.push(next);
+    }
+  }
+
+  // Does completing this step unlock System Checkout?
   if (tracking[startedCol("SYSTEM_CHECKOUT")] == null) {
     const blockers = [...GROUP_STEPS[1], ...GROUP_STEPS[2], ...GROUP_STEPS[3]];
     const allClear = blockers.every((k) => {
       const v = k === completed ? "COMPLETED" : String(tracking[statusCol(k)] ?? "PENDING");
       return v === "COMPLETED" || v === "NOT_APPLICABLE";
     });
-    if (allClear) return "SYSTEM_CHECKOUT";
+    if (allClear) result.push("SYSTEM_CHECKOUT");
   }
-  return null;
+
+  return result;
+}
+
+/** @deprecated Use nextPhasesToStart instead */
+export function nextPhaseToStart(completed: StepKey, tracking: TrackingRow): StepKey | null {
+  const all = nextPhasesToStart(completed, tracking);
+  return all.length > 0 ? all[0] : null;
 }

@@ -7,7 +7,7 @@ import { emitUpdate } from "../websocket/io.js";
 import type { Role } from "../types/index.js";
 import {
   planDischarge, reschedule, cancelPlan, initiateDischarge, cancelAfterInitiation,
-  updateStep, dashboardCounts, historyForAdmission, getDischargeForBed, dischargesForWard, listPendingByStep, listActiveDischarges, listCancelledToday, listPatientLeft, listCompletedToday, listAdmittedToday,
+  updateStep, dashboardCounts, historyForAdmission, getDischargeForBed, dischargesForWard, listPendingByStep, listBillingPipeline, listActiveDischarges, listInitiatedToday, listCancelledToday, listPatientLeft, listCompletedToday, listAdmittedToday,
   type StepKey,
 } from "../services/dischargeService.js";
 import { getAdmissionById } from "../services/patientAdmissionService.js";
@@ -38,9 +38,11 @@ async function preOwnsWard(userId: number, wardId: number): Promise<boolean> {
   return !!row;
 }
 
+const HOSPITAL_WIDE_ROLES: Role[] = ["FC", "MASTER_FC", "COO", "PHARMACY", "MASTER_PHARMACY"];
+
 /** Throws 403 unless the caller (per their role) can act on this ward. FC/COO always pass. */
 async function assertWardAccess(userId: number, role: Role, wardId: number) {
-  if (role === "FC" || role === "COO") return;
+  if (HOSPITAL_WIDE_ROLES.includes(role)) return;
   if (role === "PRE") {
     if (!(await preOwnsWard(userId, wardId))) throw new HttpError(403, "Ward not in your PRE Block");
     return;
@@ -116,7 +118,7 @@ async function fanout(wardId: number) {
 
 /** Ward ids the caller's discharge dashboard/history should be scoped to. null = hospital-wide. */
 async function myWardScope(userId: number, role: Role): Promise<number[] | null> {
-  if (role === "FC" || role === "COO") return null;
+  if (HOSPITAL_WIDE_ROLES.includes(role)) return null;
   if (role === "PRE") {
     const rows = await db.prepare(
       `SELECT pbw.ward_id FROM pre_block_wards pbw
@@ -213,10 +215,8 @@ router.patch("/:admissionId/step", asyncH(async (req, res) => {
     reason: z.string().max(500).nullable().optional(),
   }).parse(req.body);
 
-  // FC's steps (BILL_READY, PAYMENT) are hospital-wide — no ward scoping.
-  // Every other role's step is scoped to wards/beds they're allowed to touch.
   let wardId: number;
-  if (req.user!.role === "FC") {
+  if (HOSPITAL_WIDE_ROLES.includes(req.user!.role)) {
     ({ wardId } = await admissionWard(admissionId));
   } else {
     wardId = await assertAdmissionAccess(req.user!, admissionId);
@@ -271,9 +271,19 @@ router.get("/pending", asyncH(async (req, res) => {
   res.json({ discharges: await listPendingByStep(step, wardIds) });
 }));
 
+router.get("/billing-pipeline", asyncH(async (req, res) => {
+  const wardIds = await myWardScope(req.user!.id, req.user!.role);
+  res.json(await listBillingPipeline(wardIds));
+}));
+
 router.get("/cancelled-today", asyncH(async (req, res) => {
   const wardIds = await myWardScope(req.user!.id, req.user!.role);
   res.json({ discharges: await listCancelledToday(wardIds) });
+}));
+
+router.get("/initiated-today", asyncH(async (req, res) => {
+  const wardIds = await myWardScope(req.user!.id, req.user!.role);
+  res.json({ discharges: await listInitiatedToday(wardIds) });
 }));
 
 router.get("/completed-today", asyncH(async (req, res) => {
@@ -293,7 +303,7 @@ router.get("/patient-left", asyncH(async (req, res) => {
 
 router.get("/history/:admissionId", asyncH(async (req, res) => {
   const admissionId = Number(req.params.admissionId);
-  if (req.user!.role !== "FC" && req.user!.role !== "COO")
+  if (!HOSPITAL_WIDE_ROLES.includes(req.user!.role))
     await assertAdmissionAccess(req.user!, admissionId);
   res.json(await historyForAdmission(admissionId));
 }));

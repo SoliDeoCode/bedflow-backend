@@ -1083,4 +1083,81 @@ router.delete("/payer-tat/:id", asyncH(async (req, res) => {
   res.json({ ok: true });
 }));
 
+// ── FC & Pharmacy Logins ────────────────────────────────────────────────────
+
+const SIMPLE_ROLES = ["FC", "MASTER_FC", "PHARMACY", "MASTER_PHARMACY"] as const;
+type SimpleRole = (typeof SIMPLE_ROLES)[number];
+
+router.get("/simple-logins", asyncH(async (req, res) => {
+  const role = z.enum(SIMPLE_ROLES).parse(req.query.role);
+  const rows = await db.prepare(
+    `SELECT id, username, name, role, status FROM users WHERE role=? ORDER BY name`
+  ).all<{ id: number; username: string; name: string; role: string; status: string }>(role);
+  res.json({ logins: rows });
+}));
+
+router.post("/simple-logins", asyncH(async (req, res) => {
+  const { role, username, password, name } = z.object({
+    role:     z.enum(SIMPLE_ROLES),
+    username: z.string().min(1).max(60).regex(/^[a-z0-9._-]+$/i, "Invalid username"),
+    password: z.string().min(6).max(72),
+    name:     z.string().min(1).max(120),
+  }).parse(req.body);
+
+  const u = username.trim().toLowerCase();
+  const clash = await db.prepare("SELECT id FROM users WHERE username=?").get<{ id: number }>(u);
+  if (clash) throw new HttpError(409, "Username already taken");
+
+  const now = Date.now();
+  const hash = bcrypt.hashSync(password, 12);
+  const row = await db.prepare(
+    `INSERT INTO users (username, password_hash, role, name, status, created_at, updated_at)
+     VALUES (?, ?, ?, ?, 'active', ?, ?) RETURNING id, username, name, role, status`
+  ).get<{ id: number; username: string; name: string; role: string; status: string }>(
+    u, hash, role, name.trim(), now, now
+  );
+  res.status(201).json({ login: row });
+}));
+
+router.put("/simple-logins/:id", asyncH(async (req, res) => {
+  const id = Number(req.params.id);
+  const { username, password, name, status } = z.object({
+    username: z.string().min(1).max(60).regex(/^[a-z0-9._-]+$/i).optional(),
+    password: z.string().min(6).max(72).optional(),
+    name:     z.string().min(1).max(120).optional(),
+    status:   z.enum(["active", "inactive"]).optional(),
+  }).parse(req.body);
+
+  const user = await db.prepare("SELECT id, role FROM users WHERE id=?").get<{ id: number; role: string }>(id);
+  if (!user || !(SIMPLE_ROLES as readonly string[]).includes(user.role))
+    throw new HttpError(404, "Login not found");
+
+  const now = Date.now();
+  if (username) {
+    const u = username.trim().toLowerCase();
+    const clash = await db.prepare("SELECT id FROM users WHERE username=? AND id<>?").get<{ id: number }>(u, id);
+    if (clash) throw new HttpError(409, "Username already taken");
+    await db.prepare("UPDATE users SET username=?, updated_at=? WHERE id=?").run(u, now, id);
+  }
+  if (password) {
+    const hash = bcrypt.hashSync(password, 12);
+    await db.prepare("UPDATE users SET password_hash=?, updated_at=? WHERE id=?").run(hash, now, id);
+  }
+  if (name) await db.prepare("UPDATE users SET name=?, updated_at=? WHERE id=?").run(name.trim(), now, id);
+  if (status) await db.prepare("UPDATE users SET status=?, updated_at=? WHERE id=?").run(status, now, id);
+
+  const updated = await db.prepare("SELECT id, username, name, role, status FROM users WHERE id=?")
+    .get<{ id: number; username: string; name: string; role: string; status: string }>(id);
+  res.json({ login: updated });
+}));
+
+router.delete("/simple-logins/:id", asyncH(async (req, res) => {
+  const id = Number(req.params.id);
+  const user = await db.prepare("SELECT id, role FROM users WHERE id=?").get<{ id: number; role: string }>(id);
+  if (!user || !(SIMPLE_ROLES as readonly string[]).includes(user.role))
+    throw new HttpError(404, "Login not found");
+  await db.prepare("DELETE FROM users WHERE id=?").run(id);
+  res.json({ ok: true });
+}));
+
 export default router;

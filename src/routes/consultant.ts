@@ -1,7 +1,7 @@
 import { Router } from "express";
 import { authRequired, requireRole } from "../middleware/auth.js";
 import { asyncH } from "../middleware/error.js";
-import { allWardsLive, allBedDetailsLive, adminDashboard } from "../services/bedService.js";
+import { allWardsLive, allBedDetailsLive, adminDashboard, adminDashboardHistory, consultantsLive } from "../services/bedService.js";
 import { listPayerTypes } from "../services/payerTypeService.js";
 import { db } from "../db/index.js";
 
@@ -25,6 +25,50 @@ router.get("/admin-dashboard", asyncH(async (req, res) => {
 
 router.get("/payer-types", asyncH(async (_req, res) => {
   res.json({ payerTypes: await listPayerTypes(true) });
+}));
+
+router.get("/admin-dashboard-history", asyncH(async (req, res) => {
+  const unit = typeof req.query.unit === "string" ? req.query.unit : null;
+  res.json({ snapshots: await adminDashboardHistory(48, unit) });
+}));
+
+router.get("/consultants", asyncH(async (_req, res) => {
+  res.json(await consultantsLive());
+}));
+
+router.get("/snapshots", asyncH(async (_req, res) => {
+  const rows = await db.prepare(
+    "SELECT ts,total,vacant,reserved,occupied,payer_snapshot FROM occupancy_snapshots ORDER BY ts DESC LIMIT 48"
+  ).all<{ ts: number; total: number; vacant: number; reserved: number; occupied: number; payer_snapshot: Record<string, number> | null }>();
+  const snapshots = rows.reverse().map((r) => ({ ...r, payers: r.payer_snapshot || {} }));
+  res.json({ snapshots });
+}));
+
+router.get("/overstay", asyncH(async (_req, res) => {
+  const IST = 5.5 * 3600 * 1000;
+  const todayIST = new Date(Date.now() + IST).toISOString().slice(0, 10);
+  const rows = await db.prepare(`
+    SELECT
+      pa.id AS admission_id, pa.ip_last6, pa.admitted_at,
+      COALESCE(dm.name, pa.consultant_name, 'Unknown') AS doctor,
+      w.name AS ward, bd.bed_name AS bed,
+      dt.planned_date, dt.status AS discharge_status,
+      (CURRENT_DATE - dt.planned_date::date) AS days_overdue
+    FROM patient_admissions pa
+    JOIN discharge_tracking dt ON dt.admission_id = pa.id
+    JOIN wards w ON w.id = pa.ward_id
+    JOIN bed_details bd ON bd.id = pa.bed_id
+    LEFT JOIN doctors_master dm ON dm.id = pa.doctor_id
+    WHERE pa.status = 'ACTIVE'
+      AND dt.status NOT IN ('COMPLETED', 'CANCELLED')
+      AND dt.planned_date < ?
+    ORDER BY days_overdue DESC, pa.admitted_at ASC
+  `).all(todayIST);
+  const total = rows.length;
+  const tier1 = rows.filter((r: any) => Number(r.days_overdue) === 1).length;
+  const tier2 = rows.filter((r: any) => Number(r.days_overdue) >= 2 && Number(r.days_overdue) <= 3).length;
+  const tier3 = rows.filter((r: any) => Number(r.days_overdue) >= 4).length;
+  res.json({ total, tier1, tier2, tier3, rows });
 }));
 
 // ── My Wards: wards where this consultant has active patients ────────────────
@@ -88,6 +132,10 @@ router.get("/my-patients", asyncH(async (req, res) => {
        w.name         AS ward_name,
        bd.physical_status,
        bd.reservation_status,
+       bd.destination,
+       bd.reservation_note,
+       bd.operational_status,
+       bd.updated_at,
        pa.consultant_name,
        pa.department_name,
        pa.ip_last6,

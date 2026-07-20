@@ -2,7 +2,7 @@
 // The former MANAGER role was merged into COO (migration 20260621000000).
 // DOCTOR updates beds in assigned Doctor Blocks (migration 20260622000000).
 // CONSULTANT — portal login for named consultants; read-only hospital view + discharge summary.
-export type Role = "PRE" | "COO" | "NURSE" | "DOCTOR" | "FC" | "CONSULTANT";
+export type Role = "PRE" | "COO" | "NURSE" | "DOCTOR" | "FC" | "CONSULTANT" | "PHARMACY" | "MASTER_PHARMACY" | "MASTER_FC";
 
 export interface User {
   id: number;

@@ -6,6 +6,7 @@ import type { JwtPayload } from "../types/index.js";
 import { db } from "../db/index.js";
 
 let io: SocketServer | null = null;
+let patientNs: ReturnType<SocketServer["of"]> | null = null;
 
 export function initWebsocket(server: HttpServer) {
   io = new SocketServer(server, { cors: { origin: env.CORS_ORIGIN } });
@@ -31,7 +32,7 @@ export function initWebsocket(server: HttpServer) {
     // replaces the per-block `pre:<id>` joins rather than adding to them —
     // emitUpdate() always emits to "overview", so it is a strict superset and
     // keeping both would just refresh the client twice per event.
-    if (user.role === "COO" || user.role === "FC" || user.role === "PRE") socket.join("overview");
+    if (["COO", "FC", "MASTER_FC", "PRE", "PHARMACY", "MASTER_PHARMACY", "CONSULTANT"].includes(user.role)) socket.join("overview");
     if (user.role === "NURSE") {
       const rows = await db.prepare("SELECT station_id FROM nurse_stations WHERE nurse_id=?")
         .all<{ station_id: number }>(user.id);
@@ -50,6 +51,16 @@ export function initWebsocket(server: HttpServer) {
       ).all<{ ward_id: number }>(user.id);
       for (const r of rooms) socket.join(`ward:${r.ward_id}`);
     }
+  });
+
+  // Public namespace for patient portal — no JWT required.
+  patientNs = io.of("/patient");
+  patientNs.on("connection", (socket) => {
+    socket.on("subscribe", (admissionId: number) => {
+      if (typeof admissionId === "number" && admissionId > 0) {
+        socket.join(`patient:${admissionId}`);
+      }
+    });
   });
 
   return io;
@@ -83,4 +94,13 @@ export function emitUpdate(
         return typeof w === "number" ? [w] : [];
       })();
   for (const w of wardIds) io.to(`ward:${w}`).emit(event, data);
+
+  // Mirror discharge updates to the patient namespace so the patient portal
+  // refreshes live without polling.
+  if (event === "discharge:update" && patientNs) {
+    const aid = (data as { admissionId?: number })?.admissionId;
+    if (typeof aid === "number") {
+      patientNs.to(`patient:${aid}`).emit("discharge:refresh", { admissionId: aid });
+    }
+  }
 }
