@@ -202,7 +202,7 @@ router.post("/:admissionId/cancel", asyncH(async (req, res) => {
 // ── Step updates (PRE / NURSE / DOCTOR / FC — enforced per-step in the service) ──
 
 const STEP_KEYS: StepKey[] = [
-  "DISCHARGE_SUMMARY", "DISCHARGE_DOC", "DRUG_RETURN", "PHARMACY_CLEARANCE", "PROCEDURE_RECONCILIATION",
+  "DISCHARGE_INITIATION", "DISCHARGE_DOC", "DRUG_RETURN", "PHARMACY_CLEARANCE", "PROCEDURE_RECONCILIATION",
   "BILLING_STARTED", "AUDIT", "BILL_READY", "PAYMENT", "SYSTEM_CHECKOUT", "PHYSICAL_CHECKOUT",
 ];
 

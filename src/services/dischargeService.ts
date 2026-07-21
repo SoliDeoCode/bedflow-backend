@@ -15,7 +15,7 @@ export interface DischargeTracking {
   planned_by: number | null;
   prompted_at: number | null;
   initiated_at: number | null;
-  discharge_summary_status: string;
+  discharge_initiation_status: string;
   discharge_doc_status: string;
   drug_return_status: string;
   pharmacy_clearance_status: string;
@@ -33,11 +33,11 @@ export interface DischargeTracking {
 }
 
 export type StepKey =
-  | "DISCHARGE_SUMMARY" | "DISCHARGE_DOC" | "DRUG_RETURN" | "PHARMACY_CLEARANCE" | "PROCEDURE_RECONCILIATION"
+  | "DISCHARGE_INITIATION" | "DISCHARGE_DOC" | "DRUG_RETURN" | "PHARMACY_CLEARANCE" | "PROCEDURE_RECONCILIATION"
   | "BILLING_STARTED" | "AUDIT" | "BILL_READY" | "PAYMENT" | "SYSTEM_CHECKOUT" | "PHYSICAL_CHECKOUT";
 
 const STEP_COLUMN: Record<StepKey, string> = {
-  DISCHARGE_SUMMARY: "discharge_summary_status",
+  DISCHARGE_INITIATION: "discharge_initiation_status",
   DISCHARGE_DOC: "discharge_doc_status",
   DRUG_RETURN: "drug_return_status",
   PHARMACY_CLEARANCE: "pharmacy_clearance_status",
@@ -54,7 +54,7 @@ const STEP_COLUMN: Record<StepKey, string> = {
 // allowed by the spec (edit + save history) — there is no enforced step
 // ordering here, only who is allowed to touch a given step.
 export const STEP_PERMISSIONS: Record<StepKey, Role[]> = {
-  DISCHARGE_SUMMARY: ["DOCTOR", "CONSULTANT"],
+  DISCHARGE_INITIATION: ["DOCTOR", "CONSULTANT"],
   DISCHARGE_DOC: ["DOCTOR", "CONSULTANT"],
   DRUG_RETURN: ["PRE", "NURSE", "PHARMACY", "MASTER_PHARMACY"],
   PHARMACY_CLEARANCE: ["PRE", "NURSE", "PHARMACY", "MASTER_PHARMACY"],
@@ -68,7 +68,7 @@ export const STEP_PERMISSIONS: Record<StepKey, Role[]> = {
 };
 
 const STEP_LABELS: Record<StepKey, string> = {
-  DISCHARGE_SUMMARY: "Discharge Initiate",
+  DISCHARGE_INITIATION: "Discharge Initiation",
   DISCHARGE_DOC: "Discharge Summary",
   DRUG_RETURN: "Drug Return",
   PHARMACY_CLEARANCE: "Pharmacy Clearance",
@@ -84,12 +84,12 @@ const STEP_LABELS: Record<StepKey, string> = {
 // Every step System Checkout must wait on — everything except itself and Physical
 // Checkout (which happens after/parallel to it, not before it).
 const PRE_SYSTEM_CHECKOUT_STEPS: StepKey[] = [
-  "DISCHARGE_SUMMARY", "DISCHARGE_DOC", "DRUG_RETURN", "PHARMACY_CLEARANCE", "PROCEDURE_RECONCILIATION",
+  "DISCHARGE_INITIATION", "DISCHARGE_DOC", "DRUG_RETURN", "PHARMACY_CLEARANCE", "PROCEDURE_RECONCILIATION",
   "BILLING_STARTED", "AUDIT", "BILL_READY", "PAYMENT",
 ];
 
 const STEP_VALUES: Record<StepKey, string[]> = {
-  DISCHARGE_SUMMARY: ["PENDING", "COMPLETED"],
+  DISCHARGE_INITIATION: ["PENDING", "COMPLETED"],
   DISCHARGE_DOC: ["PENDING", "COMPLETED"],
   DRUG_RETURN: ["PENDING", "COMPLETED"],
   PHARMACY_CLEARANCE: ["PENDING", "COMPLETED"],
@@ -350,13 +350,13 @@ export async function initiateDischarge(opts: { admissionId: number; userId: num
 
   // Starting the discharge opens every group-leading phase at once — that start
   // stamp is what the SLA deadline and ETA are measured from.
-  // DISCHARGE_SUMMARY is auto-completed at initiation — the "Initiate Now"
+  // DISCHARGE_INITIATION is auto-completed at initiation — the "Initiate Now"
   // action IS the discharge initiation step, so it's instantly done.
   const { sql: startSql, params: startParams } = initialStartSql(now);
   await db.prepare(
     `UPDATE discharge_tracking SET status='DISCHARGE_INITIATED', initiated_at=?, payer_type=?,
-     discharge_summary_status='COMPLETED',
-     discharge_summary_completed_at=COALESCE(discharge_summary_completed_at, ?),
+     discharge_initiation_status='COMPLETED',
+     discharge_initiation_completed_at=COALESCE(discharge_initiation_completed_at, ?),
      discharge_doc_started_at=COALESCE(discharge_doc_started_at, ?),
      ${startSql}, updated_at=? WHERE id=?`
   ).run(now, payerType, now, now, ...startParams, now, tracking.id);
@@ -389,7 +389,7 @@ async function resetAndCancelTracking(tracking: DischargeTracking, userId: numbe
   await db.prepare(`
     UPDATE discharge_tracking SET
       status='CANCELLED',
-      discharge_summary_status='PENDING', discharge_doc_status='PENDING', drug_return_status='PENDING', pharmacy_clearance_status='PENDING',
+      discharge_initiation_status='PENDING', discharge_doc_status='PENDING', drug_return_status='PENDING', pharmacy_clearance_status='PENDING',
       procedure_reconciliation_status='PENDING', billing_started_status='PENDING', audit_status='PENDING',
       bill_ready_status='PENDING', payment_status='PENDING', system_checkout_status='PENDING', physical_checkout_status='PENDING',
       ${clearSla},

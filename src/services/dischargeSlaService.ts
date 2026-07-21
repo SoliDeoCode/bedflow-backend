@@ -24,7 +24,7 @@ export interface PhaseConfig {
 
 /** Parallel groups — mirrors DischargeTab.jsx GROUP_LABELS. */
 export const STEP_GROUP: Record<StepKey, number> = {
-  DISCHARGE_SUMMARY: 1,
+  DISCHARGE_INITIATION: 1,
   DISCHARGE_DOC: 1,
   DRUG_RETURN: 2,
   PHARMACY_CLEARANCE: 2,
@@ -39,7 +39,7 @@ export const STEP_GROUP: Record<StepKey, number> = {
 
 /** Phases in group order — the sequence a phase unlocks within its own group. */
 export const GROUP_STEPS: Record<number, StepKey[]> = {
-  1: ["DISCHARGE_SUMMARY", "DISCHARGE_DOC"],
+  1: ["DISCHARGE_INITIATION", "DISCHARGE_DOC"],
   2: ["DRUG_RETURN", "PHARMACY_CLEARANCE", "PROCEDURE_RECONCILIATION"],
   3: ["BILLING_STARTED", "AUDIT", "BILL_READY", "PAYMENT"],
   4: ["SYSTEM_CHECKOUT"],
@@ -49,7 +49,7 @@ export const GROUP_STEPS: Record<number, StepKey[]> = {
 export const ALL_STEPS = Object.keys(STEP_GROUP) as StepKey[];
 
 /** Steps that complete automatically at initiation — excluded from delayed warnings and progress counts. */
-const AUTO_STEPS = new Set<StepKey>(["DISCHARGE_SUMMARY"]);
+const AUTO_STEPS = new Set<StepKey>(["DISCHARGE_INITIATION"]);
 
 const snake = (k: StepKey) => k.toLowerCase();
 export const startedCol   = (k: StepKey) => `${snake(k)}_started_at`;
@@ -344,7 +344,7 @@ export async function decorateMany<T extends TrackingRow & { payer_type?: string
  * only opens once its prerequisites clear.
  */
 export function initialStartSql(now: number): { sql: string; params: unknown[] } {
-  const leads: StepKey[] = ["DISCHARGE_SUMMARY", "DRUG_RETURN", "BILLING_STARTED", "PHYSICAL_CHECKOUT"];
+  const leads: StepKey[] = ["DISCHARGE_INITIATION", "DRUG_RETURN", "BILLING_STARTED", "PHYSICAL_CHECKOUT"];
   const sets = leads.map(k => `${startedCol(k)} = COALESCE(${startedCol(k)}, ?)`);
   return { sql: sets.join(", "), params: leads.map(() => now) };
 }
