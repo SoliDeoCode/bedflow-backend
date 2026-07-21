@@ -55,23 +55,23 @@ export async function transferBed(opts: {
   if (toBed.reservation_status !== "NONE") throw new HttpError(409, "Destination bed must not be reserved");
   if (toBed.id === fromBed.id) throw new HttpError(400, "Destination bed must be different from the current bed");
 
-  await updateBedStatus({
-    bedId: opts.toBedId, physicalStatus: "OCCUPIED", reservationStatus: "NONE",
-    payerType: fromBed.payer_type,
-    userId: opts.userId, changeReason: "TRANSFER",
-  });
-
   await db.transaction(async () => {
+    await updateBedStatus({
+      bedId: opts.toBedId, physicalStatus: "OCCUPIED", reservationStatus: "NONE",
+      payerType: fromBed.payer_type,
+      userId: opts.userId, changeReason: "TRANSFER",
+    });
+
     await moveAdmission({ admissionId: admission.id, newBedId: opts.toBedId, newWardId: opts.toWardId, userId: opts.userId });
     await db.prepare(
       `INSERT INTO bed_transfer_history (admission_id, from_bed_id, to_bed_id, from_ward_id, to_ward_id, reason, transferred_by, transferred_at)
        VALUES (?,?,?,?,?,?,?,?)`
     ).run(admission.id, opts.fromBedId, opts.toBedId, fromBed.ward_id, opts.toWardId, reason, opts.userId, Date.now());
-  });
 
-  await updateBedStatus({
-    bedId: opts.fromBedId, physicalStatus: "VACANT", reservationStatus: "NONE",
-    userId: opts.userId, changeReason: "TRANSFER",
+    await updateBedStatus({
+      bedId: opts.fromBedId, physicalStatus: "VACANT", reservationStatus: "NONE",
+      userId: opts.userId, changeReason: "TRANSFER",
+    });
   });
 
   await audit(opts.userId, "bed_transfer", String(admission.id), {

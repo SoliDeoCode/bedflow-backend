@@ -15,6 +15,7 @@ const notifiedOverstays = new Set<number>();
 const OVERSTAY_THRESHOLD_MS = 60 * 60 * 1000; // 60 minutes
 
 async function tick() {
+  try {
   const now  = Date.now();
   const mins = minsNow();
   const today = todayStr();
@@ -224,6 +225,9 @@ async function tick() {
   if (mins < 60 && lastCaptureDate !== today) {
     lastCaptureDate = today;
     void captureMidnightCensus(today);
+  }
+  } catch (err) {
+    console.error("Scheduler tick failed:", err);
   }
 }
 

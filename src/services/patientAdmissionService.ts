@@ -68,6 +68,14 @@ export async function createAdmission(opts: {
   const existing = await getActiveAdmissionByBed(opts.bedId);
   if (existing) throw new HttpError(409, "This bed already has an active patient admission.");
 
+  const dupIp = await db.prepare(
+    "SELECT bed_id FROM patient_admissions WHERE ip_last6=? AND status='ACTIVE' LIMIT 1"
+  ).get<{ bed_id: number }>(ipLast6);
+  if (dupIp) {
+    const dupBed = await db.prepare("SELECT bed_name FROM bed_details WHERE id=?").get<{ bed_name: string }>(dupIp.bed_id);
+    throw new HttpError(409, `IP ${ipLast6} is already admitted on bed ${dupBed?.bed_name ?? dupIp.bed_id}. Discharge or transfer the existing admission first.`);
+  }
+
   const now = Date.now();
   const row = await db.prepare(
     `INSERT INTO patient_admissions (bed_id, ward_id, ip_last6, admission_type, consultant_name, department_name, doctor_id, department_id, status, admitted_at, created_by, updated_at)

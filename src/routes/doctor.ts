@@ -291,8 +291,8 @@ router.post("/wards/:id/review", asyncH(async (req, res) => {
   // Same shared Review button/component on both sides, same spam concern.
   const REVIEW_COOLDOWN_MS = 5 * 60 * 1000;
   const lastReview = await db.prepare(
-    "SELECT reviewed_at FROM doctor_block_reviews WHERE ward_id=? ORDER BY reviewed_at DESC LIMIT 1"
-  ).get<{ reviewed_at: number }>(wardId);
+    "SELECT reviewed_at FROM doctor_block_reviews WHERE ward_id=? AND doctor_block_id=? ORDER BY reviewed_at DESC LIMIT 1"
+  ).get<{ reviewed_at: number }>(wardId, doctorBlockId);
   if (lastReview) {
     const waitMs = REVIEW_COOLDOWN_MS - (Date.now() - Number(lastReview.reviewed_at));
     if (waitMs > 0)
