@@ -251,9 +251,10 @@ export async function createWard(opts: {
 // saved_views.selected_wards stores ward NAMES (JSON array), not ids — a rename
 // would otherwise silently drop the ward out of every saved view that lists it.
 async function renameWardInSavedViews(oldName: string, newName: string) {
+  const escaped = oldName.replace(/[%_\\]/g, "\\$&");
   const rows = await db.prepare(
-    "SELECT id, selected_wards FROM saved_views WHERE selected_wards LIKE ?"
-  ).all<{ id: number; selected_wards: string }>(`%${oldName}%`);
+    "SELECT id, selected_wards FROM saved_views WHERE selected_wards LIKE ? ESCAPE '\\'"
+  ).all<{ id: number; selected_wards: string }>(`%${escaped}%`);
   for (const row of rows) {
     let wards: unknown;
     try { wards = JSON.parse(row.selected_wards || "[]"); } catch { continue; }

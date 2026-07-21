@@ -440,14 +440,15 @@ async function completeIfEligible(tracking: DischargeTracking, userId: number) {
   const admission = await getAdmissionById(tracking.admission_id);
   if (!admission) return;
 
-  await updateBedStatus({
-    bedId: admission.bed_id, physicalStatus: "VACANT", reservationStatus: "NONE",
-    userId, changeReason: "DISCHARGE_CHECKOUT",
-  });
-  await closeAdmission(admission.id, userId);
-
   const now = Date.now();
-  await db.prepare("UPDATE discharge_tracking SET status='COMPLETED', updated_at=? WHERE id=?").run(now, tracking.id);
+  await db.transaction(async () => {
+    await updateBedStatus({
+      bedId: admission.bed_id, physicalStatus: "VACANT", reservationStatus: "NONE",
+      userId, changeReason: "DISCHARGE_CHECKOUT",
+    });
+    await closeAdmission(admission.id, userId);
+    await db.prepare("UPDATE discharge_tracking SET status='COMPLETED', updated_at=? WHERE id=?").run(now, tracking.id);
+  });
   await logHistory({
     admissionId: tracking.admission_id, trackingId: tracking.id, field: "status",
     oldValue: tracking.status, newValue: "COMPLETED", userId,
@@ -516,9 +517,11 @@ export async function updateStep(opts: {
   }
   const slaSql = slaSets.length ? `, ${slaSets.join(", ")}` : "";
 
-  await db.prepare(
+  const r = await db.prepare(
     `UPDATE discharge_tracking SET ${col}=?, status=?, patient_left=?${slaSql}, updated_at=? WHERE id=? AND updated_at=?`
   ).run(opts.status, nextStatus, patientLeft, ...slaParams, now, tracking.id, tracking.updated_at);
+  if (r.changes === 0)
+    throw new HttpError(409, "This discharge was just updated by someone else. Please refresh and try again.");
 
   await logHistory({
     admissionId: opts.admissionId, trackingId: tracking.id, field: opts.step,

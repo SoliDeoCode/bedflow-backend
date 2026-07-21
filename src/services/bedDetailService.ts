@@ -447,21 +447,21 @@ export async function updateBedStatus(opts: {
           bed.reservation_status, opts.reservationStatus,
           newPayerType, movementDestination, movementReservationNote, opts.userId, now);
     await _recalcWardTotals(bed.ward_id, opts.userId);
+
+    await handleDischargeSideEffects({
+      bedId: opts.bedId, wardId: bed.ward_id,
+      oldPhysical: bed.physical_status, newPhysical: opts.physicalStatus,
+      ipLast6: opts.ipLast6, admissionType: opts.admissionType,
+      consultantName: opts.consultantName, departmentName: opts.departmentName,
+      doctorId: opts.doctorId, departmentId: opts.departmentId,
+      changeReason, userId: opts.userId,
+    });
   });
 
   await audit(opts.userId, "bed_status_update", String(opts.bedId), {
     old: { physical: bed.physical_status, reservation: bed.reservation_status, payer: bed.payer_type, destination: bed.destination, note: bed.reservation_note },
     new: { physical: opts.physicalStatus,  reservation: opts.reservationStatus,  payer: newPayerType,  destination: movementDestination, note: movementReservationNote },
     wardId: bed.ward_id,
-  });
-
-  await handleDischargeSideEffects({
-    bedId: opts.bedId, wardId: bed.ward_id,
-    oldPhysical: bed.physical_status, newPhysical: opts.physicalStatus,
-    ipLast6: opts.ipLast6, admissionType: opts.admissionType,
-    consultantName: opts.consultantName, departmentName: opts.departmentName,
-    doctorId: opts.doctorId, departmentId: opts.departmentId,
-    changeReason, userId: opts.userId,
   });
 
   return { ok: true, ward_id: bed.ward_id, physical_status: opts.physicalStatus, reservation_status: opts.reservationStatus, payer_type: newPayerType, destination: newDestination, reservation_note: newReservationNote };

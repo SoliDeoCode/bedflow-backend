@@ -65,6 +65,9 @@ export const db: Db = {
   },
 
   async transaction<T>(fn: () => Promise<T>): Promise<T> {
+    const existing = txStore.getStore();
+    if (existing) return fn();
+
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
