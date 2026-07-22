@@ -84,7 +84,7 @@ const STEP_LABELS: Record<StepKey, string> = {
 // Every step System Checkout must wait on — everything except itself and Physical
 // Checkout (which happens after/parallel to it, not before it).
 const PRE_SYSTEM_CHECKOUT_STEPS: StepKey[] = [
-  "DISCHARGE_INITIATION", "DISCHARGE_DOC", "DRUG_RETURN", "PHARMACY_CLEARANCE", "PROCEDURE_RECONCILIATION",
+  "DISCHARGE_DOC", "DRUG_RETURN", "PHARMACY_CLEARANCE", "PROCEDURE_RECONCILIATION",
   "BILLING_STARTED", "AUDIT", "BILL_READY", "PAYMENT",
 ];
 
@@ -340,7 +340,7 @@ export async function initiateDischarge(opts: { admissionId: number; userId: num
   requireRoleIn(opts.role, INITIATE_ROLES, "Starting a discharge");
   const tracking = await getTrackingByAdmission(opts.admissionId);
   if (!tracking) throw new HttpError(404, "No discharge plan found for this admission");
-  if (tracking.status !== "PLANNED")
+  if (tracking.status !== "PLANNED" && tracking.status !== "CANCELLED")
     throw new HttpError(409, `Cannot start — discharge is already ${tracking.status}`);
 
   const now = Date.now();
