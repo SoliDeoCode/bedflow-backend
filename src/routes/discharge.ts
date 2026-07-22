@@ -308,10 +308,11 @@ router.get("/history/:admissionId", asyncH(async (req, res) => {
   res.json(await historyForAdmission(admissionId));
 }));
 
-// ── Bed transfer (PRE only) ───────────────────────────────────────────────────
+// ── Bed transfer (PRE + Nurse) ────────────────────────────────────────────────
+const TRANSFER_ROLES = ["PRE", "NURSE"];
 
 router.get("/transfer/candidates", asyncH(async (req, res) => {
-  if (req.user!.role !== "PRE") throw new HttpError(403, "Only PRE can transfer beds");
+  if (!TRANSFER_ROLES.includes(req.user!.role)) throw new HttpError(403, "Only PRE or Nurse can transfer beds");
   const wardId = Number(req.query.wardId);
   if (!wardId) throw new HttpError(400, "wardId is required");
   await assertWardAccess(req.user!.id, req.user!.role, wardId);
@@ -319,7 +320,7 @@ router.get("/transfer/candidates", asyncH(async (req, res) => {
 }));
 
 router.post("/transfer", asyncH(async (req, res) => {
-  if (req.user!.role !== "PRE") throw new HttpError(403, "Only PRE can transfer beds");
+  if (!TRANSFER_ROLES.includes(req.user!.role)) throw new HttpError(403, "Only PRE or Nurse can transfer beds");
   const { fromBedId, toWardId, toBedId, reason } = z.object({
     fromBedId: z.number().int(),
     toWardId: z.number().int(),
