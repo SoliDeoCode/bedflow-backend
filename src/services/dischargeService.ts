@@ -546,6 +546,11 @@ export async function updateStep(opts: {
     for (const next of nexts) { slaSets.push(`${startedCol(next)}=COALESCE(${startedCol(next)}, ?)`); slaParams.push(now); }
   } else {
     slaSets.push(`${completedCol(opts.step)}=NULL`);
+    // Reopening System Checkout resets Physical Checkout timer if PC hasn't been completed.
+    if (opts.step === "SYSTEM_CHECKOUT" && tracking.physical_checkout_status === "PENDING") {
+      slaSets.push(`${startedCol("PHYSICAL_CHECKOUT")}=NULL`);
+      slaSets.push(`${completedCol("PHYSICAL_CHECKOUT")}=NULL`);
+    }
   }
   const slaSql = slaSets.length ? `, ${slaSets.join(", ")}` : "";
 
