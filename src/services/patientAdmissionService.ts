@@ -112,27 +112,30 @@ export async function updateActiveAdmission(opts: {
   if (!doctorId) throw new HttpError(400, "Consultant is required.");
 
   const now = Date.now();
-  await db.prepare(
-    `UPDATE patient_admissions
-     SET ip_last6=?, admission_type=?, consultant_name=?, department_name=?, doctor_id=?, department_id=?, updated_at=?
-     WHERE id=? AND status='ACTIVE'`
-  ).run(ipLast6, admissionType, consultantName, departmentName, doctorId, departmentId, now, admission.id);
+  await db.transaction(async () => {
+    const r = await db.prepare(
+      `UPDATE patient_admissions
+       SET ip_last6=?, admission_type=?, consultant_name=?, department_name=?, doctor_id=?, department_id=?, updated_at=?
+       WHERE id=? AND status='ACTIVE' AND updated_at=?`
+    ).run(ipLast6, admissionType, consultantName, departmentName, doctorId, departmentId, now, admission.id, admission.updated_at);
+    if (r.changes === 0) throw new HttpError(409, "Patient info was just updated by someone else. Please refresh and try again.");
 
-  if (opts.payerType !== undefined) {
-    await db.prepare(
-      "UPDATE bed_details SET payer_type=?, updated_at=? WHERE id=?"
-    ).run(opts.payerType, now, opts.bedId);
-  }
+    if (opts.payerType !== undefined) {
+      await db.prepare(
+        "UPDATE bed_details SET payer_type=?, updated_at=? WHERE id=?"
+      ).run(opts.payerType, now, opts.bedId);
+    }
 
-  await audit(opts.userId, "admission_update", String(opts.bedId), {
-    old: {
-      ipLast6: admission.ip_last6, admissionType: admission.admission_type,
-      consultantName: admission.consultant_name, departmentName: admission.department_name,
-      doctorId: admission.doctor_id, departmentId: admission.department_id,
-      payerType: opts.payerType !== undefined ? undefined : "(unchanged)",
-    },
-    new: { ipLast6, admissionType, consultantName, departmentName, doctorId, departmentId,
-           ...(opts.payerType !== undefined ? { payerType: opts.payerType } : {}) },
+    await audit(opts.userId, "admission_update", String(opts.bedId), {
+      old: {
+        ipLast6: admission.ip_last6, admissionType: admission.admission_type,
+        consultantName: admission.consultant_name, departmentName: admission.department_name,
+        doctorId: admission.doctor_id, departmentId: admission.department_id,
+        payerType: opts.payerType !== undefined ? undefined : "(unchanged)",
+      },
+      new: { ipLast6, admissionType, consultantName, departmentName, doctorId, departmentId,
+             ...(opts.payerType !== undefined ? { payerType: opts.payerType } : {}) },
+    });
   });
 
   return (await getAdmissionById(admission.id))!;

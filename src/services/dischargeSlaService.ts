@@ -344,7 +344,7 @@ export async function decorateMany<T extends TrackingRow & { payer_type?: string
  * only opens once its prerequisites clear.
  */
 export function initialStartSql(now: number): { sql: string; params: unknown[] } {
-  const leads: StepKey[] = ["DISCHARGE_INITIATION", "DRUG_RETURN", "BILLING_STARTED", "PHYSICAL_CHECKOUT"];
+  const leads: StepKey[] = ["DISCHARGE_INITIATION", "DRUG_RETURN", "PHYSICAL_CHECKOUT"];
   const sets = leads.map(k => `${startedCol(k)} = COALESCE(${startedCol(k)}, ?)`);
   return { sql: sets.join(", "), params: leads.map(() => now) };
 }
@@ -381,6 +381,17 @@ export function nextPhasesToStart(completed: StepKey, tracking: TrackingRow): St
     // Skip if this step fans out to parallel successors (already handled above)
     if (next && tracking[startedCol(next)] == null && !Object.values(PARALLEL_SUCCESSORS).some(arr => arr.includes(next))) {
       result.push(next);
+    }
+  }
+
+  // Bill Prep (BILLING_STARTED) unlocks only when BOTH Pharmacy Clearance and
+  // Procedure Reconciliation are done. Its start time = now (the later of the two).
+  if (tracking[startedCol("BILLING_STARTED")] == null &&
+      (completed === "PHARMACY_CLEARANCE" || completed === "PROCEDURE_RECONCILIATION")) {
+    const sibling = completed === "PHARMACY_CLEARANCE" ? "PROCEDURE_RECONCILIATION" : "PHARMACY_CLEARANCE";
+    const siblingStatus = String(tracking[statusCol(sibling)] ?? "PENDING");
+    if (siblingStatus === "COMPLETED" || siblingStatus === "NOT_APPLICABLE") {
+      result.push("BILLING_STARTED");
     }
   }
 
