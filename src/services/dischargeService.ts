@@ -54,15 +54,15 @@ const STEP_COLUMN: Record<StepKey, string> = {
 // allowed by the spec (edit + save history) — there is no enforced step
 // ordering here, only who is allowed to touch a given step.
 export const STEP_PERMISSIONS: Record<StepKey, Role[]> = {
-  DISCHARGE_INITIATION: ["DOCTOR", "CONSULTANT"],
-  DISCHARGE_DOC: ["DOCTOR", "CONSULTANT"],
+  DISCHARGE_INITIATION: ["PRE", "DOCTOR", "CONSULTANT"],
+  DISCHARGE_DOC: ["PRE", "DOCTOR", "CONSULTANT"],
   DRUG_RETURN: ["PRE", "NURSE", "PHARMACY", "MASTER_PHARMACY"],
   PHARMACY_CLEARANCE: ["PRE", "NURSE", "PHARMACY", "MASTER_PHARMACY"],
   PROCEDURE_RECONCILIATION: ["PRE", "PHARMACY", "MASTER_PHARMACY"],
   BILLING_STARTED: ["PRE", "FC", "MASTER_FC"],
   AUDIT: ["PRE", "FC", "MASTER_FC"],
-  BILL_READY: ["FC", "MASTER_FC"],
-  PAYMENT: ["FC", "MASTER_FC"],
+  BILL_READY: ["PRE", "FC", "MASTER_FC"],
+  PAYMENT: ["PRE", "FC", "MASTER_FC"],
   SYSTEM_CHECKOUT: ["PRE"],
   PHYSICAL_CHECKOUT: ["PRE", "NURSE"],
 };
@@ -300,15 +300,18 @@ export async function reschedule(opts: {
   const oldValue = `${tracking.planned_date} ${tracking.planned_time ?? ""}`.trim();
   const newValue = `${opts.plannedDate} ${opts.plannedTime ?? ""}`.trim();
   const now = Date.now();
-  await db.prepare(
-    "UPDATE discharge_tracking SET planned_date=?, planned_time=?, status='PLANNED', prompted_at=NULL, updated_at=? WHERE id=?"
-  ).run(opts.plannedDate, opts.plannedTime ?? null, now, tracking.id);
+  await db.transaction(async () => {
+    const r = await db.prepare(
+      "UPDATE discharge_tracking SET planned_date=?, planned_time=?, status='PLANNED', prompted_at=NULL, updated_at=? WHERE id=? AND updated_at=?"
+    ).run(opts.plannedDate, opts.plannedTime ?? null, now, tracking.id, tracking.updated_at);
+    if (r.changes === 0) throw new HttpError(409, "This discharge was just updated by someone else. Please refresh and try again.");
 
-  await logHistory({
-    admissionId: opts.admissionId, trackingId: tracking.id, field: "reschedule",
-    oldValue, newValue, userId: opts.userId, reason: opts.reason,
+    await logHistory({
+      admissionId: opts.admissionId, trackingId: tracking.id, field: "reschedule",
+      oldValue, newValue, userId: opts.userId, reason: opts.reason,
+    });
+    await audit(opts.userId, "discharge_reschedule", String(opts.admissionId), { from: oldValue, to: newValue, reason: opts.reason });
   });
-  await audit(opts.userId, "discharge_reschedule", String(opts.admissionId), { from: oldValue, to: newValue, reason: opts.reason });
 
   return (await getTrackingById(tracking.id))!;
 }
@@ -321,12 +324,16 @@ export async function cancelPlan(opts: { admissionId: number; reason?: string | 
     throw new HttpError(409, "Only a discharge that hasn't started yet can be cancelled this way");
 
   const now = Date.now();
-  await db.prepare("UPDATE discharge_tracking SET status='CANCELLED', updated_at=? WHERE id=?").run(now, tracking.id);
-  await logHistory({
-    admissionId: opts.admissionId, trackingId: tracking.id, field: "status",
-    oldValue: tracking.status, newValue: "CANCELLED", userId: opts.userId, reason: opts.reason,
+  await db.transaction(async () => {
+    const r = await db.prepare("UPDATE discharge_tracking SET status='CANCELLED', updated_at=? WHERE id=? AND updated_at=?").run(now, tracking.id, tracking.updated_at);
+    if (r.changes === 0) throw new HttpError(409, "This discharge was just updated by someone else. Please refresh and try again.");
+
+    await logHistory({
+      admissionId: opts.admissionId, trackingId: tracking.id, field: "status",
+      oldValue: tracking.status, newValue: "CANCELLED", userId: opts.userId, reason: opts.reason,
+    });
+    await audit(opts.userId, "discharge_cancel_plan", String(opts.admissionId), { reason: opts.reason });
   });
-  await audit(opts.userId, "discharge_cancel_plan", String(opts.admissionId), { reason: opts.reason });
 }
 
 export async function initiateDischarge(opts: { admissionId: number; userId: number; role: Role }): Promise<DischargeTracking> {
@@ -353,55 +360,60 @@ export async function initiateDischarge(opts: { admissionId: number; userId: num
   // DISCHARGE_INITIATION is auto-completed at initiation — the "Initiate Now"
   // action IS the discharge initiation step, so it's instantly done.
   const { sql: startSql, params: startParams } = initialStartSql(now);
-  await db.prepare(
-    `UPDATE discharge_tracking SET status='DISCHARGE_INITIATED', initiated_at=?, payer_type=?,
-     discharge_initiation_status='COMPLETED',
-     discharge_initiation_completed_at=COALESCE(discharge_initiation_completed_at, ?),
-     discharge_doc_started_at=COALESCE(discharge_doc_started_at, ?),
-     ${startSql}, updated_at=? WHERE id=?`
-  ).run(now, payerType, now, now, ...startParams, now, tracking.id);
-  await logHistory({
-    admissionId: opts.admissionId, trackingId: tracking.id, field: "status",
-    oldValue: tracking.status, newValue: "DISCHARGE_INITIATED", userId: opts.userId,
+  await db.transaction(async () => {
+    const r = await db.prepare(
+      `UPDATE discharge_tracking SET status='DISCHARGE_INITIATED', initiated_at=?, payer_type=?,
+       discharge_initiation_status='COMPLETED',
+       discharge_initiation_completed_at=COALESCE(discharge_initiation_completed_at, ?),
+       discharge_doc_started_at=COALESCE(discharge_doc_started_at, ?),
+       ${startSql}, updated_at=? WHERE id=? AND updated_at=?`
+    ).run(now, payerType, now, now, ...startParams, now, tracking.id, tracking.updated_at);
+    if (r.changes === 0) throw new HttpError(409, "This discharge was just updated by someone else. Please refresh and try again.");
+
+    await logHistory({
+      admissionId: opts.admissionId, trackingId: tracking.id, field: "status",
+      oldValue: tracking.status, newValue: "DISCHARGE_INITIATED", userId: opts.userId,
+    });
+    await audit(opts.userId, "discharge_initiate", String(opts.admissionId), {});
   });
-  await audit(opts.userId, "discharge_initiate", String(opts.admissionId), {});
 
   return (await getTrackingById(tracking.id))!;
 }
 
 async function resetAndCancelTracking(tracking: DischargeTracking, userId: number | null, reason: string | null | undefined) {
   const now = Date.now();
-  for (const step of Object.keys(STEP_COLUMN) as StepKey[]) {
-    const col = STEP_COLUMN[step];
-    const oldValue = (tracking as unknown as Record<string, string>)[col];
-    if (oldValue !== "PENDING") {
-      await logHistory({
-        admissionId: tracking.admission_id, trackingId: tracking.id, field: step,
-        oldValue, newValue: "PENDING", userId, reason: reason ?? "Discharge cancelled after initiation",
-      });
+  await db.transaction(async () => {
+    for (const step of Object.keys(STEP_COLUMN) as StepKey[]) {
+      const col = STEP_COLUMN[step];
+      const oldValue = (tracking as unknown as Record<string, string>)[col];
+      if (oldValue !== "PENDING") {
+        await logHistory({
+          admissionId: tracking.admission_id, trackingId: tracking.id, field: step,
+          oldValue, newValue: "PENDING", userId, reason: reason ?? "Discharge cancelled after initiation",
+        });
+      }
     }
-  }
-  // Reset the SLA clocks too — a cancelled workflow must not carry stale start
-  // times into a later re-plan, or every phase would look instantly delayed.
-  const clearSla = ALL_STEPS
-    .flatMap(k => [`${startedCol(k)}=NULL`, `${completedCol(k)}=NULL`])
-    .join(", ");
-  await db.prepare(`
-    UPDATE discharge_tracking SET
-      status='CANCELLED',
-      discharge_initiation_status='PENDING', discharge_doc_status='PENDING', drug_return_status='PENDING', pharmacy_clearance_status='PENDING',
-      procedure_reconciliation_status='PENDING', billing_started_status='PENDING', audit_status='PENDING',
-      bill_ready_status='PENDING', payment_status='PENDING', system_checkout_status='PENDING', physical_checkout_status='PENDING',
-      ${clearSla},
-      patient_left=NULL, updated_at=?
-    WHERE id=?
-  `).run(now, tracking.id);
+    const clearSla = ALL_STEPS
+      .flatMap(k => [`${startedCol(k)}=NULL`, `${completedCol(k)}=NULL`])
+      .join(", ");
+    const r = await db.prepare(`
+      UPDATE discharge_tracking SET
+        status='CANCELLED',
+        discharge_initiation_status='PENDING', discharge_doc_status='PENDING', drug_return_status='PENDING', pharmacy_clearance_status='PENDING',
+        procedure_reconciliation_status='PENDING', billing_started_status='PENDING', audit_status='PENDING',
+        bill_ready_status='PENDING', payment_status='PENDING', system_checkout_status='PENDING', physical_checkout_status='PENDING',
+        ${clearSla},
+        patient_left=NULL, updated_at=?
+      WHERE id=? AND updated_at=?
+    `).run(now, tracking.id, tracking.updated_at);
+    if (r.changes === 0) throw new HttpError(409, "This discharge was just updated by someone else. Please refresh and try again.");
 
-  await logHistory({
-    admissionId: tracking.admission_id, trackingId: tracking.id, field: "status",
-    oldValue: tracking.status, newValue: "CANCELLED", userId, reason,
+    await logHistory({
+      admissionId: tracking.admission_id, trackingId: tracking.id, field: "status",
+      oldValue: tracking.status, newValue: "CANCELLED", userId, reason,
+    });
+    await audit(userId, "discharge_cancel", String(tracking.admission_id), { reason });
   });
-  await audit(userId, "discharge_cancel", String(tracking.admission_id), { reason });
 }
 
 /** "Discharge cancelled after initiation" edge case: stop workflow, reset checklist, keep history. */
@@ -447,7 +459,8 @@ async function completeIfEligible(tracking: DischargeTracking, userId: number) {
       userId, changeReason: "DISCHARGE_CHECKOUT",
     });
     await closeAdmission(admission.id, userId);
-    await db.prepare("UPDATE discharge_tracking SET status='COMPLETED', updated_at=? WHERE id=?").run(now, tracking.id);
+    const r = await db.prepare("UPDATE discharge_tracking SET status='COMPLETED', updated_at=? WHERE id=? AND updated_at=?").run(now, tracking.id, tracking.updated_at);
+    if (r.changes === 0) throw new HttpError(409, "This discharge was just updated by someone else. Please refresh and try again.");
   });
   await logHistory({
     admissionId: tracking.admission_id, trackingId: tracking.id, field: "status",
@@ -475,6 +488,25 @@ export async function updateStep(opts: {
 
   if (opts.step === "PHYSICAL_CHECKOUT" && opts.status === "COMPLETED" && opts.patientLeft === undefined)
     throw new HttpError(400, "patient_left (true/false) is required when completing Physical Checkout");
+
+  // Bill Prep requires both Pharmacy Clearance and Procedure Reconciliation done.
+  if (opts.step === "BILLING_STARTED" && opts.status === "COMPLETED") {
+    const phcDone = ["COMPLETED", "NOT_APPLICABLE"].includes(tracking.pharmacy_clearance_status);
+    const prDone = ["COMPLETED", "NOT_APPLICABLE"].includes(tracking.procedure_reconciliation_status);
+    const missing: string[] = [];
+    if (!phcDone) missing.push(STEP_LABELS.PHARMACY_CLEARANCE);
+    if (!prDone) missing.push(STEP_LABELS.PROCEDURE_RECONCILIATION);
+    if (missing.length > 0)
+      throw new HttpError(409, `Complete these steps before Bill Prep: ${missing.join(", ")}`);
+  }
+
+  // Drug Return cannot be reopened once either downstream step has been completed.
+  if (opts.step === "DRUG_RETURN" && opts.status === "PENDING") {
+    const phcDone = ["COMPLETED", "NOT_APPLICABLE"].includes(tracking.pharmacy_clearance_status);
+    const prDone = ["COMPLETED", "NOT_APPLICABLE"].includes(tracking.procedure_reconciliation_status);
+    if (phcDone || prDone)
+      throw new HttpError(409, "Cannot reopen Drug Return — Pharmacy Clearance or Procedure Reconciliation is already completed.");
+  }
 
   // System Checkout must be the last administrative step — it can't be marked
   // complete while any other part of the discharge flow (doctor summary, drug/
@@ -514,6 +546,11 @@ export async function updateStep(opts: {
     for (const next of nexts) { slaSets.push(`${startedCol(next)}=COALESCE(${startedCol(next)}, ?)`); slaParams.push(now); }
   } else {
     slaSets.push(`${completedCol(opts.step)}=NULL`);
+    // Reopening System Checkout resets Physical Checkout timer if PC hasn't been completed.
+    if (opts.step === "SYSTEM_CHECKOUT" && tracking.physical_checkout_status === "PENDING") {
+      slaSets.push(`${startedCol("PHYSICAL_CHECKOUT")}=NULL`);
+      slaSets.push(`${completedCol("PHYSICAL_CHECKOUT")}=NULL`);
+    }
   }
   const slaSql = slaSets.length ? `, ${slaSets.join(", ")}` : "";
 

@@ -108,23 +108,26 @@ export async function reviewRequest(opts: {
   if (req.status !== "PENDING") throw new HttpError(409, `Request already ${req.status}`);
 
   const now = Date.now();
-  await db.prepare(
-    `UPDATE reopen_requests SET status=?, reviewed_by=?, review_note=?, reviewed_at=? WHERE id=?`
-  ).run(opts.action, opts.userId, opts.reviewNote ?? null, now, opts.requestId);
+  await db.transaction(async () => {
+    const r = await db.prepare(
+      `UPDATE reopen_requests SET status=?, reviewed_by=?, review_note=?, reviewed_at=? WHERE id=? AND status='PENDING'`
+    ).run(opts.action, opts.userId, opts.reviewNote ?? null, now, opts.requestId);
+    if (r.changes === 0) throw new HttpError(409, "This request was already reviewed by someone else. Please refresh.");
 
-  if (opts.action === "APPROVED") {
-    await updateStep({
-      admissionId: req.admission_id,
-      step: req.step_key as StepKey,
-      status: "PENDING",
-      userId: opts.userId,
-      role: opts.role as any,
-      reason: `Reopened via request #${req.id}: ${req.reason}`,
+    if (opts.action === "APPROVED") {
+      await updateStep({
+        admissionId: req.admission_id,
+        step: req.step_key as StepKey,
+        status: "PENDING",
+        userId: opts.userId,
+        role: opts.role as any,
+        reason: `Reopened via request #${req.id}: ${req.reason}`,
+      });
+    }
+
+    await audit(opts.userId, `reopen_request_${opts.action.toLowerCase()}`, String(req.admission_id), {
+      requestId: req.id, step: req.step_key,
     });
-  }
-
-  await audit(opts.userId, `reopen_request_${opts.action.toLowerCase()}`, String(req.admission_id), {
-    requestId: req.id, step: req.step_key,
   });
 
   return (await db.prepare("SELECT * FROM reopen_requests WHERE id=?")

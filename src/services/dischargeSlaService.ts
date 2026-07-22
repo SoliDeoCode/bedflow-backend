@@ -207,6 +207,8 @@ export interface WorkflowView {
   /** Estimated discharge time (epoch ms), null once complete. */
   eta: number | null;
   etaMinutes: number | null;
+  /** Fixed expected discharge time (epoch ms) = initiated_at + critical-path TAT sum. */
+  expectedTime: number | null;
   done: number;
   total: number;
   pct: number;
@@ -297,6 +299,22 @@ export function computeWorkflow(
   const tail = Math.max(groupRemaining(4), groupRemaining(5));
   const etaMinutes = parallelHead + tail;
 
+  // Fixed expected time: initiated_at + critical-path TAT sum (never changes).
+  // Group 2 → Group 3 is serial (Bill Prep waits on PHC+PR).
+  // Within group 2: DRUG_RETURN is sequential, then PHC and PR run in parallel.
+  const initiatedAt = num(tracking.initiated_at);
+  const tat = (key: StepKey) => {
+    const p = phases.find(ph => ph.key === key);
+    return p && p.state !== "NOT_APPLICABLE" ? p.expectedMinutes : 0;
+  };
+  const g1Total = tat("DISCHARGE_INITIATION") + tat("DISCHARGE_DOC");
+  const g2Total = tat("DRUG_RETURN") + Math.max(tat("PHARMACY_CLEARANCE"), tat("PROCEDURE_RECONCILIATION"));
+  const g3Total = tat("BILLING_STARTED") + tat("AUDIT") + tat("BILL_READY") + tat("PAYMENT");
+  const g4Total = tat("SYSTEM_CHECKOUT");
+  const g5Total = tat("PHYSICAL_CHECKOUT");
+  const criticalPathMinutes = Math.max(g1Total, g2Total + g3Total) + g4Total + g5Total;
+  const expectedTime = initiatedAt != null ? initiatedAt + criticalPathMinutes * 60_000 : null;
+
   const counted = phases.filter(p => p.state !== "NOT_APPLICABLE" && !AUTO_STEPS.has(p.key));
   const done = counted.filter(p => p.state === "COMPLETED").length;
   const total = counted.length;
@@ -308,6 +326,7 @@ export function computeWorkflow(
     state: finished ? "COMPLETED" : delayed.length > 0 ? "DELAYED" : "ON_TIME",
     eta: finished ? null : now + etaMinutes * 60_000,
     etaMinutes: finished ? null : etaMinutes,
+    expectedTime,
     done, total,
     pct: total ? Math.round((done / total) * 100) : 0,
   };
@@ -344,7 +363,7 @@ export async function decorateMany<T extends TrackingRow & { payer_type?: string
  * only opens once its prerequisites clear.
  */
 export function initialStartSql(now: number): { sql: string; params: unknown[] } {
-  const leads: StepKey[] = ["DISCHARGE_INITIATION", "DRUG_RETURN", "BILLING_STARTED", "PHYSICAL_CHECKOUT"];
+  const leads: StepKey[] = ["DISCHARGE_INITIATION", "DRUG_RETURN"];
   const sets = leads.map(k => `${startedCol(k)} = COALESCE(${startedCol(k)}, ?)`);
   return { sql: sets.join(", "), params: leads.map(() => now) };
 }
@@ -384,6 +403,17 @@ export function nextPhasesToStart(completed: StepKey, tracking: TrackingRow): St
     }
   }
 
+  // Bill Prep (BILLING_STARTED) unlocks only when BOTH Pharmacy Clearance and
+  // Procedure Reconciliation are done. Its start time = now (the later of the two).
+  if (tracking[startedCol("BILLING_STARTED")] == null &&
+      (completed === "PHARMACY_CLEARANCE" || completed === "PROCEDURE_RECONCILIATION")) {
+    const sibling = completed === "PHARMACY_CLEARANCE" ? "PROCEDURE_RECONCILIATION" : "PHARMACY_CLEARANCE";
+    const siblingStatus = String(tracking[statusCol(sibling)] ?? "PENDING");
+    if (siblingStatus === "COMPLETED" || siblingStatus === "NOT_APPLICABLE") {
+      result.push("BILLING_STARTED");
+    }
+  }
+
   // Does completing this step unlock System Checkout?
   if (tracking[startedCol("SYSTEM_CHECKOUT")] == null) {
     const blockers = [...GROUP_STEPS[1], ...GROUP_STEPS[2], ...GROUP_STEPS[3]];
@@ -392,6 +422,11 @@ export function nextPhasesToStart(completed: StepKey, tracking: TrackingRow): St
       return v === "COMPLETED" || v === "NOT_APPLICABLE";
     });
     if (allClear) result.push("SYSTEM_CHECKOUT");
+  }
+
+  // Physical Checkout timer starts only when System Checkout completes.
+  if (completed === "SYSTEM_CHECKOUT" && tracking[startedCol("PHYSICAL_CHECKOUT")] == null) {
+    result.push("PHYSICAL_CHECKOUT");
   }
 
   return result;

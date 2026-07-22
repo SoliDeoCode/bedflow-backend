@@ -47,19 +47,22 @@ router.get("/status", asyncH(async (req, res) => {
   const config = await listPhaseConfig();
   const wf = computeWorkflow({ ...row, status: row.discharge_status } as never, config);
 
-  // Critical-path expected time: groups 1-3 run in parallel, then 4+5 in parallel.
+  // Critical-path expected time — mirrors computeWorkflow's expectedTime.
+  // Group 2 has a parallel fan-out (Drug Return → PHC + PR in parallel),
+  // and group 3 is serial after group 2 (Bill Prep waits on PHC+PR).
   let totalExpectedMinutes: number | null = null;
   let expectedEta: number | null = null;
   if (wf) {
-    const groupTotals: Record<number, number> = {};
-    for (const p of wf.phases) {
-      if (p.state === "NOT_APPLICABLE") continue;
-      const g = STEP_GROUP[p.key as keyof typeof STEP_GROUP] ?? 0;
-      groupTotals[g] = (groupTotals[g] ?? 0) + p.expectedMinutes;
-    }
-    const head = Math.max(groupTotals[1] ?? 0, groupTotals[2] ?? 0, groupTotals[3] ?? 0);
-    const tail = Math.max(groupTotals[4] ?? 0, groupTotals[5] ?? 0);
-    totalExpectedMinutes = head + tail;
+    const tat = (key: string) => {
+      const p = wf.phases.find(ph => ph.key === key);
+      return p && p.state !== "NOT_APPLICABLE" ? p.expectedMinutes : 0;
+    };
+    const g1 = tat("DISCHARGE_INITIATION") + tat("DISCHARGE_DOC");
+    const g2 = tat("DRUG_RETURN") + Math.max(tat("PHARMACY_CLEARANCE"), tat("PROCEDURE_RECONCILIATION"));
+    const g3 = tat("BILLING_STARTED") + tat("AUDIT") + tat("BILL_READY") + tat("PAYMENT");
+    const g4 = tat("SYSTEM_CHECKOUT");
+    const g5 = tat("PHYSICAL_CHECKOUT");
+    totalExpectedMinutes = Math.max(g1, g2 + g3) + g4 + g5;
     const init = Number(row.initiated_at);
     if (init > 0) expectedEta = init + totalExpectedMinutes * 60_000;
   }

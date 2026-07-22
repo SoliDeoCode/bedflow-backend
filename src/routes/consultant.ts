@@ -32,8 +32,15 @@ router.get("/admin-dashboard-history", asyncH(async (req, res) => {
   res.json({ snapshots: await adminDashboardHistory(48, unit) });
 }));
 
-router.get("/consultants", asyncH(async (_req, res) => {
-  res.json(await consultantsLive());
+router.get("/consultants", asyncH(async (req, res) => {
+  const full = await consultantsLive();
+  // Hide other consultants — only show the logged-in consultant's own row.
+  // To enable: uncomment the filter below and remove the empty array.
+  // const me = req.user!;
+  // const myName = me.name || me.username || "";
+  // full.consultants = full.consultants.filter(c => c.name === myName);
+  full.consultants = [];
+  res.json(full);
 }));
 
 router.get("/snapshots", asyncH(async (_req, res) => {
