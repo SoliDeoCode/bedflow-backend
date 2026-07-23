@@ -63,7 +63,7 @@ export const STEP_PERMISSIONS: Record<StepKey, Role[]> = {
   AUDIT: ["PRE", "FC", "MASTER_FC"],
   BILL_READY: ["PRE", "FC", "MASTER_FC"],
   PAYMENT: ["PRE", "FC", "MASTER_FC"],
-  SYSTEM_CHECKOUT: ["PRE"],
+  SYSTEM_CHECKOUT: ["PRE", "FC", "MASTER_FC"],
   PHYSICAL_CHECKOUT: ["PRE", "NURSE"],
 };
 
@@ -231,6 +231,9 @@ export async function listBillingPipeline(wardIds: number[] | null) {
   const scopeClause = wardIds ? "AND pa.ward_id = ANY(?)" : "";
   const params: unknown[] = wardIds ? [wardIds] : [];
 
+  // Payment done but System Checkout still pending is a valid, distinct bucket
+  // now (FC's own next step) — the old payment_status != 'COMPLETED' filter
+  // would have excluded exactly those rows, so it's widened to also admit them.
   const rows = await db.prepare(`
     SELECT dt.*, pa.id AS admission_id, pa.bed_id, pa.ward_id, pa.ip_last6,
            bd.bed_name, w.name AS ward_name, pa.admitted_at
@@ -239,13 +242,13 @@ export async function listBillingPipeline(wardIds: number[] | null) {
     JOIN bed_details bd ON bd.id = pa.bed_id
     JOIN wards w ON w.id = pa.ward_id
     WHERE pa.status='ACTIVE' AND dt.status IN ('DISCHARGE_INITIATED','IN_PROGRESS')
-      AND dt.payment_status != 'COMPLETED'
+      AND (dt.payment_status != 'COMPLETED' OR dt.system_checkout_status = 'PENDING')
       ${scopeClause}
     ORDER BY dt.updated_at ASC
   `).all(...params);
 
   const buckets: Record<string, typeof rows> = {
-    BILLING_STARTED: [], AUDIT: [], BILL_READY: [], PAYMENT: [],
+    SYSTEM_CHECKOUT: [], BILLING_STARTED: [], AUDIT: [], BILL_READY: [], PAYMENT: [],
   };
   for (const r of rows) {
     const row = r as Record<string, unknown>;
@@ -253,6 +256,7 @@ export async function listBillingPipeline(wardIds: number[] | null) {
     else if (row.audit_status === "PENDING") buckets.AUDIT.push(r);
     else if (row.bill_ready_status === "PENDING") buckets.BILL_READY.push(r);
     else if (row.payment_status === "PENDING") buckets.PAYMENT.push(r);
+    else if (row.system_checkout_status === "PENDING") buckets.SYSTEM_CHECKOUT.push(r);
   }
   return buckets;
 }

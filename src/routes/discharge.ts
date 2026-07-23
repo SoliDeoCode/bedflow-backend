@@ -13,6 +13,7 @@ import {
 import { getAdmissionById } from "../services/patientAdmissionService.js";
 import { listPhaseConfig, computeWorkflow, decorateMany } from "../services/dischargeSlaService.js";
 import { listTransferCandidates, transferBed, moveToDischargeLounge } from "../services/bedTransferService.js";
+import { wardsOperationalHospitalWide } from "../services/bedService.js";
 import { canNurseAccessBed, getMyStations } from "./nurse.js";
 import { accessibleWards, blockForWard } from "./doctor.js";
 
@@ -58,6 +59,19 @@ async function assertWardAccess(userId: number, role: Role, wardId: number) {
       throw new HttpError(403, "Ward not in your nursing station");
     return;
   }
+}
+
+/** Destination-ward check for Bed Transfer specifically — every transfer-capable role
+ *  (PRE, Nurse, FC) can target any operational ward hospital-wide, not just their own
+ *  block/station. Only the ward's operational status matters here; the *source* ward
+ *  (fromWardId) still goes through the ordinary, scoped assertWardAccess above, so a
+ *  PRE/Nurse user can still only transfer a patient OUT of their own wards — just not
+ *  restricted on where they can send them. The Discharge Lounge is rejected separately,
+ *  unconditionally, inside transferBed() itself. */
+async function assertTransferDestinationAccess(wardId: number) {
+  const ward = await db.prepare("SELECT operational FROM wards WHERE id=?").get<{ operational: boolean }>(wardId);
+  if (!ward) throw new HttpError(404, "Ward not found");
+  if (!ward.operational) throw new HttpError(409, "Destination ward is currently non-operational");
 }
 
 /** A CONSULTANT owns only the beds whose ACTIVE admission carries their name —
@@ -308,19 +322,52 @@ router.get("/history/:admissionId", asyncH(async (req, res) => {
   res.json(await historyForAdmission(admissionId));
 }));
 
-// ── Bed transfer (PRE + Nurse) ────────────────────────────────────────────────
-const TRANSFER_ROLES = ["PRE", "NURSE"];
+// ── Bed transfer (PRE + Nurse + FC) ───────────────────────────────────────────
+const TRANSFER_ROLES = ["PRE", "NURSE", "FC", "MASTER_FC"];
+
+/** Every operational ward hospital-wide, excluding the Discharge Lounge (never a valid
+ *  manual transfer target — see transferBed's allowDischargeLounge guard), each flagged
+ *  with whether the caller's own ordinary assignment covers it. Purely informational —
+ *  every ward returned here is still a valid transfer destination; inMyScope only lets
+ *  the frontend warn before transferring into a ward outside the user's usual wards. */
+router.get("/transfer/wards", asyncH(async (req, res) => {
+  if (!TRANSFER_ROLES.includes(req.user!.role)) throw new HttpError(403, "Only PRE, Nurse, or FC can transfer beds");
+  const wards = (await wardsOperationalHospitalWide()).filter(w => !w.is_discharge_lounge);
+
+  let ownWardIds: Set<number>;
+  if (req.user!.role === "PRE") {
+    const rows = await db.prepare(
+      `SELECT DISTINCT pbw.ward_id FROM pre_block_wards pbw
+       JOIN user_pre_blocks upb ON upb.pre_block_id = pbw.pre_block_id
+       WHERE upb.user_id = ?`
+    ).all<{ ward_id: number }>(req.user!.id);
+    ownWardIds = new Set(rows.map(r => r.ward_id));
+  } else if (req.user!.role === "NURSE") {
+    const stations = await getMyStations({ user: { id: req.user!.id } });
+    const stationIds = stations.map(s => s.id);
+    const rows = stationIds.length
+      ? await db.prepare(`SELECT id AS ward_id FROM wards WHERE station_id = ANY(?)`).all<{ ward_id: number }>(stationIds)
+      : [];
+    ownWardIds = new Set(rows.map(r => r.ward_id));
+  } else {
+    // FC/MASTER_FC already have no narrower "own wards" concept — every
+    // operational ward is equally theirs, so nothing here is ever out-of-scope.
+    ownWardIds = new Set(wards.map(w => w.id));
+  }
+
+  res.json({ wards: wards.map(w => ({ ...w, inMyScope: ownWardIds.has(w.id) })) });
+}));
 
 router.get("/transfer/candidates", asyncH(async (req, res) => {
-  if (!TRANSFER_ROLES.includes(req.user!.role)) throw new HttpError(403, "Only PRE or Nurse can transfer beds");
+  if (!TRANSFER_ROLES.includes(req.user!.role)) throw new HttpError(403, "Only PRE, Nurse, or FC can transfer beds");
   const wardId = Number(req.query.wardId);
   if (!wardId) throw new HttpError(400, "wardId is required");
-  await assertWardAccess(req.user!.id, req.user!.role, wardId);
+  await assertTransferDestinationAccess(wardId);
   res.json({ beds: await listTransferCandidates(wardId) });
 }));
 
 router.post("/transfer", asyncH(async (req, res) => {
-  if (!TRANSFER_ROLES.includes(req.user!.role)) throw new HttpError(403, "Only PRE or Nurse can transfer beds");
+  if (!TRANSFER_ROLES.includes(req.user!.role)) throw new HttpError(403, "Only PRE, Nurse, or FC can transfer beds");
   const { fromBedId, toWardId, toBedId, reason } = z.object({
     fromBedId: z.number().int(),
     toWardId: z.number().int(),
@@ -330,7 +377,7 @@ router.post("/transfer", asyncH(async (req, res) => {
 
   const fromWardId = await bedWard(fromBedId);
   await assertWardAccess(req.user!.id, req.user!.role, fromWardId);
-  await assertWardAccess(req.user!.id, req.user!.role, toWardId);
+  await assertTransferDestinationAccess(toWardId);
 
   const result = await transferBed({ fromBedId, toWardId, toBedId, reason, userId: req.user!.id });
   // One merged emit instead of two separate ones — emitUpdate always also hits the
@@ -349,11 +396,12 @@ router.post("/transfer", asyncH(async (req, res) => {
   res.json(result);
 }));
 
-// Physical Checkout is complete but System Checkout is still pending — PRE-only for now
-// (see moveToDischargeLounge). Moves the admission to a Discharge Lounge bed and frees
-// the real bed immediately, instead of leaving it Occupied with nobody in it.
+// Physical Checkout is complete but System Checkout is still pending — PRE or Nurse,
+// matching whoever is allowed to complete Physical Checkout itself (see PHYSICAL_CHECKOUT
+// in dischargeService.ts's STEP_PERMISSIONS). Moves the admission to a Discharge Lounge bed
+// and frees the real bed immediately, instead of leaving it Occupied with nobody in it.
 router.post("/:admissionId/move-to-lounge", asyncH(async (req, res) => {
-  if (req.user!.role !== "PRE") throw new HttpError(403, "Only PRE can move a bed to the Discharge Lounge");
+  if (!["PRE", "NURSE"].includes(req.user!.role)) throw new HttpError(403, "Only PRE or Nurse can move a bed to the Discharge Lounge");
   const admissionId = Number(req.params.admissionId);
   const fromWardId = await assertAdmissionAccess(req.user!, admissionId);
   const { bedId: fromBedId } = await admissionWard(admissionId);

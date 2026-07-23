@@ -65,6 +65,22 @@ export async function wardsForUserBlocks(userId: number): Promise<WardView[]> {
   ).all<WardView>(userId);
 }
 
+/** All operational wards hospital-wide, no per-user assignment scoping — used by FC's
+ *  Bed Entry, which (unlike PRE/Nurse) has no block/station assignment table to join
+ *  through and is intentionally granted every operational ward instead. Includes the
+ *  Discharge Lounge ward if it's operational, same as PRE's own ward lists do. */
+export async function wardsOperationalHospitalWide(): Promise<WardView[]> {
+  return db.prepare(
+    `SELECT w.id, w.name AS ward, w.total_beds AS total, w.unit_type, w.operational,
+            w.is_discharge_lounge,
+            b.vacant, b.reserved, b.occupied, b.occupied_reserved, b.updated_at AS "updatedAt"
+     FROM wards w
+     JOIN beds b ON b.ward_id = w.id
+     WHERE w.operational = true
+     ORDER BY w.name`
+  ).all<WardView>();
+}
+
 /** Wards for each PRE Block a user is assigned to, grouped by block (preserves block membership). */
 export async function wardsGroupedByBlock(userId: number): Promise<{ id: number; name: string; wards: WardView[] }[]> {
   const blocks = await db.prepare(

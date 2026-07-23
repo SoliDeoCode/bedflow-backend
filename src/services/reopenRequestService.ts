@@ -21,7 +21,7 @@ export interface ReopenRequest {
 }
 
 const PHARMACY_STEPS: StepKey[] = ["DRUG_RETURN", "PHARMACY_CLEARANCE"];
-const FC_STEPS: StepKey[] = ["BILLING_STARTED", "AUDIT", "BILL_READY", "PAYMENT"];
+const FC_STEPS: StepKey[] = ["BILLING_STARTED", "AUDIT", "BILL_READY", "PAYMENT", "SYSTEM_CHECKOUT"];
 const REOPENABLE_STEPS: StepKey[] = [...PHARMACY_STEPS, ...FC_STEPS];
 
 export function isPharmacyStep(step: StepKey): boolean { return PHARMACY_STEPS.includes(step); }

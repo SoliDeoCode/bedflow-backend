@@ -14,12 +14,13 @@ export async function listTransferCandidates(wardId: number) {
 interface BedRow {
   id: number; ward_id: number; physical_status: string; reservation_status: string;
   operational_status: boolean; ward_operational: boolean; payer_type: string | null;
+  ward_is_discharge_lounge: boolean;
 }
 
 async function getBedForTransfer(bedId: number): Promise<BedRow> {
   const bed = await db.prepare(
     `SELECT bd.id, bd.ward_id, bd.physical_status, bd.reservation_status, bd.operational_status,
-            bd.payer_type, w.operational AS ward_operational
+            bd.payer_type, w.operational AS ward_operational, w.is_discharge_lounge AS ward_is_discharge_lounge
      FROM bed_details bd JOIN wards w ON w.id = bd.ward_id
      WHERE bd.id = ?`
   ).get<BedRow>(bedId);
@@ -28,14 +29,19 @@ async function getBedForTransfer(bedId: number): Promise<BedRow> {
 }
 
 /** Moves an active admission (and its in-progress discharge, if any) from one bed to another.
- *  Only PRE calls this (enforced in the route) — Occupied/Occupied+Reserved beds only, and only
- *  into an operational, Vacant, non-reserved destination bed. Order of operations is chosen so
- *  that if a later step fails, the active admission is never lost track of: the new bed is
- *  occupied first, the admission is moved second, and the old bed is vacated last. A failure on
- *  the final step leaves both beds Occupied (visible, recoverable by manually vacating the old
- *  bed) rather than losing the admission's link to a bed entirely. */
+ *  Occupied/Occupied+Reserved beds only, and only into an operational, Vacant, non-reserved
+ *  destination bed. Order of operations is chosen so that if a later step fails, the active
+ *  admission is never lost track of: the new bed is occupied first, the admission is moved
+ *  second, and the old bed is vacated last. A failure on the final step leaves both beds
+ *  Occupied (visible, recoverable by manually vacating the old bed) rather than losing the
+ *  admission's link to a bed entirely.
+ *
+ *  The Discharge Lounge is never a valid manual destination — it's a virtual holding ward
+ *  reachable only automatically via moveToDischargeLounge() once Physical Checkout is
+ *  complete. allowDischargeLounge is set only by that function's own internal call. */
 export async function transferBed(opts: {
   fromBedId: number; toWardId: number; toBedId: number; reason: string; userId: number;
+  allowDischargeLounge?: boolean;
 }) {
   const reason = opts.reason.trim();
   if (!reason) throw new HttpError(400, "Transfer reason is required");
@@ -49,6 +55,8 @@ export async function transferBed(opts: {
 
   const toBed = await getBedForTransfer(opts.toBedId);
   if (toBed.ward_id !== opts.toWardId) throw new HttpError(400, "Destination bed is not in the selected ward");
+  if (toBed.ward_is_discharge_lounge && !opts.allowDischargeLounge)
+    throw new HttpError(409, "The Discharge Lounge can't be selected as a manual transfer destination — it's only reached automatically once Physical Checkout is complete.");
   if (!toBed.ward_operational) throw new HttpError(409, "Destination ward is currently non-operational");
   if (!toBed.operational_status) throw new HttpError(409, "Destination bed is non-operational");
   if (toBed.physical_status !== "VACANT") throw new HttpError(409, "Destination bed must be Vacant");
@@ -60,6 +68,11 @@ export async function transferBed(opts: {
       bedId: opts.toBedId, physicalStatus: "OCCUPIED", reservationStatus: "NONE",
       payerType: fromBed.payer_type,
       userId: opts.userId, changeReason: "TRANSFER",
+      // Guards against two transfers landing on the same empty bed at once — the
+      // second one to reach here finds the bed no longer Vacant and fails cleanly
+      // instead of silently doubling up on the same bed.
+      expectedPhysicalStatus: "VACANT", expectedReservationStatus: "NONE",
+      conflictMessage: "Someone just moved another patient into this bed. Please choose a different bed and try again.",
     });
 
     await moveAdmission({ admissionId: admission.id, newBedId: opts.toBedId, newWardId: opts.toWardId, userId: opts.userId });
@@ -90,7 +103,7 @@ export async function transferBed(opts: {
  *  go Vacant (paperwork isn't done), so the admission moves here and the real bed frees up
  *  immediately for a new patient. Reuses transferBed — same admission-move + history trail,
  *  just with the destination picked automatically instead of by the caller.
- *  PRE only (enforced in the route) — matches who's allowed to trigger this for now. */
+ *  PRE or Nurse (enforced in the route) — matches whoever can complete Physical Checkout. */
 export async function moveToDischargeLounge(opts: { admissionId: number; fromBedId: number; userId: number }) {
   const tracking = await getTrackingByAdmission(opts.admissionId);
   if (!tracking) throw new HttpError(404, "No discharge found for this admission");
@@ -110,5 +123,6 @@ export async function moveToDischargeLounge(opts: { admissionId: number; fromBed
     fromBedId: opts.fromBedId, toWardId: lounge.id, toBedId: toBed.id,
     reason: "Physical checkout complete — moved to Discharge Lounge pending System Checkout",
     userId: opts.userId,
+    allowDischargeLounge: true,
   });
 }

@@ -312,6 +312,17 @@ export async function updateBedStatus(opts: {
    *  TRANSFER / DISCHARGE_CHECKOUT are used by bedTransferService / dischargeService
    *  themselves, which already manage the admission — the hook no-ops for those. */
   changeReason?: "MANUAL" | "TRANSFER" | "DISCHARGE_CHECKOUT";
+  /** Set by callers (currently only bedTransferService) that already validated the
+   *  bed's current state and need that assumption re-checked atomically at write time —
+   *  e.g. two concurrent transfers both targeting the same empty bed. When set, the
+   *  usual "nothing actually changed" short-circuit below is skipped (a same-looking
+   *  end state is NOT proof nobody else got here first) and the write itself only
+   *  succeeds if the bed is still in exactly this state. */
+  expectedPhysicalStatus?: string;
+  expectedReservationStatus?: string;
+  /** Friendlier 409 message to show when expectedPhysicalStatus/expectedReservationStatus
+   *  no longer match — falls back to the generic conflict message if not given. */
+  conflictMessage?: string;
 }) {
   const bed = await db.prepare(
     `SELECT bd.id, bd.ward_id, bd.bed_name, bd.physical_status, bd.reservation_status,
@@ -421,21 +432,36 @@ export async function updateBedStatus(opts: {
   }
   const movementReservationNote = enteringOrStayingVacRes ? newReservationNote : (wasVacRes ? bed.reservation_note : null);
 
+  const hasExpectedState = opts.expectedPhysicalStatus !== undefined;
   const noStatusChange      = bed.physical_status === opts.physicalStatus && bed.reservation_status === opts.reservationStatus;
   const noPayerChange       = (newPayerType ?? null) === (bed.payer_type ?? null);
   const noDestinationChange = (newDestination ?? null) === (bed.destination ?? null);
   const noNoteChange        = (newReservationNote ?? null) === (bed.reservation_note ?? null);
-  if (noStatusChange && noPayerChange && noDestinationChange && noNoteChange)
+  // Skipped when the caller passed expectedPhysicalStatus: an end state that merely
+  // *looks* unchanged could mean someone else already made this exact change first
+  // (e.g. two transfers into the same bed), which the write-time guard below must
+  // still catch rather than being short-circuited away here.
+  if (!hasExpectedState && noStatusChange && noPayerChange && noDestinationChange && noNoteChange)
     return { ok: true, ward_id: bed.ward_id, physical_status: opts.physicalStatus, reservation_status: opts.reservationStatus, payer_type: newPayerType, destination: newDestination, reservation_note: newReservationNote };
+
+  if (hasExpectedState && (bed.physical_status !== opts.expectedPhysicalStatus || bed.reservation_status !== opts.expectedReservationStatus))
+    throw new HttpError(409, opts.conflictMessage ?? "This bed was just updated by someone else. Refresh to see the latest status.");
 
   const now = Date.now();
   await db.transaction(async () => {
     // Optimistic lock: only update if nobody changed the row since we read it.
-    const r = await db.prepare(
-      "UPDATE bed_details SET physical_status=?, reservation_status=?, payer_type=?, destination=?, reservation_note=?, updated_at=?, updated_by=? WHERE id=? AND updated_at=?"
-    ).run(opts.physicalStatus, opts.reservationStatus, newPayerType, newDestination, newReservationNote, now, opts.userId, opts.bedId, bed.updated_at);
+    // When the caller supplied an expected state (transfers into this bed), the
+    // guard also re-checks physical/reservation status atomically — closing the
+    // gap where two concurrent transfers both read "Vacant" before either wrote.
+    let sql = "UPDATE bed_details SET physical_status=?, reservation_status=?, payer_type=?, destination=?, reservation_note=?, updated_at=?, updated_by=? WHERE id=? AND updated_at=?";
+    const params: unknown[] = [opts.physicalStatus, opts.reservationStatus, newPayerType, newDestination, newReservationNote, now, opts.userId, opts.bedId, bed.updated_at];
+    if (hasExpectedState) {
+      sql += " AND physical_status=? AND reservation_status=?";
+      params.push(opts.expectedPhysicalStatus, opts.expectedReservationStatus);
+    }
+    const r = await db.prepare(sql).run(...params);
     if (r.changes === 0)
-      throw new HttpError(409, "This bed was just updated by someone else. Refresh to see the latest status.");
+      throw new HttpError(409, opts.conflictMessage ?? "This bed was just updated by someone else. Refresh to see the latest status.");
     // bed_movements is an append-only audit trail — rows here are never
     // updated or deleted, only ever inserted.
     await db.prepare(

@@ -7,15 +7,28 @@ import {
   reviewRequest, pendingCount,
 } from "../services/reopenRequestService.js";
 import { emitUpdate } from "../websocket/io.js";
-import { allWardsLive, allBedDetailsLive, adminDashboard, adminDashboardHistory, consultantsLive } from "../services/bedService.js";
+import { allWardsLive, allBedDetailsLive, adminDashboard, adminDashboardHistory, consultantsLive, wardsOperationalHospitalWide, summarize } from "../services/bedService.js";
 import { listPayerTypes } from "../services/payerTypeService.js";
+import { listDestinations } from "../services/destinationService.js";
+import { listBeds, updateBedStatus } from "../services/bedDetailService.js";
+import { updateActiveAdmission } from "../services/patientAdmissionService.js";
 import { db } from "../db/index.js";
 
 const router = Router();
-const FC_STEPS = ["BILLING_STARTED", "AUDIT", "BILL_READY", "PAYMENT"] as const;
+const FC_STEPS = ["BILLING_STARTED", "AUDIT", "BILL_READY", "PAYMENT", "SYSTEM_CHECKOUT"] as const;
 type FCStep = typeof FC_STEPS[number];
 
 router.use(authRequired, requireRole("FC", "MASTER_FC"));
+
+/** FC has no ward-assignment table (unlike PRE Blocks / nurse stations) — every
+ *  operational ward hospital-wide is in scope, so the only per-ward check needed
+ *  is that it's still operational at the moment of the write (in addition to the
+ *  identical check updateBedStatus already does internally). */
+async function assertWardOperational(wardId: number) {
+  const ward = await db.prepare("SELECT operational FROM wards WHERE id=?").get<{ operational: boolean }>(wardId);
+  if (!ward) throw new HttpError(404, "Ward not found");
+  if (!ward.operational) throw new HttpError(409, "This ward is currently non-operational. Contact your manager.");
+}
 
 router.get("/reopen-pending-count", asyncH(async (req, res) => {
   const count = req.user!.role === "MASTER_FC"
@@ -128,6 +141,96 @@ router.get("/overstay", asyncH(async (_req, res) => {
   const tier2 = rows.filter((r: any) => Number(r.days_overdue) >= 2 && Number(r.days_overdue) <= 3).length;
   const tier3 = rows.filter((r: any) => Number(r.days_overdue) >= 4).length;
   res.json({ total, tier1, tier2, tier3, rows });
+}));
+
+// ── Bed Entry — hospital-wide, operational wards only, no round/review workflow ──
+// FC gets full write access (admit, edit patient info) across every operational
+// ward, unlike PRE/Nurse which are scoped to their assigned blocks/stations.
+// There's deliberately no /wards/:id/review or /submit here — Review and Submit
+// Round are a PRE-specific round-compliance workflow that FC's Bed Entry does not
+// have.
+
+router.get("/wards", asyncH(async (_req, res) => {
+  const wards = await wardsOperationalHospitalWide();
+  res.json({ wards, summary: summarize(wards) });
+}));
+
+router.get("/destinations", asyncH(async (_req, res) => {
+  res.json({ destinations: await listDestinations(true) });
+}));
+
+router.get("/wards/:id/beds", asyncH(async (req, res) => {
+  const wardId = Number(req.params.id);
+  await assertWardOperational(wardId);
+  const physicalStatus    = req.query.physical_status    as string | undefined;
+  const reservationStatus = req.query.reservation_status as string | undefined;
+  res.json({ beds: await listBeds(wardId, physicalStatus, reservationStatus, false) });
+}));
+
+router.patch("/beds/:id/status", asyncH(async (req, res) => {
+  const bedId = Number(req.params.id);
+  const { physical_status, reservation_status, payer_type, destination, reservation_note, ip_last6, admission_type, consultant_name, department_name, doctor_id, department_id } = z.object({
+    physical_status:    z.enum(["VACANT", "OCCUPIED"]),
+    reservation_status: z.enum(["NONE", "RESERVED"]),
+    payer_type:         z.string().max(100).nullable().optional(),
+    destination:        z.string().max(100).nullable().optional(),
+    reservation_note:   z.string().max(255).nullable().optional(),
+    ip_last6:           z.string().max(6).optional(),
+    admission_type:     z.enum(["IP", "DAYCARE", "OPD"]).optional(),
+    consultant_name:    z.string().max(120).nullable().optional(),
+    department_name:    z.string().max(120).nullable().optional(),
+    doctor_id:          z.number().int().positive().nullable().optional(),
+    department_id:      z.number().int().positive().nullable().optional(),
+  }).parse(req.body);
+
+  const bed = await db.prepare("SELECT ward_id FROM bed_details WHERE id=?").get<{ ward_id: number }>(bedId);
+  if (!bed) throw new HttpError(404, "Bed not found");
+  await assertWardOperational(bed.ward_id);
+
+  const result = await updateBedStatus({
+    bedId, physicalStatus: physical_status, reservationStatus: reservation_status,
+    payerType: payer_type, destination, reservationNote: reservation_note, userId: req.user!.id,
+    ipLast6: ip_last6, admissionType: admission_type, consultantName: consultant_name, departmentName: department_name,
+    doctorId: doctor_id, departmentId: department_id,
+  });
+
+  emitUpdate("bed:update", {
+    bedId, wardId: result.ward_id,
+    physicalStatus: physical_status, reservationStatus: reservation_status,
+    payerType: result.payer_type, destination: result.destination, reservationNote: result.reservation_note,
+  }, { wardId: result.ward_id });
+  res.json(result);
+}));
+
+/** Corrects IP/admission-type/consultant/department on a bed's already-active
+ *  admission — mirrors PRE's PATCH /beds/:id/admission exactly (see pre.ts). */
+router.patch("/beds/:id/admission", asyncH(async (req, res) => {
+  const bedId = Number(req.params.id);
+  const { ip_last6, admission_type, consultant_name, department_name, doctor_id, department_id, payer_type } = z.object({
+    ip_last6:        z.string().length(6).optional(),
+    admission_type:  z.enum(["IP", "DAYCARE", "OPD"]).optional(),
+    consultant_name: z.string().max(120).nullable().optional(),
+    department_name: z.string().max(120).nullable().optional(),
+    doctor_id:       z.number().int().positive().optional(),
+    department_id:   z.number().int().positive().optional(),
+    payer_type:      z.string().max(100).nullable().optional(),
+  }).parse(req.body);
+
+  const bed = await db.prepare("SELECT ward_id, physical_status FROM bed_details WHERE id=?").get<{ ward_id: number; physical_status: string }>(bedId);
+  if (!bed) throw new HttpError(404, "Bed not found");
+  await assertWardOperational(bed.ward_id);
+  if (bed.physical_status !== "OCCUPIED") throw new HttpError(409, "Bed is not currently occupied.");
+
+  await updateActiveAdmission({
+    bedId, userId: req.user!.id,
+    ipLast6: ip_last6, admissionType: admission_type,
+    consultantName: consultant_name, departmentName: department_name,
+    doctorId: doctor_id, departmentId: department_id,
+    payerType: payer_type,
+  });
+
+  emitUpdate("bed:update", { bedId, wardId: bed.ward_id }, { wardId: bed.ward_id });
+  res.json({ ok: true });
 }));
 
 export default router;
