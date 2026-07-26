@@ -8,12 +8,14 @@ import type { Role } from "../types/index.js";
 import {
   planDischarge, reschedule, cancelPlan, initiateDischarge, cancelAfterInitiation,
   updateStep, dashboardCounts, historyForAdmission, getDischargeForBed, dischargesForWard, listPendingByStep, listBillingPipeline, listActiveDischarges, listInitiatedToday, listCancelledToday, listPatientLeft, listCompletedToday, listAdmittedToday,
+  dischargeImmediate,
   type StepKey,
 } from "../services/dischargeService.js";
 import { getAdmissionById } from "../services/patientAdmissionService.js";
 import { listPhaseConfig, computeWorkflow, decorateMany } from "../services/dischargeSlaService.js";
-import { listTransferCandidates, transferBed, moveToDischargeLounge } from "../services/bedTransferService.js";
-import { wardsOperationalHospitalWide } from "../services/bedService.js";
+import { listTransferCandidates, transferBed, moveToDischargeLounge, readmitFromLounge } from "../services/bedTransferService.js";
+import { wardsOperationalHospitalWide, wardIdsForUnit, loungeOriginAdmissionIds } from "../services/bedService.js";
+import { ownsBed as consultantOwnsBedByOwnership, ownsAdmission as consultantOwnsAdmissionByOwnership } from "../services/consultantGroupService.js";
 import { canNurseAccessBed, getMyStations } from "./nurse.js";
 import { accessibleWards, blockForWard } from "./doctor.js";
 
@@ -74,23 +76,11 @@ async function assertTransferDestinationAccess(wardId: number) {
   if (!ward.operational) throw new HttpError(409, "Destination ward is currently non-operational");
 }
 
-/** A CONSULTANT owns only the beds whose ACTIVE admission carries their name —
- *  ward-level access means nothing for them, so every write must check this. */
-async function consultantOwnsBed(name: string, bedId: number): Promise<boolean> {
-  const row = await db.prepare(
-    "SELECT 1 FROM patient_admissions WHERE bed_id=? AND status='ACTIVE' AND consultant_name=?"
-  ).get(bedId, name);
-  return !!row;
-}
-
-async function consultantOwnsAdmission(name: string, admissionId: number): Promise<boolean> {
-  const row = await db.prepare(
-    "SELECT 1 FROM patient_admissions WHERE id=? AND consultant_name=?"
-  ).get(admissionId, name);
-  return !!row;
-}
-
-async function assertBedAccess(user: { id: number; role: Role; name: string }, bedId: number) {
+/** A CONSULTANT owns a bed/admission if they're the individual doctor on record,
+ *  OR a member of the Consultant Group on record — resolved via consultantGroupService,
+ *  never by matching consultant_name text. Ward-level access means nothing for a
+ *  CONSULTANT, so every write must go through one of these. */
+async function assertBedAccess(user: { id: number; role: Role; name: string; doctor_master_id?: number | null }, bedId: number) {
   if (user.role === "NURSE") {
     const stations = await getMyStations({ user: { id: user.id } });
     const allowed = await canNurseAccessBed(user.id, bedId, stations.map(s => s.id));
@@ -98,7 +88,7 @@ async function assertBedAccess(user: { id: number; role: Role; name: string }, b
     return;
   }
   if (user.role === "CONSULTANT") {
-    if (!(await consultantOwnsBed(user.name, bedId)))
+    if (!user.doctor_master_id || !(await consultantOwnsBedByOwnership(user.doctor_master_id, bedId)))
       throw new HttpError(403, "This patient is not under your care");
     return;
   }
@@ -112,11 +102,11 @@ async function admissionWard(admissionId: number): Promise<{ wardId: number; bed
   return { wardId: admission.ward_id, bedId: admission.bed_id };
 }
 
-async function assertAdmissionAccess(user: { id: number; role: Role; name: string }, admissionId: number): Promise<number> {
+async function assertAdmissionAccess(user: { id: number; role: Role; name: string; doctor_master_id?: number | null }, admissionId: number): Promise<number> {
   const { wardId, bedId } = await admissionWard(admissionId);
   if (user.role === "NURSE") await assertBedAccess(user, bedId);
   else if (user.role === "CONSULTANT") {
-    if (!(await consultantOwnsAdmission(user.name, admissionId)))
+    if (!user.doctor_master_id || !(await consultantOwnsAdmissionByOwnership(user.doctor_master_id, admissionId)))
       throw new HttpError(403, "This patient is not under your care");
   }
   else await assertWardAccess(user.id, user.role, wardId);
@@ -148,6 +138,35 @@ async function myWardScope(userId: number, role: Role): Promise<number[] | null>
     return rows.map(r => r.id);
   }
   return null;
+}
+
+/** Same as myWardScope, but honors an explicit ?hospitalWide=true opt-in — used
+ *  only by the Transaction Board's drilldown modal, which must match the same
+ *  hospital-wide scope its card counts already use (adminDashboard/dashboardCounts
+ *  for Nurse/PRE/Doctor are unrestricted; this modal previously wasn't, causing
+ *  the card number and the drilldown list to disagree). Every OTHER caller of
+ *  these routes (e.g. each role's own scoped Discharges worklist page) never
+ *  sends this param, so their behavior is unchanged.
+ *
+ *  ?unit=<unit_type> further narrows that hospital-wide scope to the Unit
+ *  toolbar's current selection (TOTAL/KIMS/Renova/Cuddles/... — resolved
+ *  dynamically off wards.unit_type via bedService.ts's wardIdsForUnit, so any
+ *  unit added later needs no code change here). extraAdmissionIds carries the
+ *  Discharge Lounge patients who belong to that unit by ORIGIN — see
+ *  loungeOriginAdmissionIds — since their pa.ward_id becomes the Lounge
+ *  ward's id after transfer and would otherwise vanish from a unit-scoped
+ *  list. Returned wardIds/extraAdmissionIds get OR'd together by
+ *  dischargeService.ts's wardScopeSql in every list/count query below. */
+async function myWardScopeOrHospitalWide(req: { query: unknown; user?: { id: number; role: Role } }): Promise<{ wardIds: number[] | null; extraAdmissionIds: number[] | null }> {
+  const q = req.query as Record<string, unknown>;
+  if (q?.hospitalWide === "true") {
+    const unit = typeof q.unit === "string" ? q.unit : null;
+    if (!unit) return { wardIds: null, extraAdmissionIds: null };
+    const unitWardIds = await wardIdsForUnit(unit);
+    if (!unitWardIds) return { wardIds: null, extraAdmissionIds: null };
+    return { wardIds: unitWardIds, extraAdmissionIds: await loungeOriginAdmissionIds(unitWardIds) };
+  }
+  return { wardIds: await myWardScope(req.user!.id, req.user!.role), extraAdmissionIds: null };
 }
 
 // ── Plan / reschedule / cancel / initiate ────────────────────────────────────
@@ -254,14 +273,14 @@ router.get("/bed/:bedId", asyncH(async (req, res) => {
 }));
 
 router.get("/dashboard", asyncH(async (req, res) => {
-  const wardIds = await myWardScope(req.user!.id, req.user!.role);
-  res.json(await dashboardCounts(wardIds));
+  const { wardIds, extraAdmissionIds } = await myWardScopeOrHospitalWide(req);
+  res.json(await dashboardCounts(wardIds, extraAdmissionIds));
 }));
 
 router.get("/active", asyncH(async (req, res) => {
-  // A CONSULTANT's list is scoped by admission ownership, not ward — they see
-  // only their own patients, whether the request is ward-filtered or not.
-  const mine = req.user!.role === "CONSULTANT" ? req.user!.name : null;
+  // A CONSULTANT's list is scoped by admission ownership (individual or group
+  // membership), not ward — they see only their own patients either way.
+  const mine = req.user!.role === "CONSULTANT" ? (req.user!.doctor_master_id ?? null) : null;
   const wardIdParam = req.query.wardId as string | undefined;
   if (wardIdParam) {
     const wardId = Number(wardIdParam);
@@ -269,8 +288,8 @@ router.get("/active", asyncH(async (req, res) => {
     res.json({ discharges: await decorateMany(await listActiveDischarges([wardId], mine) as never[]) });
     return;
   }
-  const wardIds = await myWardScope(req.user!.id, req.user!.role);
-  res.json({ discharges: await decorateMany(await listActiveDischarges(wardIds, mine) as never[]) });
+  const { wardIds, extraAdmissionIds } = await myWardScopeOrHospitalWide(req);
+  res.json({ discharges: await decorateMany(await listActiveDischarges(wardIds, mine, extraAdmissionIds) as never[]) });
 }));
 
 router.get("/ward/:wardId", asyncH(async (req, res) => {
@@ -281,38 +300,38 @@ router.get("/ward/:wardId", asyncH(async (req, res) => {
 
 router.get("/pending", asyncH(async (req, res) => {
   const step = z.enum(STEP_KEYS as [StepKey, ...StepKey[]]).parse(req.query.step);
-  const wardIds = await myWardScope(req.user!.id, req.user!.role);
-  res.json({ discharges: await listPendingByStep(step, wardIds) });
+  const { wardIds, extraAdmissionIds } = await myWardScopeOrHospitalWide(req);
+  res.json({ discharges: await listPendingByStep(step, wardIds, extraAdmissionIds) });
 }));
 
 router.get("/billing-pipeline", asyncH(async (req, res) => {
-  const wardIds = await myWardScope(req.user!.id, req.user!.role);
-  res.json(await listBillingPipeline(wardIds));
+  const { wardIds, extraAdmissionIds } = await myWardScopeOrHospitalWide(req);
+  res.json(await listBillingPipeline(wardIds, extraAdmissionIds));
 }));
 
 router.get("/cancelled-today", asyncH(async (req, res) => {
-  const wardIds = await myWardScope(req.user!.id, req.user!.role);
-  res.json({ discharges: await listCancelledToday(wardIds) });
+  const { wardIds, extraAdmissionIds } = await myWardScopeOrHospitalWide(req);
+  res.json({ discharges: await listCancelledToday(wardIds, extraAdmissionIds) });
 }));
 
 router.get("/initiated-today", asyncH(async (req, res) => {
-  const wardIds = await myWardScope(req.user!.id, req.user!.role);
-  res.json({ discharges: await listInitiatedToday(wardIds) });
+  const { wardIds, extraAdmissionIds } = await myWardScopeOrHospitalWide(req);
+  res.json({ discharges: await listInitiatedToday(wardIds, extraAdmissionIds) });
 }));
 
 router.get("/completed-today", asyncH(async (req, res) => {
-  const wardIds = await myWardScope(req.user!.id, req.user!.role);
-  res.json({ discharges: await listCompletedToday(wardIds) });
+  const { wardIds, extraAdmissionIds } = await myWardScopeOrHospitalWide(req);
+  res.json({ discharges: await listCompletedToday(wardIds, extraAdmissionIds) });
 }));
 
 router.get("/admitted-today", asyncH(async (req, res) => {
-  const wardIds = await myWardScope(req.user!.id, req.user!.role);
-  res.json({ admissions: await listAdmittedToday(wardIds) });
+  const { wardIds, extraAdmissionIds } = await myWardScopeOrHospitalWide(req);
+  res.json({ admissions: await listAdmittedToday(wardIds, extraAdmissionIds) });
 }));
 
 router.get("/patient-left", asyncH(async (req, res) => {
-  const wardIds = await myWardScope(req.user!.id, req.user!.role);
-  res.json({ discharges: await listPatientLeft(wardIds) });
+  const { wardIds, extraAdmissionIds } = await myWardScopeOrHospitalWide(req);
+  res.json({ discharges: await listPatientLeft(wardIds, extraAdmissionIds) });
 }));
 
 router.get("/history/:admissionId", asyncH(async (req, res) => {
@@ -325,14 +344,14 @@ router.get("/history/:admissionId", asyncH(async (req, res) => {
 // ── Bed transfer (PRE + Nurse + FC) ───────────────────────────────────────────
 const TRANSFER_ROLES = ["PRE", "NURSE", "FC", "MASTER_FC"];
 
-/** Every operational ward hospital-wide, excluding the Discharge Lounge (never a valid
- *  manual transfer target — see transferBed's allowDischargeLounge guard), each flagged
- *  with whether the caller's own ordinary assignment covers it. Purely informational —
+/** Every operational ward hospital-wide, including the Discharge Lounge — moving a
+ *  bed there manually is now a valid transfer (see transferBed), each flagged with
+ *  whether the caller's own ordinary assignment covers it. Purely informational —
  *  every ward returned here is still a valid transfer destination; inMyScope only lets
  *  the frontend warn before transferring into a ward outside the user's usual wards. */
 router.get("/transfer/wards", asyncH(async (req, res) => {
   if (!TRANSFER_ROLES.includes(req.user!.role)) throw new HttpError(403, "Only PRE, Nurse, or FC can transfer beds");
-  const wards = (await wardsOperationalHospitalWide()).filter(w => !w.is_discharge_lounge);
+  const wards = await wardsOperationalHospitalWide();
 
   let ownWardIds: Set<number>;
   if (req.user!.role === "PRE") {
@@ -394,6 +413,42 @@ router.post("/transfer", asyncH(async (req, res) => {
     wardId: [...new Set([fromWardId, toWardId])],
   });
   res.json(result);
+}));
+
+router.post("/:admissionId/readmit", asyncH(async (req, res) => {
+  if (!TRANSFER_ROLES.includes(req.user!.role)) throw new HttpError(403, "Only PRE, Nurse, or FC can readmit a patient");
+  const admissionId = Number(req.params.admissionId);
+  const { toWardId, toBedId, reason } = z.object({
+    toWardId: z.number().int(),
+    toBedId: z.number().int(),
+    reason: z.string().min(1).max(500),
+  }).parse(req.body);
+
+  const { wardId: fromWardId, bedId: fromBedId } = await admissionWard(admissionId);
+  await assertTransferDestinationAccess(toWardId);
+
+  const result = await readmitFromLounge({ fromBedId, toWardId, toBedId, reason, userId: req.user!.id });
+  const fromFan = await fanout(fromWardId);
+  const toFan = fromWardId === toWardId ? fromFan : await fanout(toWardId);
+  const preRooms = [...new Set([fromFan.pre, toFan.pre].filter((v): v is string => !!v))];
+  const stationRooms = [...new Set([fromFan.stationId, toFan.stationId].filter((v): v is number => v != null))];
+  emitUpdate("discharge:update", { type: "readmit", ...result, fromWardId }, {
+    pre: preRooms.length ? preRooms : undefined,
+    stationId: stationRooms.length ? stationRooms : undefined,
+    wardId: [...new Set([fromWardId, toWardId])],
+  });
+  res.json(result);
+}));
+
+// PRE-only emergency override: force-completes every checklist step on a lounge
+// admission's discharge and closes it out immediately. Irreversible — the client
+// is expected to have already confirmed this with the user before calling it.
+router.post("/:admissionId/force-complete", asyncH(async (req, res) => {
+  const admissionId = Number(req.params.admissionId);
+  const fromWardId = await assertAdmissionAccess(req.user!, admissionId);
+  await dischargeImmediate({ admissionId, userId: req.user!.id, role: req.user!.role as Role });
+  emitUpdate("discharge:update", { type: "force-complete", admissionId, wardId: fromWardId }, await fanout(fromWardId));
+  res.json({ ok: true });
 }));
 
 // Physical Checkout is complete but System Checkout is still pending — PRE or Nurse,

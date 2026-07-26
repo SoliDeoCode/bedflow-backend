@@ -205,7 +205,7 @@ router.patch("/beds/:id/status", asyncH(async (req, res) => {
   const blocks = await myPreBlocks(req);
   const blockIds = blocks.map(b => b.id);
   const bedId = Number(req.params.id);
-  const { physical_status, reservation_status, payer_type, destination, reservation_note, ip_last6, admission_type, consultant_name, department_name, doctor_id, department_id } = z.object({
+  const { physical_status, reservation_status, payer_type, destination, reservation_note, ip_last6, admission_type, department_name, doctor_id, department_id, consultant_group_id } = z.object({
     physical_status:    z.enum(["VACANT", "OCCUPIED"]),
     reservation_status: z.enum(["NONE", "RESERVED"]),
     payer_type:         z.string().max(100).nullable().optional(),
@@ -213,10 +213,10 @@ router.patch("/beds/:id/status", asyncH(async (req, res) => {
     reservation_note:   z.string().max(255).nullable().optional(),
     ip_last6:           z.string().max(6).optional(),
     admission_type:     z.enum(["IP", "DAYCARE", "OPD"]).optional(),
-    consultant_name:    z.string().max(120).nullable().optional(),
     department_name:    z.string().max(120).nullable().optional(),
     doctor_id:          z.number().int().positive().nullable().optional(),
     department_id:      z.number().int().positive().nullable().optional(),
+    consultant_group_id: z.number().int().positive().nullable().optional(),
   }).parse(req.body);
 
   // Bed must belong to a ward that's in one of the user's blocks
@@ -230,8 +230,8 @@ router.patch("/beds/:id/status", asyncH(async (req, res) => {
   const result = await updateBedStatus({
     bedId, physicalStatus: physical_status, reservationStatus: reservation_status,
     payerType: payer_type, destination, reservationNote: reservation_note, userId: req.user!.id,
-    ipLast6: ip_last6, admissionType: admission_type, consultantName: consultant_name, departmentName: department_name,
-    doctorId: doctor_id, departmentId: department_id,
+    ipLast6: ip_last6, admissionType: admission_type, departmentName: department_name,
+    doctorId: doctor_id, departmentId: department_id, consultantGroupId: consultant_group_id,
   });
 
   const stationRow = await db.prepare(
@@ -258,13 +258,13 @@ router.patch("/beds/:id/admission", asyncH(async (req, res) => {
   const blocks = await myPreBlocks(req);
   const blockIds = blocks.map(b => b.id);
   const bedId = Number(req.params.id);
-  const { ip_last6, admission_type, consultant_name, department_name, doctor_id, department_id, payer_type } = z.object({
+  const { ip_last6, admission_type, department_name, doctor_id, department_id, consultant_group_id, payer_type } = z.object({
     ip_last6:        z.string().length(6).optional(),
     admission_type:  z.enum(["IP", "DAYCARE", "OPD"]).optional(),
-    consultant_name: z.string().max(120).nullable().optional(),
     department_name: z.string().max(120).nullable().optional(),
-    doctor_id:       z.number().int().positive().optional(),
+    doctor_id:       z.number().int().positive().nullable().optional(),
     department_id:   z.number().int().positive().optional(),
+    consultant_group_id: z.number().int().positive().nullable().optional(),
     payer_type:      z.string().max(100).nullable().optional(),
   }).parse(req.body);
 
@@ -284,8 +284,8 @@ router.patch("/beds/:id/admission", asyncH(async (req, res) => {
   await updateActiveAdmission({
     bedId, userId: req.user!.id,
     ipLast6: ip_last6, admissionType: admission_type,
-    consultantName: consultant_name, departmentName: department_name,
-    doctorId: doctor_id, departmentId: department_id,
+    departmentName: department_name,
+    doctorId: doctor_id, departmentId: department_id, consultantGroupId: consultant_group_id,
     payerType: payer_type,
   });
 

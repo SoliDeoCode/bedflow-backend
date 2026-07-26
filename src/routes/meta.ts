@@ -6,6 +6,7 @@ import { saveSubscription } from "../services/pushService.js";
 import { pushEnabled, env } from "../config/env.js";
 import { COO_REMINDERS } from "../config/domain.js";
 import { listDepartments, listDoctors, listDoctorsWithDepartments } from "../services/doctorDeptService.js";
+import { listGroupsWithDetails } from "../services/consultantGroupService.js";
 
 const router = Router();
 
@@ -25,6 +26,10 @@ router.get("/doctors", authRequired, asyncH(async (req, res) => {
   } else {
     res.json({ doctors: await listDoctorsWithDepartments(true) });
   }
+}));
+
+router.get("/consultant-groups", authRequired, asyncH(async (_req, res) => {
+  res.json({ groups: await listGroupsWithDetails(true) });
 }));
 
 router.post("/push/subscribe", authRequired, asyncH(async (req, res) => {

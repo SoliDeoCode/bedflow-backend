@@ -1,6 +1,8 @@
 import { db } from "../db/index.js";
 import { HttpError } from "../middleware/error.js";
 import { audit } from "./auditService.js";
+import { consultantRoomsFor } from "./consultantGroupService.js";
+import { emitConsultantPatientUpdate } from "../websocket/io.js";
 
 export interface PatientAdmission {
   id: number;
@@ -14,6 +16,10 @@ export interface PatientAdmission {
   department_name: string | null;
   doctor_id: number | null;
   department_id: number | null;
+  /** "DOCTOR" (single consultant, doctor_id set) or "GROUP" (joint Consultant
+   *  Group, consultant_group_id set) — never both, enforced by a DB CHECK. */
+  owner_type: "DOCTOR" | "GROUP";
+  consultant_group_id: number | null;
   /** "IP" | "DAYCARE" — null only for admissions predating this field. */
   admission_type: string | null;
   status: "ACTIVE" | "DISCHARGED";
@@ -21,6 +27,10 @@ export interface PatientAdmission {
   discharged_at: number | null;
   created_by: number | null;
   updated_at: number;
+  /** Set the moment the patient is known to have physically left the bed — e.g. a
+   *  manual Bed Transfer into the Discharge Lounge before any discharge was planned.
+   *  Independent of discharge_tracking, which may not exist yet at that point. */
+  physically_left_at: number | null;
 }
 
 const IP_LAST6_RE = /^\d{6}$/;
@@ -40,10 +50,61 @@ export function validateAdmissionType(admissionType: string | undefined | null):
   return value;
 }
 
+/** Exactly one of doctorId/consultantGroupId must be set — never both, never
+ *  neither. Mirrors the DB's chk_admission_owner CHECK constraint. */
+function resolveOwnerType(doctorId: number | null, consultantGroupId: number | null): "DOCTOR" | "GROUP" {
+  const hasDoctor = doctorId != null;
+  const hasGroup = consultantGroupId != null;
+  if (hasDoctor === hasGroup)
+    throw new HttpError(400, "Select exactly one consultant or Consultant Group.");
+  return hasGroup ? "GROUP" : "DOCTOR";
+}
+
+/** Resolves the display-name mirror stored in consultant_name, and — for a
+ *  group owner — validates the chosen department actually belongs to that
+ *  group (a group can only admit under one of its own mapped departments). */
+async function resolveOwnerName(
+  ownerType: "DOCTOR" | "GROUP", doctorId: number | null, consultantGroupId: number | null, departmentId: number,
+): Promise<string> {
+  if (ownerType === "DOCTOR") {
+    const row = await db.prepare("SELECT name FROM doctors_master WHERE id=?").get<{ name: string }>(doctorId);
+    if (!row) throw new HttpError(400, "Selected consultant not found.");
+    return row.name;
+  }
+  const row = await db.prepare("SELECT name FROM consultant_groups WHERE id=?").get<{ name: string }>(consultantGroupId);
+  if (!row) throw new HttpError(400, "Selected Consultant Group not found.");
+  const deptOk = await db.prepare(
+    "SELECT 1 FROM consultant_group_departments WHERE group_id=? AND department_id=?"
+  ).get(consultantGroupId, departmentId);
+  if (!deptOk) throw new HttpError(400, "Selected department is not associated with this Consultant Group.");
+  return row.name;
+}
+
 export async function getActiveAdmissionByBed(bedId: number): Promise<PatientAdmission | undefined> {
   return db.prepare(
     "SELECT * FROM patient_admissions WHERE bed_id=? AND status='ACTIVE'"
   ).get<PatientAdmission>(bedId);
+}
+
+/** Same row shape as GET /consultant/my-patients, for exactly one admission —
+ *  reused by every real-time emit site so a targeted socket event carries enough
+ *  to patch that one row on the receiving MyPatientsPage without a refetch. */
+export async function getMyPatientsRow(admissionId: number): Promise<Record<string, unknown> | undefined> {
+  return db.prepare(
+    `SELECT
+       bd.id AS bed_id, bd.bed_name, bd.ward_id, w.name AS ward_name,
+       bd.physical_status, bd.reservation_status, bd.destination, bd.reservation_note,
+       bd.operational_status, bd.updated_at, bd.payer_type,
+       pa.id AS admission_id, pa.consultant_name, pa.department_name,
+       pa.owner_type, pa.doctor_id, pa.consultant_group_id,
+       pa.ip_last6, pa.admission_type, pa.admitted_at,
+       row_to_json(dt.*) AS discharge_tracking
+     FROM patient_admissions pa
+     JOIN bed_details bd ON bd.id = pa.bed_id
+     JOIN wards w ON w.id = bd.ward_id
+     LEFT JOIN discharge_tracking dt ON dt.admission_id = pa.id
+     WHERE pa.id = ?`
+  ).get<Record<string, unknown>>(admissionId);
 }
 
 export async function getAdmissionById(admissionId: number): Promise<PatientAdmission | undefined> {
@@ -54,17 +115,21 @@ export async function getAdmissionById(admissionId: number): Promise<PatientAdmi
  *  bedDetailService post-commit hook — never call this directly from a route. */
 export async function createAdmission(opts: {
   bedId: number; wardId: number; ipLast6: string; admissionType: string; userId: number;
-  consultantName?: string | null; departmentName?: string | null;
+  departmentName?: string | null;
   doctorId?: number | null; departmentId?: number | null;
+  consultantGroupId?: number | null;
 }): Promise<PatientAdmission> {
   const ipLast6 = validateIpLast6(opts.ipLast6);
   const admissionType = validateAdmissionType(opts.admissionType);
-  const consultantName = opts.consultantName?.toString().trim() || null;
   const departmentName = opts.departmentName?.toString().trim() || null;
-  const doctorId = opts.doctorId ?? null;
   const departmentId = opts.departmentId ?? null;
   if (!departmentId) throw new HttpError(400, "Department is required.");
-  if (!doctorId) throw new HttpError(400, "Consultant is required.");
+
+  const doctorId = opts.doctorId ?? null;
+  const consultantGroupId = opts.consultantGroupId ?? null;
+  const ownerType = resolveOwnerType(doctorId, consultantGroupId);
+  const consultantName = await resolveOwnerName(ownerType, doctorId, consultantGroupId, departmentId);
+
   const existing = await getActiveAdmissionByBed(opts.bedId);
   if (existing) throw new HttpError(409, "This bed already has an active patient admission.");
 
@@ -78,12 +143,23 @@ export async function createAdmission(opts: {
 
   const now = Date.now();
   const row = await db.prepare(
-    `INSERT INTO patient_admissions (bed_id, ward_id, ip_last6, admission_type, consultant_name, department_name, doctor_id, department_id, status, admitted_at, created_by, updated_at)
-     VALUES (?,?,?,?,?,?,?,?,'ACTIVE',?,?,?) RETURNING id`
-  ).run(opts.bedId, opts.wardId, ipLast6, admissionType, consultantName, departmentName, doctorId, departmentId, now, opts.userId, now);
+    `INSERT INTO patient_admissions (bed_id, ward_id, ip_last6, admission_type, consultant_name, department_name, doctor_id, department_id, owner_type, consultant_group_id, status, admitted_at, created_by, updated_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,'ACTIVE',?,?,?) RETURNING id`
+  ).run(
+    opts.bedId, opts.wardId, ipLast6, admissionType, consultantName, departmentName,
+    ownerType === "DOCTOR" ? doctorId : null, departmentId, ownerType, ownerType === "GROUP" ? consultantGroupId : null,
+    now, opts.userId, now,
+  );
   const admission = await getAdmissionById(Number(row.lastInsertRowid));
 
-  await audit(opts.userId, "admission_create", String(opts.bedId), { ipLast6, admissionType, wardId: opts.wardId, consultantName, departmentName, doctorId, departmentId });
+  await audit(opts.userId, "admission_create", String(opts.bedId), { ipLast6, admissionType, wardId: opts.wardId, consultantName, departmentName, ownerType, doctorId, consultantGroupId, departmentId });
+
+  const rooms = consultantRoomsFor({ owner_type: ownerType, doctor_id: doctorId, consultant_group_id: consultantGroupId });
+  if (rooms.length) {
+    const row = await getMyPatientsRow(admission!.id);
+    if (row) emitConsultantPatientUpdate(rooms, { type: "ADMITTED", action: "UPSERT", ...row });
+  }
+
   return admission!;
 }
 
@@ -95,8 +171,9 @@ export async function createAdmission(opts: {
 export async function updateActiveAdmission(opts: {
   bedId: number; userId: number;
   ipLast6?: string; admissionType?: string;
-  consultantName?: string | null; departmentName?: string | null;
+  departmentName?: string | null;
   doctorId?: number | null; departmentId?: number | null;
+  consultantGroupId?: number | null;
   payerType?: string | null;
 }): Promise<PatientAdmission> {
   const admission = await getActiveAdmissionByBed(opts.bedId);
@@ -104,20 +181,34 @@ export async function updateActiveAdmission(opts: {
 
   const ipLast6 = opts.ipLast6 !== undefined ? validateIpLast6(opts.ipLast6) : admission.ip_last6;
   const admissionType = opts.admissionType !== undefined ? validateAdmissionType(opts.admissionType) : admission.admission_type;
-  const doctorId = opts.doctorId !== undefined ? opts.doctorId : admission.doctor_id;
   const departmentId = opts.departmentId !== undefined ? opts.departmentId : admission.department_id;
-  const consultantName = opts.consultantName !== undefined ? (opts.consultantName?.toString().trim() || null) : admission.consultant_name;
   const departmentName = opts.departmentName !== undefined ? (opts.departmentName?.toString().trim() || null) : admission.department_name;
   if (!departmentId) throw new HttpError(400, "Department is required.");
-  if (!doctorId) throw new HttpError(400, "Consultant is required.");
+
+  // Changing the owner requires sending both fields together (even if one is
+  // explicitly null) — the caller always knows the full new owner state, so a
+  // half-sent pair would mean a client bug, not a legitimate partial update.
+  const ownerChanging = opts.doctorId !== undefined || opts.consultantGroupId !== undefined;
+  if (ownerChanging && (opts.doctorId === undefined || opts.consultantGroupId === undefined))
+    throw new HttpError(400, "doctorId and consultantGroupId must be sent together when changing the consultant.");
+
+  const doctorId = ownerChanging ? (opts.doctorId ?? null) : admission.doctor_id;
+  const consultantGroupId = ownerChanging ? (opts.consultantGroupId ?? null) : admission.consultant_group_id;
+  const ownerType = ownerChanging ? resolveOwnerType(doctorId, consultantGroupId) : admission.owner_type;
+  // Department membership (for a group owner) is re-validated every time, not
+  // just when the owner changes — it's an invariant that must always hold,
+  // including when only the department itself changes on an existing group admission.
+  const consultantName = ownerType === "GROUP" || ownerChanging
+    ? await resolveOwnerName(ownerType, doctorId, consultantGroupId, departmentId)
+    : admission.consultant_name;
 
   const now = Date.now();
   await db.transaction(async () => {
     const r = await db.prepare(
       `UPDATE patient_admissions
-       SET ip_last6=?, admission_type=?, consultant_name=?, department_name=?, doctor_id=?, department_id=?, updated_at=?
+       SET ip_last6=?, admission_type=?, consultant_name=?, department_name=?, doctor_id=?, department_id=?, owner_type=?, consultant_group_id=?, updated_at=?
        WHERE id=? AND status='ACTIVE' AND updated_at=?`
-    ).run(ipLast6, admissionType, consultantName, departmentName, doctorId, departmentId, now, admission.id, admission.updated_at);
+    ).run(ipLast6, admissionType, consultantName, departmentName, doctorId, departmentId, ownerType, consultantGroupId, now, admission.id, admission.updated_at);
     if (r.changes === 0) throw new HttpError(409, "Patient info was just updated by someone else. Please refresh and try again.");
 
     if (opts.payerType !== undefined) {
@@ -130,13 +221,31 @@ export async function updateActiveAdmission(opts: {
       old: {
         ipLast6: admission.ip_last6, admissionType: admission.admission_type,
         consultantName: admission.consultant_name, departmentName: admission.department_name,
-        doctorId: admission.doctor_id, departmentId: admission.department_id,
+        ownerType: admission.owner_type, doctorId: admission.doctor_id, consultantGroupId: admission.consultant_group_id,
+        departmentId: admission.department_id,
         payerType: opts.payerType !== undefined ? undefined : "(unchanged)",
       },
-      new: { ipLast6, admissionType, consultantName, departmentName, doctorId, departmentId,
+      new: { ipLast6, admissionType, consultantName, departmentName, ownerType, doctorId, consultantGroupId, departmentId,
              ...(opts.payerType !== undefined ? { payerType: opts.payerType } : {}) },
     });
   });
+
+  // Ownership change: the old owner's rooms get a REMOVE (they no longer see this
+  // patient), the new owner's rooms get an UPSERT (add if new to them, patch if
+  // somehow already visible) — the room split itself decides add vs remove, so
+  // the receiving page never has to reason about "is this still mine". A
+  // non-owner change (IP fix, department correction, etc.) only reaches the
+  // unchanged current owner as a plain UPSERT.
+  const oldRooms = ownerChanging ? consultantRoomsFor({ owner_type: admission.owner_type, doctor_id: admission.doctor_id, consultant_group_id: admission.consultant_group_id }) : [];
+  const newRooms = consultantRoomsFor({ owner_type: ownerType, doctor_id: doctorId, consultant_group_id: consultantGroupId });
+  const removedRooms = oldRooms.filter((r) => !newRooms.includes(r));
+  if (removedRooms.length) {
+    emitConsultantPatientUpdate(removedRooms, { type: "OWNERSHIP_CHANGED", action: "REMOVE", admission_id: admission.id, bed_id: admission.bed_id });
+  }
+  if (newRooms.length) {
+    const row = await getMyPatientsRow(admission.id);
+    if (row) emitConsultantPatientUpdate(newRooms, { type: ownerChanging ? "OWNERSHIP_CHANGED" : "UPDATED", action: "UPSERT", ...row });
+  }
 
   return (await getAdmissionById(admission.id))!;
 }
@@ -144,10 +253,16 @@ export async function updateActiveAdmission(opts: {
 /** Closes an admission — either a normal discharge completion or a manual/unexpected vacate. */
 export async function closeAdmission(admissionId: number, userId: number | null): Promise<void> {
   const now = Date.now();
-  await db.prepare(
+  const admission = await getAdmissionById(admissionId);
+  const r = await db.prepare(
     "UPDATE patient_admissions SET status='DISCHARGED', discharged_at=?, updated_at=? WHERE id=? AND status='ACTIVE'"
   ).run(now, now, admissionId);
   await audit(userId, "admission_close", String(admissionId), {});
+
+  if (r.changes > 0 && admission) {
+    const rooms = consultantRoomsFor(admission);
+    if (rooms.length) emitConsultantPatientUpdate(rooms, { type: "DISCHARGED", action: "REMOVE", admission_id: admissionId, bed_id: admission.bed_id });
+  }
 }
 
 /** Moves an admission (and thus its discharge workflow) to a new bed/ward — used by bed transfer. */
@@ -161,4 +276,11 @@ export async function moveAdmission(opts: {
   await audit(opts.userId, "admission_move", String(opts.admissionId), {
     newBedId: opts.newBedId, newWardId: opts.newWardId,
   });
+
+  const admission = await getAdmissionById(opts.admissionId);
+  const rooms = admission ? consultantRoomsFor(admission) : [];
+  if (rooms.length) {
+    const row = await getMyPatientsRow(opts.admissionId);
+    if (row) emitConsultantPatientUpdate(rooms, { type: "TRANSFERRED", action: "UPSERT", ...row });
+  }
 }

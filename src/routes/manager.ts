@@ -37,9 +37,15 @@ import {
 } from "../services/destinationService.js";
 import {
   listDepartments, createDepartment, updateDepartment, deleteDepartment,
-  listDoctorsWithDepartments, createDoctor as createDoctorMaster,
-  updateDoctorMaster, deleteDoctorMaster,
+  listDoctorsWithDepartments,
 } from "../services/doctorDeptService.js";
+import {
+  listGroupsWithDetails, createGroup as createConsultantGroup,
+  updateGroup as updateConsultantGroup, deleteGroup as deleteConsultantGroup,
+} from "../services/consultantGroupService.js";
+import {
+  listConsultantUsers, createConsultantUser, updateConsultantUser, deleteConsultantUser,
+} from "../services/consultantUserService.js";
 import {
   getDischargeLounge, setupDischargeLounge, renameDischargeLounge,
 } from "../services/dischargeLoungeService.js";
@@ -872,31 +878,45 @@ router.delete("/departments/:id", asyncH(async (req, res) => {
   res.json(await deleteDepartment({ id, userId: req.user!.id }));
 }));
 
+// Read-only — still needed by the Consultant Groups member picker. Creating/
+// editing/deleting a doctor now happens only via /consultants below, since a
+// doctor never exists without its consultant login (created together, see
+// consultantUserService.ts).
 router.get("/doctors-master", asyncH(async (_req, res) => {
   res.json({ doctors: await listDoctorsWithDepartments(false) });
 }));
 
-router.post("/doctors-master", asyncH(async (req, res) => {
-  const { name, department_ids } = z.object({
+// ── Consultant Groups — joint-ownership bundles (e.g. "Vijay / Kumari") for
+// patients admitted under more than one consultant at once. Separate entity
+// from doctors_master, never merged with it. ───────────────────────────────
+
+router.get("/consultant-groups", asyncH(async (_req, res) => {
+  res.json({ groups: await listGroupsWithDetails(false) });
+}));
+
+router.post("/consultant-groups", asyncH(async (req, res) => {
+  const { name, doctor_ids, department_ids } = z.object({
     name: z.string().min(1).max(150),
+    doctor_ids: z.array(z.number().int().positive()).min(2),
     department_ids: z.array(z.number().int().positive()).min(1),
   }).parse(req.body);
-  res.json({ doctor: await createDoctorMaster(name, department_ids) });
+  res.json({ group: await createConsultantGroup({ name, doctorIds: doctor_ids, departmentIds: department_ids, userId: req.user!.id }) });
 }));
 
-router.put("/doctors-master/:id", asyncH(async (req, res) => {
-  const { name, active, department_ids } = z.object({
+router.put("/consultant-groups/:id", asyncH(async (req, res) => {
+  const { name, active, doctor_ids, department_ids } = z.object({
     name:           z.string().min(1).max(150).optional(),
     active:         z.boolean().optional(),
-    department_ids: z.array(z.number().int().positive()).optional(),
+    doctor_ids:     z.array(z.number().int().positive()).min(2).optional(),
+    department_ids: z.array(z.number().int().positive()).min(1).optional(),
   }).parse(req.body);
   const id = Number(req.params.id);
-  res.json(await updateDoctorMaster({ id, name, active, departmentIds: department_ids, userId: req.user!.id }));
+  res.json(await updateConsultantGroup({ id, name, active, doctorIds: doctor_ids, departmentIds: department_ids, userId: req.user!.id }));
 }));
 
-router.delete("/doctors-master/:id", asyncH(async (req, res) => {
+router.delete("/consultant-groups/:id", asyncH(async (req, res) => {
   const id = Number(req.params.id);
-  res.json(await deleteDoctorMaster({ id, userId: req.user!.id }));
+  res.json(await deleteConsultantGroup({ id, userId: req.user!.id }));
 }));
 
 // ── Discharge Lounge — a virtual holding ward, set up once by an admin. Lives
@@ -921,86 +941,39 @@ router.put("/discharge-lounge", asyncH(async (req, res) => {
   res.json(await renameDischargeLounge({ name, managerId: req.user!.id }));
 }));
 
-// ── Consultant Logins — COO creates portal credentials for named consultants ──
-// Each CONSULTANT user's `name` must match a doctors_master entry so "My Patients"
-// can filter bed entries by consultant_name = user.name on the backend.
+// ── Consultant Users — created as one unit (login + doctors_master identity),
+// same pattern as PRE/Nurse/Doctor user management. Departments are assigned as
+// a follow-up edit, not required at creation. ──────────────────────────────────
 
-router.get("/consultant-logins", asyncH(async (_req, res) => {
-  const rows = await db.prepare(
-    `SELECT u.id, u.username, u.name,
-            dm.id AS doctor_master_id, u.status
-     FROM users u
-     LEFT JOIN doctors_master dm ON dm.name = u.name
-     WHERE u.role = 'CONSULTANT'
-     ORDER BY u.name`
-  ).all<{ id: number; username: string; name: string; doctor_master_id: number | null; status: string }>();
-  res.json({ logins: rows });
+router.get("/consultants", asyncH(async (_req, res) => {
+  res.json({ consultants: await listConsultantUsers() });
 }));
 
-router.post("/consultant-logins", asyncH(async (req, res) => {
-  const { doctor_master_id, username, password } = z.object({
-    doctor_master_id: z.number().int().positive(),
-    username:         z.string().min(1).max(60).regex(/^[a-z0-9._-]+$/i, "Username may only contain letters, numbers, dots, hyphens, underscores"),
-    password:         z.string().min(6, "Password must be at least 6 characters").max(72),
+router.post("/consultants", asyncH(async (req, res) => {
+  const { name, username, password, department_ids } = z.object({
+    name: z.string().min(1).max(150),
+    username: z.string().min(1).max(60),
+    password: z.string().min(8).max(72),
+    department_ids: z.array(z.number().int().positive()).optional(),
   }).parse(req.body);
-
-  // Look up the doctor's display name — this becomes the login user's name
-  const doctor = await db.prepare("SELECT id, name FROM doctors_master WHERE id=?").get<{ id: number; name: string }>(doctor_master_id);
-  if (!doctor) throw new HttpError(404, "Doctor not found.");
-
-  // Prevent duplicate usernames
-  const clash = await db.prepare("SELECT id FROM users WHERE username=?").get<{ id: number }>(username.trim().toLowerCase());
-  if (clash) throw new HttpError(409, "This username is already taken. Please choose another.");
-
-  // Prevent a second login for the same doctor name
-  const existing = await db.prepare("SELECT id FROM users WHERE role='CONSULTANT' AND name=?").get<{ id: number }>(doctor.name);
-  if (existing) throw new HttpError(409, "A consultant login already exists for this doctor. Edit the existing login instead.");
-
-  const hash = bcrypt.hashSync(password, 12);
-  const now = Date.now();
-
-  const row = await db.prepare(
-    `INSERT INTO users (username, password_hash, role, name, status, created_at, updated_at)
-     VALUES (?, ?, 'CONSULTANT', ?, 'active', ?, ?)
-     RETURNING id, username, name, role, status`
-  ).get<{ id: number; username: string; name: string; role: string; status: string }>(
-    username.trim().toLowerCase(), hash, doctor.name, now, now
-  );
-
-  res.status(201).json({ login: { ...row, doctor_master_id } });
+  res.status(201).json({ consultant: await createConsultantUser({ name, username, password, departmentIds: department_ids, userId: req.user!.id }) });
 }));
 
-router.put("/consultant-logins/:id", asyncH(async (req, res) => {
-  const id = Number(req.params.id);
-  const { username, password } = z.object({
-    username: z.string().min(1).max(60).regex(/^[a-z0-9._-]+$/i, "Invalid username format").optional(),
-    password: z.string().min(6, "Password must be at least 6 characters").max(72).optional(),
+router.put("/consultants/:id", asyncH(async (req, res) => {
+  const { name, username, password, active, department_ids } = z.object({
+    name:           z.string().min(1).max(150).optional(),
+    username:       z.string().min(1).max(60).optional(),
+    password:       z.string().min(8).max(72).optional(),
+    active:         z.boolean().optional(),
+    department_ids: z.array(z.number().int().positive()).optional(),
   }).parse(req.body);
-
-  const user = await db.prepare("SELECT id FROM users WHERE id=? AND role='CONSULTANT'").get<{ id: number }>(id);
-  if (!user) throw new HttpError(404, "Consultant login not found.");
-
-  if (username) {
-    const clash = await db.prepare("SELECT id FROM users WHERE username=? AND id<>?").get<{ id: number }>(username.trim().toLowerCase(), id);
-    if (clash) throw new HttpError(409, "This username is already taken.");
-    await db.prepare("UPDATE users SET username=?, updated_at=? WHERE id=?").run(username.trim().toLowerCase(), Date.now(), id);
-  }
-  if (password) {
-    const bcrypt = await import("bcryptjs");
-    const hash = bcrypt.hashSync(password, 12);
-    await db.prepare("UPDATE users SET password_hash=?, updated_at=? WHERE id=?").run(hash, Date.now(), id);
-  }
-
-  const updated = await db.prepare("SELECT id, username, name, role, status FROM users WHERE id=?").get<{ id: number; username: string; name: string; role: string; status: string }>(id);
-  res.json({ login: updated });
+  const id = Number(req.params.id);
+  res.json(await updateConsultantUser({ id, name, username, password, active, departmentIds: department_ids, userId: req.user!.id }));
 }));
 
-router.delete("/consultant-logins/:id", asyncH(async (req, res) => {
+router.delete("/consultants/:id", asyncH(async (req, res) => {
   const id = Number(req.params.id);
-  const user = await db.prepare("SELECT id FROM users WHERE id=? AND role='CONSULTANT'").get<{ id: number }>(id);
-  if (!user) throw new HttpError(404, "Consultant login not found.");
-  await db.prepare("DELETE FROM users WHERE id=? AND role='CONSULTANT'").run(id);
-  res.json({ ok: true });
+  res.json(await deleteConsultantUser({ id, userId: req.user!.id }));
 }));
 
 // ── Discharge Phase SLAs ─────────────────────────────────────────────────────

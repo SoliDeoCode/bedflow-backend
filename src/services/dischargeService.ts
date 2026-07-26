@@ -2,9 +2,26 @@ import { db } from "../db/index.js";
 import { HttpError } from "../middleware/error.js";
 import { audit } from "./auditService.js";
 import { updateBedStatus } from "./bedDetailService.js";
-import { getActiveAdmissionByBed, getAdmissionById, closeAdmission, type PatientAdmission } from "./patientAdmissionService.js";
+import { getActiveAdmissionByBed, getAdmissionById, closeAdmission, getMyPatientsRow, type PatientAdmission } from "./patientAdmissionService.js";
 import { initialStartSql, nextPhasesToStart, startedCol, completedCol, ALL_STEPS } from "./dischargeSlaService.js";
+import { consultantRoomsFor } from "./consultantGroupService.js";
+import { emitConsultantPatientUpdate } from "../websocket/io.js";
 import type { Role } from "../types/index.js";
+
+/** Builds the shared "scope to these wards" WHERE fragment used by every
+ *  discharge list/count query below. extraAdmissionIds widens the match to
+ *  also include specific admissions by id regardless of their current
+ *  ward_id — needed for Discharge Lounge patients when a Unit filter is
+ *  active: their pa.ward_id becomes the Lounge ward's id after transfer
+ *  (bedTransferService.ts), which would otherwise make them invisible to a
+ *  unit-scoped filter. Callers resolve which lounge admissions actually
+ *  originated from the selected unit via bedService.ts's
+ *  loungeOriginAdmissionIds() and pass their ids here. */
+function wardScopeSql(wardIds: number[] | null, extraAdmissionIds?: number[] | null): { clause: string; params: unknown[] } {
+  if (!wardIds) return { clause: "", params: [] };
+  if (extraAdmissionIds?.length) return { clause: "AND (pa.ward_id = ANY(?) OR pa.id = ANY(?))", params: [wardIds, extraAdmissionIds] };
+  return { clause: "AND pa.ward_id = ANY(?)", params: [wardIds] };
+}
 
 export interface DischargeTracking {
   id: number;
@@ -165,13 +182,22 @@ export async function dischargesForWard(wardId: number) {
 /** Every discharge that's currently alive (planned or running) across the given wards —
  *  powers the "Discharges" page each role sees. wardIds = null is hospital-wide.
  *  Running discharges come first (most actionable), then planned by nearest date. */
-/** consultantName — CONSULTANT scoping is by admission ownership, not by ward, so
- *  their Discharges page shows only their own patients. */
-export async function listActiveDischarges(wardIds: number[] | null, consultantName?: string | null) {
+/** consultantDoctorMasterId — CONSULTANT scoping is by admission ownership (individual
+ *  or Consultant Group membership), not by ward, so their Discharges page shows only
+ *  their own patients — resolved the same way as consultantGroupService.ownsAdmission,
+ *  inlined here since this is a list query rather than a single-row check. */
+export async function listActiveDischarges(wardIds: number[] | null, consultantDoctorMasterId?: number | null, extraAdmissionIds?: number[] | null) {
   const params: unknown[] = [];
   let scopeClause = "";
-  if (wardIds) { scopeClause += " AND pa.ward_id = ANY(?)"; params.push(wardIds); }
-  if (consultantName) { scopeClause += " AND pa.consultant_name = ?"; params.push(consultantName); }
+  const wardScope = wardScopeSql(wardIds, extraAdmissionIds);
+  if (wardScope.clause) { scopeClause += " " + wardScope.clause; params.push(...wardScope.params); }
+  if (consultantDoctorMasterId) {
+    scopeClause += ` AND ((pa.owner_type='DOCTOR' AND pa.doctor_id = ?)
+      OR (pa.owner_type='GROUP' AND EXISTS (
+            SELECT 1 FROM consultant_group_members m
+            WHERE m.group_id = pa.consultant_group_id AND m.doctor_id = ?)))`;
+    params.push(consultantDoctorMasterId, consultantDoctorMasterId);
+  }
 
   return db.prepare(`
     SELECT dt.*, pa.id AS admission_id, pa.bed_id, pa.ward_id, pa.ip_last6,
@@ -209,11 +235,10 @@ export async function listByStepStatus(step: StepKey, status: string, wardIds: n
   `).all(...params);
 }
 
-export async function listPendingByStep(step: StepKey, wardIds: number[] | null) {
+export async function listPendingByStep(step: StepKey, wardIds: number[] | null, extraAdmissionIds?: number[] | null) {
   const col = STEP_COLUMN[step];
   if (!col) throw new HttpError(400, `Unknown discharge step: ${step}`);
-  const scopeClause = wardIds ? "AND pa.ward_id = ANY(?)" : "";
-  const params: unknown[] = wardIds ? [wardIds] : [];
+  const { clause: scopeClause, params } = wardScopeSql(wardIds, extraAdmissionIds);
 
   return db.prepare(`
     SELECT dt.*, pa.id AS admission_id, pa.bed_id, pa.ward_id, pa.ip_last6, bd.bed_name, w.name AS ward_name
@@ -227,9 +252,8 @@ export async function listPendingByStep(step: StepKey, wardIds: number[] | null)
   `).all(...params);
 }
 
-export async function listBillingPipeline(wardIds: number[] | null) {
-  const scopeClause = wardIds ? "AND pa.ward_id = ANY(?)" : "";
-  const params: unknown[] = wardIds ? [wardIds] : [];
+export async function listBillingPipeline(wardIds: number[] | null, extraAdmissionIds?: number[] | null) {
+  const { clause: scopeClause, params } = wardScopeSql(wardIds, extraAdmissionIds);
 
   // Payment done but System Checkout still pending is a valid, distinct bucket
   // now (FC's own next step) — the old payment_status != 'COMPLETED' filter
@@ -261,6 +285,17 @@ export async function listBillingPipeline(wardIds: number[] | null) {
   return buckets;
 }
 
+/** Shared by every discharge-workflow mutation that doesn't already emit its own
+ *  My Patients event (plan/reschedule/cancel-plan/initiate/cancel-after-initiation)
+ *  — one line per call site instead of duplicating the owner/room/row lookup. */
+async function emitMyPatientsUpdate(admissionId: number) {
+  const admission = await getAdmissionById(admissionId);
+  const rooms = admission ? consultantRoomsFor(admission) : [];
+  if (!rooms.length) return;
+  const row = await getMyPatientsRow(admissionId);
+  if (row) emitConsultantPatientUpdate(rooms, { type: "UPDATED", action: "UPSERT", ...row });
+}
+
 export async function planDischarge(opts: {
   bedId: number; plannedDate: string; plannedTime?: string | null; userId: number; role: Role;
 }): Promise<DischargeTracking> {
@@ -275,10 +310,16 @@ export async function planDischarge(opts: {
     throw new HttpError(409, "This admission already has a discharge in progress");
 
   const now = Date.now();
+  // The patient may already have physically left (e.g. moved to the Discharge Lounge
+  // via a manual Bed Transfer before any discharge was planned) — physically_left_at
+  // is the source of truth for that, independent of this tracking row's existence.
+  const alreadyLeft = admission.physically_left_at != null;
   const row = await db.prepare(
-    `INSERT INTO discharge_tracking (admission_id, status, planned_date, planned_time, planned_by, created_by, created_at, updated_at)
-     VALUES (?, 'PLANNED', ?, ?, ?, ?, ?, ?) RETURNING id`
-  ).run(admission.id, opts.plannedDate, opts.plannedTime ?? null, opts.userId, opts.userId, now, now);
+    `INSERT INTO discharge_tracking (admission_id, status, planned_date, planned_time, planned_by, created_by, created_at, updated_at,
+       physical_checkout_status, patient_left)
+     VALUES (?, 'PLANNED', ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`
+  ).run(admission.id, opts.plannedDate, opts.plannedTime ?? null, opts.userId, opts.userId, now, now,
+    alreadyLeft ? "COMPLETED" : "PENDING", alreadyLeft ? true : null);
   const trackingId = Number(row.lastInsertRowid);
 
   await logHistory({
@@ -287,6 +328,7 @@ export async function planDischarge(opts: {
   });
   await audit(opts.userId, "discharge_plan", String(admission.id), { bedId: opts.bedId, plannedDate: opts.plannedDate, plannedTime: opts.plannedTime });
 
+  await emitMyPatientsUpdate(admission.id);
   return (await getTrackingById(trackingId))!;
 }
 
@@ -317,6 +359,7 @@ export async function reschedule(opts: {
     await audit(opts.userId, "discharge_reschedule", String(opts.admissionId), { from: oldValue, to: newValue, reason: opts.reason });
   });
 
+  await emitMyPatientsUpdate(opts.admissionId);
   return (await getTrackingById(tracking.id))!;
 }
 
@@ -338,6 +381,8 @@ export async function cancelPlan(opts: { admissionId: number; reason?: string | 
     });
     await audit(opts.userId, "discharge_cancel_plan", String(opts.admissionId), { reason: opts.reason });
   });
+
+  await emitMyPatientsUpdate(opts.admissionId);
 }
 
 export async function initiateDischarge(opts: { admissionId: number; userId: number; role: Role }): Promise<DischargeTracking> {
@@ -381,6 +426,7 @@ export async function initiateDischarge(opts: { admissionId: number; userId: num
     await audit(opts.userId, "discharge_initiate", String(opts.admissionId), {});
   });
 
+  await emitMyPatientsUpdate(opts.admissionId);
   return (await getTrackingById(tracking.id))!;
 }
 
@@ -429,6 +475,7 @@ export async function cancelAfterInitiation(opts: { admissionId: number; reason?
     throw new HttpError(409, `Discharge is already ${tracking.status}`);
 
   await resetAndCancelTracking(tracking, opts.userId, opts.reason);
+  await emitMyPatientsUpdate(opts.admissionId);
 }
 
 /** Called from bedDetailService when a bed with an active admission is manually marked
@@ -471,6 +518,136 @@ async function completeIfEligible(tracking: DischargeTracking, userId: number) {
     oldValue: tracking.status, newValue: "COMPLETED", userId,
   });
   await audit(userId, "discharge_complete", String(tracking.admission_id), {});
+}
+
+/** Stamps patient_admissions.physically_left_at — the source of truth for "patient
+ *  physically left" that survives even when no discharge_tracking row exists yet.
+ *  Safe to call unconditionally; a no-op once already set. */
+async function markPhysicallyLeft(admissionId: number): Promise<void> {
+  await db.prepare(
+    "UPDATE patient_admissions SET physically_left_at = COALESCE(physically_left_at, ?) WHERE id=?"
+  ).run(Date.now(), admissionId);
+}
+
+/** Called from bedTransferService.transferBed when the destination is the Discharge
+ *  Lounge and a discharge has already been initiated for this admission — the transfer
+ *  itself is the declaration that the patient has physically left, so Physical Checkout
+ *  is marked complete as a side effect. Touches only physical_checkout_status/patient_left
+ *  — no other checklist step. (For "no discharge started yet," markPhysicallyLeft alone
+ *  is enough — planDischarge/dischargeImmediate read it back when tracking is created.) */
+export async function markPhysicalCheckoutFromTransfer(admissionId: number, userId: number): Promise<void> {
+  await markPhysicallyLeft(admissionId);
+  const tracking = await getTrackingByAdmission(admissionId);
+  if (!tracking || ["COMPLETED", "CANCELLED"].includes(tracking.status)) return;
+  if (tracking.physical_checkout_status === "COMPLETED") return;
+
+  const now = Date.now();
+  const r = await db.prepare(
+    `UPDATE discharge_tracking SET physical_checkout_status='COMPLETED', patient_left=true,
+       physical_checkout_started_at=COALESCE(physical_checkout_started_at, ?),
+       physical_checkout_completed_at=?, updated_at=? WHERE id=? AND updated_at=?`
+  ).run(now, now, now, tracking.id, tracking.updated_at);
+  if (r.changes === 0) throw new HttpError(409, "This discharge was just updated by someone else. Please refresh and try again.");
+
+  await logHistory({
+    admissionId, trackingId: tracking.id, field: "PHYSICAL_CHECKOUT",
+    oldValue: tracking.physical_checkout_status, newValue: "COMPLETED", userId,
+    reason: "Marked via Bed Transfer to Discharge Lounge",
+  });
+
+  const updated = (await getTrackingById(tracking.id))!;
+  await completeIfEligible(updated, userId);
+}
+
+/** Called from bedTransferService.transferBed (via readmitFromLounge) when the
+ *  *source* bed was the Discharge Lounge — the patient is physically back on a real
+ *  bed now, so the earlier "patient left" declaration is stale and must be undone.
+ *  Only physical_checkout_status/patient_left are touched — every other checklist
+ *  step (billing, audit, etc.) is left exactly as it was, same scope boundary as
+ *  markPhysicalCheckoutFromTransfer. No-op if there's nothing to undo. */
+export async function resetPhysicalCheckoutOnReadmit(admissionId: number, userId: number): Promise<void> {
+  await db.prepare("UPDATE patient_admissions SET physically_left_at = NULL WHERE id=?").run(admissionId);
+
+  const tracking = await getTrackingByAdmission(admissionId);
+  if (!tracking || ["COMPLETED", "CANCELLED"].includes(tracking.status)) return;
+  if (tracking.physical_checkout_status !== "COMPLETED") return;
+
+  const now = Date.now();
+  const r = await db.prepare(
+    `UPDATE discharge_tracking SET physical_checkout_status='PENDING', patient_left=NULL,
+       physical_checkout_started_at=NULL, physical_checkout_completed_at=NULL, updated_at=?
+     WHERE id=? AND updated_at=?`
+  ).run(now, tracking.id, tracking.updated_at);
+  if (r.changes === 0) throw new HttpError(409, "This discharge was just updated by someone else. Please refresh and try again.");
+
+  await logHistory({
+    admissionId, trackingId: tracking.id, field: "PHYSICAL_CHECKOUT",
+    oldValue: "COMPLETED", newValue: "PENDING", userId,
+    reason: "Readmitted from Discharge Lounge — patient is back on a real bed",
+  });
+}
+
+/** PRE-only emergency override for a lounge admission: force-completes every
+ *  checklist step and closes the discharge in one shot. Usable at any point, on
+ *  any admission currently sitting in the Discharge Lounge — including one with
+ *  no discharge_tracking row at all yet, which gets created and completed in the
+ *  same transaction. Physical checkout is always already true here (a lounge
+ *  admission implies physically_left_at is set), so nothing needs deriving for it. */
+export async function dischargeImmediate(opts: { admissionId: number; userId: number; role: Role }): Promise<void> {
+  requireRoleIn(opts.role, ["PRE"], "Discharge Immediate");
+
+  const admission = await getAdmissionById(opts.admissionId);
+  if (!admission || admission.status !== "ACTIVE") throw new HttpError(404, "No active admission found");
+
+  const bedRow = await db.prepare(
+    `SELECT w.is_discharge_lounge FROM bed_details bd JOIN wards w ON w.id = bd.ward_id WHERE bd.id = ?`
+  ).get<{ is_discharge_lounge: boolean }>(admission.bed_id);
+  if (!bedRow?.is_discharge_lounge)
+    throw new HttpError(409, "Discharge Immediate is only available for admissions currently in the Discharge Lounge");
+
+  let tracking = await getTrackingByAdmission(opts.admissionId);
+  if (tracking && ["COMPLETED", "CANCELLED"].includes(tracking.status))
+    throw new HttpError(409, `Discharge is already ${tracking.status}`);
+
+  const now = Date.now();
+  const nowIst = new Date(now + 5.5 * 60 * 60 * 1000).toISOString().slice(0, 10);
+
+  await db.transaction(async () => {
+    if (!tracking) {
+      const row = await db.prepare(
+        `INSERT INTO discharge_tracking (admission_id, status, planned_date, planned_by, created_by, created_at, updated_at,
+           physical_checkout_status, patient_left, initiated_at)
+         VALUES (?, 'DISCHARGE_INITIATED', ?, ?, ?, ?, ?, 'COMPLETED', true, ?) RETURNING id`
+      ).run(opts.admissionId, nowIst, opts.userId, opts.userId, now, now, now);
+      tracking = (await getTrackingById(Number(row.lastInsertRowid)))!;
+    }
+
+    const steps = Object.keys(STEP_COLUMN) as StepKey[];
+    const setSql = steps.map((s) => `${STEP_COLUMN[s]}='COMPLETED'`).join(", ");
+    const r = await db.prepare(
+      `UPDATE discharge_tracking SET status='COMPLETED', patient_left=true, ${setSql}, updated_at=? WHERE id=? AND updated_at=?`
+    ).run(now, tracking!.id, tracking!.updated_at);
+    if (r.changes === 0) throw new HttpError(409, "This discharge was just updated by someone else. Please refresh and try again.");
+
+    for (const s of steps) {
+      const col = STEP_COLUMN[s];
+      const oldValue = (tracking as unknown as Record<string, string>)[col];
+      if (oldValue !== "COMPLETED") {
+        await logHistory({
+          admissionId: opts.admissionId, trackingId: tracking!.id, field: s,
+          oldValue, newValue: "COMPLETED", userId: opts.userId, reason: "Discharge Immediate (force-complete)",
+        });
+      }
+    }
+
+    await updateBedStatus({
+      bedId: admission.bed_id, physicalStatus: "VACANT", reservationStatus: "NONE",
+      userId: opts.userId, changeReason: "DISCHARGE_CHECKOUT",
+    });
+    await closeAdmission(admission.id, opts.userId);
+  });
+
+  await audit(opts.userId, "discharge_force_complete", String(opts.admissionId), {});
 }
 
 export async function updateStep(opts: {
@@ -572,7 +749,20 @@ export async function updateStep(opts: {
 
   const updated = (await getTrackingById(tracking.id))!;
   await completeIfEligible(updated, opts.userId);
-  return (await getTrackingById(tracking.id))!;
+
+  // Skip if completeIfEligible just closed the admission above — closeAdmission
+  // already emitted its own DISCHARGED event for this same change, a second
+  // UPDATED here would be redundant.
+  const final = (await getTrackingById(tracking.id))!;
+  if (final.status !== "COMPLETED") {
+    const admission = await getAdmissionById(opts.admissionId);
+    const rooms = admission ? consultantRoomsFor(admission) : [];
+    if (rooms.length) {
+      const row = await getMyPatientsRow(opts.admissionId);
+      if (row) emitConsultantPatientUpdate(rooms, { type: "UPDATED", action: "UPSERT", ...row });
+    }
+  }
+  return final;
 }
 
 export interface DischargeDashboardCounts {
@@ -612,9 +802,8 @@ export interface DischargeDashboardCounts {
 }
 
 /** wardIds = null means hospital-wide (COO/FC); otherwise scoped to the caller's wards. */
-export async function dashboardCounts(wardIds: number[] | null): Promise<DischargeDashboardCounts> {
-  const scopeClause = wardIds ? "AND pa.ward_id = ANY(?)" : "";
-  const params: unknown[] = wardIds ? [wardIds] : [];
+export async function dashboardCounts(wardIds: number[] | null, extraAdmissionIds?: number[] | null): Promise<DischargeDashboardCounts> {
+  const { clause: scopeClause, params } = wardScopeSql(wardIds, extraAdmissionIds);
 
   // IST day boundaries (hospital is India-based — see existing scheduler's IST usage).
   const nowIst = new Date(Date.now() + 5.5 * 60 * 60 * 1000);
@@ -713,22 +902,20 @@ const DISCHARGE_LIST_SELECT = `
   JOIN wards w ON w.id = pa.ward_id
 `;
 
-export async function listCancelledToday(wardIds: number[] | null) {
+export async function listCancelledToday(wardIds: number[] | null, extraAdmissionIds?: number[] | null) {
   const nowIst = new Date(Date.now() + 5.5 * 60 * 60 * 1000);
   const todayStartMs = new Date(nowIst.toISOString().slice(0, 10) + "T00:00:00+05:30").getTime();
-  const scopeClause = wardIds ? "AND pa.ward_id = ANY(?)" : "";
-  const params: unknown[] = wardIds ? [wardIds] : [];
+  const { clause: scopeClause, params } = wardScopeSql(wardIds, extraAdmissionIds);
   return db.prepare(
     `${DISCHARGE_LIST_SELECT} WHERE dt.status='CANCELLED' AND dt.updated_at >= ? ${scopeClause} ORDER BY dt.updated_at DESC`
   ).all(todayStartMs, ...params);
 }
 
-export async function listAdmittedToday(wardIds: number[] | null) {
+export async function listAdmittedToday(wardIds: number[] | null, extraAdmissionIds?: number[] | null) {
   const nowIst = new Date(Date.now() + 5.5 * 60 * 60 * 1000);
   const todayStart = new Date(nowIst.toISOString().slice(0, 10) + "T00:00:00+05:30").getTime();
   const todayEnd = todayStart + 24 * 60 * 60 * 1000;
-  const scopeClause = wardIds ? "AND pa.ward_id = ANY(?)" : "";
-  const params: unknown[] = wardIds ? [wardIds] : [];
+  const { clause: scopeClause, params } = wardScopeSql(wardIds, extraAdmissionIds);
   return db.prepare(`
     SELECT pa.id AS admission_id, pa.bed_id, pa.ward_id, pa.ip_last6, pa.admitted_at,
            bd.bed_name, w.name AS ward_name
@@ -740,31 +927,28 @@ export async function listAdmittedToday(wardIds: number[] | null) {
   `).all(todayStart, todayEnd, ...params);
 }
 
-export async function listInitiatedToday(wardIds: number[] | null) {
+export async function listInitiatedToday(wardIds: number[] | null, extraAdmissionIds?: number[] | null) {
   const nowIst = new Date(Date.now() + 5.5 * 60 * 60 * 1000);
   const todayStartMs = new Date(nowIst.toISOString().slice(0, 10) + "T00:00:00+05:30").getTime();
-  const scopeClause = wardIds ? "AND pa.ward_id = ANY(?)" : "";
-  const params: unknown[] = wardIds ? [wardIds] : [];
+  const { clause: scopeClause, params } = wardScopeSql(wardIds, extraAdmissionIds);
   return db.prepare(
     `${DISCHARGE_LIST_SELECT} WHERE dt.status IN ('DISCHARGE_INITIATED','IN_PROGRESS','COMPLETED')
      AND dt.initiated_at >= ? ${scopeClause} ORDER BY dt.initiated_at DESC`
   ).all(todayStartMs, ...params);
 }
 
-export async function listCompletedToday(wardIds: number[] | null) {
+export async function listCompletedToday(wardIds: number[] | null, extraAdmissionIds?: number[] | null) {
   const nowIst = new Date(Date.now() + 5.5 * 60 * 60 * 1000);
   const todayStartMs = new Date(nowIst.toISOString().slice(0, 10) + "T00:00:00+05:30").getTime();
-  const scopeClause = wardIds ? "AND pa.ward_id = ANY(?)" : "";
-  const params: unknown[] = wardIds ? [wardIds] : [];
+  const { clause: scopeClause, params } = wardScopeSql(wardIds, extraAdmissionIds);
   return db.prepare(
     `${DISCHARGE_LIST_SELECT} WHERE dt.status='COMPLETED' AND dt.updated_at >= ?
      AND pa.status='DISCHARGED' ${scopeClause} ORDER BY dt.updated_at DESC`
   ).all(todayStartMs, ...params);
 }
 
-export async function listPatientLeft(wardIds: number[] | null) {
-  const scopeClause = wardIds ? "AND pa.ward_id = ANY(?)" : "";
-  const params: unknown[] = wardIds ? [wardIds] : [];
+export async function listPatientLeft(wardIds: number[] | null, extraAdmissionIds?: number[] | null) {
+  const { clause: scopeClause, params } = wardScopeSql(wardIds, extraAdmissionIds);
   return db.prepare(
     `${DISCHARGE_LIST_SELECT} WHERE dt.patient_left = TRUE AND dt.system_checkout_status != 'COMPLETED'
      AND pa.status IN ('ACTIVE','DISCHARGED') ${scopeClause} ORDER BY dt.updated_at DESC`

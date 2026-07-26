@@ -22,6 +22,69 @@ export interface PreSummary {
   total: number; wards: number; wardsDone: number; complete: boolean;
 }
 
+function normalizeDashboardUnitType(unitType?: string | null): string | null {
+  const raw = (unitType || "").trim();
+  if (!raw) return null;
+  if (raw.includes("Renova")) return "Renova";
+  if (raw === "KIMS") return "KIMS";
+  return raw;
+}
+
+function dashboardUnitMatches(rawUnitType: string | null | undefined, selectedUnitType?: string | null) {
+  const selected = normalizeDashboardUnitType(selectedUnitType);
+  if (!selected || selected === "TOTAL") return true;
+  return normalizeDashboardUnitType(rawUnitType) === selected;
+}
+
+function dashboardSnapshotUnitKeys(unitType?: string | null): string[] | null {
+  const normalized = normalizeDashboardUnitType(unitType);
+  if (!normalized || normalized === "TOTAL") return null;
+  if (normalized === "Renova") return ["Renova", "KIMS - Renova"];
+  return [normalized];
+}
+
+/** Ward ids whose unit_type matches the Unit toolbar's current selection —
+ *  same normalization/grouping rules as adminDashboard()'s own filter (see
+ *  dashboardUnitMatches above), driven entirely off whatever unit_type values
+ *  actually exist on operational wards. Adding a new unit in Setup → Wards
+ *  needs zero code changes here — it's picked up automatically. Returns null
+ *  for "TOTAL"/empty (no filter, hospital-wide), matching every other wardIds
+ *  convention in this file. Used by discharge.ts to make the Transaction
+ *  Board's drilldown lists/counts respect the same Unit filter its card
+ *  numbers already do. */
+export async function wardIdsForUnit(unitType?: string | null): Promise<number[] | null> {
+  const normalized = normalizeDashboardUnitType(unitType);
+  if (!normalized || normalized === "TOTAL") return null;
+  const rows = await db.prepare("SELECT id, unit_type FROM wards WHERE operational=true")
+    .all<{ id: number; unit_type: string | null }>();
+  return rows.filter((r) => dashboardUnitMatches(r.unit_type, unitType)).map((r) => r.id);
+}
+
+/** Admission ids of patients currently sitting in the Discharge Lounge whose
+ *  most recent transfer came FROM one of the given wards. A lounge patient's
+ *  patient_admissions.ward_id becomes the Lounge ward's id the moment they're
+ *  transferred (see bedTransferService.ts's moveAdmission), so a plain
+ *  "pa.ward_id = ANY(unitWardIds)" filter would silently drop every lounge
+ *  patient once a Unit filter is active — same reasoning as
+ *  loungeOriginBreakdown above, just returning admission ids instead of a
+ *  count so callers can OR them into an existing ward-scoped query. */
+export async function loungeOriginAdmissionIds(wardIds: number[] | null): Promise<number[]> {
+  if (!wardIds || wardIds.length === 0) return [];
+  const rows = await db.prepare(`
+    SELECT pa.id
+    FROM patient_admissions pa
+    JOIN bed_details bd_lounge ON bd_lounge.id = pa.bed_id
+    JOIN wards w_lounge ON w_lounge.id = bd_lounge.ward_id AND w_lounge.is_discharge_lounge AND w_lounge.operational = true
+    JOIN LATERAL (
+      SELECT bth.from_bed_id FROM bed_transfer_history bth
+      WHERE bth.admission_id = pa.id ORDER BY bth.transferred_at DESC LIMIT 1
+    ) lt ON true
+    JOIN bed_details bd_from ON bd_from.id = lt.from_bed_id
+    WHERE pa.status = 'ACTIVE' AND bd_from.ward_id = ANY(?)
+  `).all<{ id: number }>(wardIds);
+  return rows.map((r) => r.id);
+}
+
 export async function wardsForFloor(floorId: number): Promise<WardView[]> {
   return db.prepare(
     `SELECT w.id, w.name AS ward, w.total_beds AS total, w.unit_type,
@@ -377,7 +440,9 @@ export async function allWardsLive(restrictWardIds?: number[] | null) {
 
   // Per-ward payer breakdown so the dashboard's Payer Mix can be recomputed
   // client-side from whatever wards are currently visible (Unit + Search).
-  //   payersLive  = currently occupied beds by payer in that ward
+  //   payersLive  = currently occupied beds by payer in that ward (includes
+  //                 occupied+reserved beds — a reserved bed still has a real
+  //                 patient/payer, same reasoning as Total Patients including it)
   //   payersAdmit = beds taken OCCUPIED by payer, bucketed by time window
   //                 (today IST / last 7d / 30d / 12 months) for the range toggle.
   const IST = 5.5 * 3600 * 1000;
@@ -391,7 +456,7 @@ export async function allWardsLive(restrictWardIds?: number[] | null) {
     : await Promise.all([
       db.prepare(
         `SELECT ward_id, payer_type, COUNT(*)::int AS n FROM bed_details
-          WHERE payer_type IS NOT NULL AND physical_status = 'OCCUPIED' AND reservation_status = 'NONE'
+          WHERE payer_type IS NOT NULL AND physical_status = 'OCCUPIED'
             AND ward_id = ANY(?) GROUP BY ward_id, payer_type`
       ).all<{ ward_id: number; payer_type: string; n: number }>(wardIds),
       db.prepare(
@@ -517,6 +582,12 @@ export interface LiveBedDetail {
   updated_by_name: string | null;
   discharge_tracking: unknown | null;
   admission_type: string | null;
+  /** Only set for a bed in the Discharge Lounge — the real ward/bed the patient
+   *  physically left before landing here (most recent bed_transfer_history row
+   *  for their admission). Null for every ordinary bed. */
+  origin_ward_id: number | null;
+  origin_ward_name: string | null;
+  origin_bed_name: string | null;
 }
 
 // Bed-level rows for the dashboard's Bed Explorer popup (click a KPI/payer
@@ -534,12 +605,21 @@ export async function allBedDetailsLive(restrictWardIds?: number[] | null) {
             bd.bed_name, bd.physical_status, bd.reservation_status, bd.payer_type,
             bd.destination, bd.reservation_note, bd.operational_status,
             bd.updated_at, u.name AS updated_by_name, row_to_json(dt.*) AS discharge_tracking,
-            pa.admission_type, pa.ip_last6
+            pa.admission_type, pa.ip_last6,
+            w_from.id AS origin_ward_id, w_from.name AS origin_ward_name, bd_from.bed_name AS origin_bed_name
      FROM bed_details bd
      JOIN wards w ON w.id = bd.ward_id
      LEFT JOIN users u ON u.id = bd.updated_by
      LEFT JOIN patient_admissions pa ON pa.bed_id = bd.id AND pa.status = 'ACTIVE'
      LEFT JOIN discharge_tracking dt ON dt.admission_id = pa.id
+     -- Origin ward/bed — lounge beds only. The ON condition short-circuits this
+     -- for every ordinary bed, so it costs nothing outside the Discharge Lounge.
+     LEFT JOIN LATERAL (
+       SELECT bth.from_bed_id, bth.from_ward_id FROM bed_transfer_history bth
+       WHERE bth.admission_id = pa.id ORDER BY bth.transferred_at DESC LIMIT 1
+     ) lt ON w.is_discharge_lounge AND pa.id IS NOT NULL
+     LEFT JOIN bed_details bd_from ON bd_from.id = lt.from_bed_id
+     LEFT JOIN wards w_from ON w_from.id = lt.from_ward_id
      WHERE w.operational = true ${restrictWardIds ? "AND w.id = ANY(?)" : ""}
      ORDER BY w.name,
        substring(bd.bed_name from '^[^0-9]*') ASC,
@@ -627,7 +707,7 @@ export async function midnightCensusFor(date: string) {
  *  already excluded from "Operational Beds" on the snapshot. */
 async function bedStateBreakdown(wardIds: number[] | null) {
   return db.prepare(`
-    SELECT w.bed_type, pa.admission_type,
+    SELECT w.bed_type, pa.admission_type, bd.payer_type,
       CASE
         WHEN w.is_discharge_lounge AND bd.physical_status='OCCUPIED' THEN 'lounge'
         WHEN bd.physical_status='OCCUPIED' AND bd.reservation_status='NONE'
@@ -651,8 +731,8 @@ async function bedStateBreakdown(wardIds: number[] | null) {
     -- beds than the card's own number. Bed-level operational_status matches
     -- the same convention one level down.
     WHERE w.operational = true AND bd.operational_status = true ${wardIds ? "AND w.id = ANY(?)" : ""}
-    GROUP BY w.bed_type, pa.admission_type, state
-  `).all<{ bed_type: string; admission_type: string | null; state: string; c: number }>(...(wardIds ? [wardIds] : []));
+    GROUP BY w.bed_type, pa.admission_type, bd.payer_type, state
+  `).all<{ bed_type: string; admission_type: string | null; payer_type: string | null; state: string; c: number }>(...(wardIds ? [wardIds] : []));
 }
 
 /** For every admission currently sitting in the Discharge Lounge, the bed_type of
@@ -663,7 +743,7 @@ async function bedStateBreakdown(wardIds: number[] | null) {
  *  the Unit filter's meaning everywhere else on this dashboard. */
 async function loungeOriginBreakdown(wardIds: number[] | null) {
   return db.prepare(`
-    SELECT w_from.bed_type AS origin_bed_type, COUNT(*)::int AS c
+    SELECT w_from.bed_type AS origin_bed_type, pa.admission_type, bd_lounge.payer_type, COUNT(*)::int AS c
     FROM patient_admissions pa
     JOIN bed_details bd_lounge ON bd_lounge.id = pa.bed_id
     JOIN wards w_lounge ON w_lounge.id = bd_lounge.ward_id AND w_lounge.is_discharge_lounge AND w_lounge.operational = true
@@ -675,14 +755,20 @@ async function loungeOriginBreakdown(wardIds: number[] | null) {
     JOIN wards w_from ON w_from.id = bd_from.ward_id
     -- Scoped by the patient's ORIGIN ward (bd_from), by design — that's what
     -- makes "Census"/"Non Census" mean anything for a lounge patient (the
-    -- lounge ward itself has no bed_type of its own that matters here).
+    -- lounge ward itself has no bed_type of its own that matters here, and
+    -- its own unit_type is always NULL so it can never match a unit filter —
+    -- see totalPatients/patientType below, which rely on this instead of
+    -- bedStateBreakdown's wardIds-scoped 'lounge' rows for the same reason).
+    -- payer_type is read off bd_lounge (the patient's current, physical bed)
+    -- since that's where the payer is actually assigned/tracked.
     WHERE pa.status = 'ACTIVE' ${wardIds ? "AND bd_from.ward_id = ANY(?)" : ""}
-    GROUP BY w_from.bed_type
-  `).all<{ origin_bed_type: string; c: number }>(...(wardIds ? [wardIds] : []));
+    GROUP BY w_from.bed_type, pa.admission_type, bd_lounge.payer_type
+  `).all<{ origin_bed_type: string; admission_type: string | null; payer_type: string | null; c: number }>(...(wardIds ? [wardIds] : []));
 }
 
 /** unitType = null/undefined/"TOTAL" means hospital-wide — matches the COO
- *  dashboard's "Unit" toolbar filter (TOTAL + each distinct wards.unit_type).
+ *  dashboard's "Unit" toolbar filter (TOTAL + logical unit groups like KIMS /
+ *  Renova, plus any other raw unit names).
  *  Every count below is scoped to the same set of wards so the whole board
  *  (Hospital Snapshot, Occupancy Board, Transaction Board) moves together
  *  when that filter changes, same as the ward tables and By Payer cards
@@ -690,9 +776,10 @@ async function loungeOriginBreakdown(wardIds: number[] | null) {
 /** restrictWardIds — see allWardsLive(). Intersects with the unitType filter
  *  when both are given (e.g. a PRE user filtering their own wards by unit). */
 export async function adminDashboard(unitType?: string | null, restrictWardIds?: number[] | null) {
-  const scoped = !!unitType && unitType !== "TOTAL";
+  const scoped = !!normalizeDashboardUnitType(unitType) && normalizeDashboardUnitType(unitType) !== "TOTAL";
   let wardIds = scoped
-    ? (await db.prepare("SELECT id FROM wards WHERE unit_type=? AND operational=true").all<{ id: number }>(unitType))
+    ? (await db.prepare("SELECT id, unit_type FROM wards WHERE operational=true").all<{ id: number; unit_type: string | null }>())
+      .filter((r) => dashboardUnitMatches(r.unit_type, unitType))
       .map(r => r.id)
     : null;
   if (restrictWardIds) {
@@ -700,7 +787,7 @@ export async function adminDashboard(unitType?: string | null, restrictWardIds?:
   }
 
   const rows = await bedStateBreakdown(wardIds);
-  const sum = (pred: (r: { bed_type: string; admission_type: string | null; state: string }) => boolean) =>
+  const sum = (pred: (r: { bed_type: string; admission_type: string | null; payer_type: string | null; state: string }) => boolean) =>
     rows.filter(pred).reduce((s, r) => s + r.c, 0);
   const occStates = ["onbed", "overstay", "occ_res"];
 
@@ -721,10 +808,29 @@ export async function adminDashboard(unitType?: string | null, restrictWardIds?:
 
   const onbed = sum(r => r.state === "onbed");
   const overstay = sum(r => r.state === "overstay");
-  const loungePatients = sum(r => r.state === "lounge");
+  const reserved = sum(r => r.state === "occ_res");
   const loungeOrigin = await loungeOriginBreakdown(wardIds);
-  const loungeBy = (bedType: string) => loungeOrigin.find(r => r.origin_bed_type === bedType)?.c ?? 0;
-  const allAdmittedStates = ["onbed", "overstay", "lounge"];
+  // Origin-scoped, not bedStateBreakdown's 'lounge' rows — the lounge ward's
+  // own unit_type is always NULL, so wardIds (a unit filter) would otherwise
+  // drop every lounge patient here whenever a specific unit is selected. See
+  // loungeOriginBreakdown's comment.
+  const loungePatients = loungeOrigin.reduce((s, r) => s + r.c, 0);
+  const loungeBy = (bedType: string) => loungeOrigin.filter(r => r.origin_bed_type === bedType).reduce((s, r) => s + r.c, 0);
+  const loungeAdmittedBy = (admissionType: string) => loungeOrigin.filter(r => r.admission_type === admissionType).reduce((s, r) => s + r.c, 0);
+  const loungePaidBy = (payerType: string) => loungeOrigin.filter(r => r.payer_type === payerType).reduce((s, r) => s + r.c, 0);
+
+  // Origin-scoped, same reasoning as patientType — a lounge patient's payer
+  // only counts toward a unit if that's where they actually came from,
+  // otherwise a unit filter would leak every other unit's lounge patients
+  // into "By Payer" (the old bug: frontend summed the lounge ward's payer
+  // mix unconditionally regardless of the active unit filter).
+  const payerTypeNames = new Set<string>();
+  for (const r of rows) if (r.payer_type) payerTypeNames.add(r.payer_type);
+  for (const r of loungeOrigin) if (r.payer_type) payerTypeNames.add(r.payer_type);
+  const payerType: Record<string, number> = {};
+  for (const pt of payerTypeNames) {
+    payerType[pt] = sum(r => r.payer_type === pt && occStates.includes(r.state)) + loungePaidBy(pt);
+  }
 
   const todayStart = startOfDayIST();
   const todayEnd = todayStart + 24 * 60 * 60 * 1000;
@@ -742,10 +848,14 @@ export async function adminDashboard(unitType?: string | null, restrictWardIds?:
       nonCensusBeds: Number(snapshotRow?.non_census_beds || 0),
     },
     occupancy: {
-      totalPatients: onbed + overstay + loungePatients,
+      totalPatients: onbed + overstay + reserved + loungePatients,
+      // Same as totalPatients minus the Discharge Lounge — on-bed + overstay +
+      // reserved beds only, both Census and Non-Census (occStates covers all
+      // three; lounge is excluded by definition).
+      totalOccupancy: onbed + overstay + reserved,
 
       // Kept for anything still reading the old flat shape.
-      onbed, overstay, loungePatients,
+      onbed, overstay, reserved, loungePatients,
       censusOcc: sum(r => r.bed_type === "Census" && occStates.includes(r.state)),
       nonCensusOcc: sum(r => r.bed_type === "Non-Census" && occStates.includes(r.state)),
       vacantCensus: sum(r => r.bed_type === "Census" && (r.state === "vacant_none" || r.state === "vacant_res")),
@@ -768,9 +878,8 @@ export async function adminDashboard(unitType?: string | null, restrictWardIds?:
         res: sum(r => r.bed_type === "Non-Census" && r.state === "occ_res"),
         overstay: sum(r => r.bed_type === "Non-Census" && r.state === "overstay"),
       },
-      // total must be the sum of its own sub-breakdown (both origin-scoped) —
-      // using loungePatients (scoped by the lounge ward itself) here let this
-      // disagree with census/nonCensus on a scoped PRE/Nurse dashboard.
+      // total intentionally matches loungePatients above — both are origin-scoped
+      // now, so this always equals the sum of its own census/nonCensus split.
       lounge: {
         total: loungeBy("Census") + loungeBy("Non-Census"),
         census: loungeBy("Census"),
@@ -783,11 +892,16 @@ export async function adminDashboard(unitType?: string | null, restrictWardIds?:
         nonCensus: sum(r => r.bed_type === "Non-Census" && r.state === "vacant_none"),
         ncRes: sum(r => r.bed_type === "Non-Census" && r.state === "vacant_res"),
       },
+      // occStates covers onbed/overstay/occ_res; lounge is added separately,
+      // origin-scoped, for the same reason totalPatients/lounge.* are above.
       patientType: {
-        ipd: sum(r => r.admission_type === "IP" && allAdmittedStates.includes(r.state)),
-        dayCare: sum(r => r.admission_type === "DAYCARE" && allAdmittedStates.includes(r.state)),
-        opd: sum(r => r.admission_type === "OPD" && allAdmittedStates.includes(r.state)),
+        ipd: sum(r => r.admission_type === "IP" && occStates.includes(r.state)) + loungeAdmittedBy("IP"),
+        dayCare: sum(r => r.admission_type === "DAYCARE" && occStates.includes(r.state)) + loungeAdmittedBy("DAYCARE"),
+        opd: sum(r => r.admission_type === "OPD" && occStates.includes(r.state)) + loungeAdmittedBy("OPD"),
       },
+      // Keyed by payer name (from Setup → Payer Types); origin-scoped for the
+      // Discharge Lounge same as patientType above.
+      payerType,
     },
     transaction: {
       newAdmissionsToday: Number(admissionsToday?.c || 0),
@@ -831,13 +945,18 @@ export async function adminDashboard(unitType?: string | null, restrictWardIds?:
  *  already cover — called from the scheduler on the same hourly tick as
  *  snapshotOccupancy(). Builds real sparkline history for the flat-line cards.
  *  Writes one row for hospital-wide (unit_type=NULL) PLUS one row per operational
- *  unit_type, so the Unit toolbar filter can show a real per-unit trend instead
- *  of always falling back to the hospital-wide line. */
+ *  logical unit group, so the Unit toolbar filter can show a real per-unit
+ *  trend instead of always falling back to the hospital-wide line. */
 export async function snapshotAdminDashboard() {
   const unitRows = await db.prepare(
-    "SELECT DISTINCT unit_type FROM wards WHERE operational=true AND unit_type IS NOT NULL AND unit_type <> ''"
+    // The Discharge Lounge is excluded regardless of whatever unit_type it's
+    // been given — it's a shared virtual holding ward, not a real unit; its
+    // patients are already attributed to their origin ward's unit elsewhere.
+    "SELECT DISTINCT unit_type FROM wards WHERE operational=true AND unit_type IS NOT NULL AND unit_type <> '' AND is_discharge_lounge = false"
   ).all<{ unit_type: string }>();
-  const targets: (string | null)[] = [null, ...unitRows.map(r => r.unit_type)];
+  const targets: (string | null)[] = [null, ...Array.from(
+    new Set(unitRows.map(r => normalizeDashboardUnitType(r.unit_type)).filter(Boolean))
+  )];
   const ts = Date.now();
 
   for (const unit of targets) {
@@ -899,11 +1018,38 @@ export async function consultantsLive() {
 /** Last N hourly rows for one unit (or hospital-wide when unitType is null/"TOTAL"),
  *  oldest first (matches the shape callers expect for sparklines). */
 export async function adminDashboardHistory(limit = 48, unitType?: string | null) {
-  const scoped = !!unitType && unitType !== "TOTAL";
+  const snapshotKeys = dashboardSnapshotUnitKeys(unitType);
+  if (!snapshotKeys) {
+    const rows = await db.prepare(
+      `SELECT * FROM admin_dashboard_snapshots
+       WHERE unit_type IS NOT DISTINCT FROM ?
+       ORDER BY ts DESC LIMIT ?`
+    ).all<Record<string, number>>(null, limit);
+    return rows.reverse();
+  }
+
+  const fetchLimit = Math.max(limit * snapshotKeys.length * 4, limit);
   const rows = await db.prepare(
     `SELECT * FROM admin_dashboard_snapshots
-     WHERE unit_type IS NOT DISTINCT FROM ?
+     WHERE unit_type = ANY(?)
      ORDER BY ts DESC LIMIT ?`
-  ).all<Record<string, number>>(scoped ? unitType : null, limit);
-  return rows.reverse();
+  ).all<Array<Record<string, number | string | null>>[number]>(snapshotKeys, fetchLimit);
+
+  const byTs = new Map<number, Record<string, number | string | null>>();
+  for (const row of rows) {
+    const ts = Number(row.ts || 0);
+    if (!ts) continue;
+    if (!byTs.has(ts)) byTs.set(ts, { ...row, unit_type: normalizeDashboardUnitType(unitType) });
+    else {
+      const acc = byTs.get(ts)!;
+      for (const [key, value] of Object.entries(row)) {
+        if (key === "ts" || key === "unit_type") continue;
+        if (typeof value === "number") acc[key] = Number(acc[key] || 0) + value;
+      }
+    }
+  }
+
+  return Array.from(byTs.values())
+    .sort((a, b) => Number(a.ts) - Number(b.ts))
+    .slice(-limit) as Record<string, number>[];
 }

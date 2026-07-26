@@ -20,6 +20,7 @@ export async function login(username: string, password: string) {
     block: null, pre: null,
     nursing_station: user.nursing_station ?? null,
     station_id: user.station_id ?? null,
+    doctor_master_id: user.doctor_master_id ?? null,
   };
   const token = jwt.sign(payload, env.JWT_SECRET, { expiresIn: "24h" });
   return { token, user: { ...payload } };

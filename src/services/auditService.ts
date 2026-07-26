@@ -42,6 +42,7 @@ const CATEGORY_ACTIONS: Record<string, string[]> = {
     "admission_create", "admission_close", "admission_move",
     "discharge_plan", "discharge_reschedule", "discharge_cancel_plan", "discharge_initiate",
     "discharge_cancel", "discharge_step_update", "discharge_complete", "bed_transfer",
+    "bed_readmit", "discharge_force_complete",
   ],
 };
 

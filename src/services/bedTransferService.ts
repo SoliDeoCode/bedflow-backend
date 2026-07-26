@@ -3,7 +3,7 @@ import { HttpError } from "../middleware/error.js";
 import { audit } from "./auditService.js";
 import { listBeds, updateBedStatus } from "./bedDetailService.js";
 import { getActiveAdmissionByBed, moveAdmission } from "./patientAdmissionService.js";
-import { getTrackingByAdmission } from "./dischargeService.js";
+import { getTrackingByAdmission, markPhysicalCheckoutFromTransfer, resetPhysicalCheckoutOnReadmit } from "./dischargeService.js";
 
 /** Beds a patient can be transferred into: operational, Vacant, not reserved.
  *  Mirrors bedDetailService.listBeds — reused rather than re-implemented. */
@@ -36,9 +36,13 @@ async function getBedForTransfer(bedId: number): Promise<BedRow> {
  *  Occupied (visible, recoverable by manually vacating the old bed) rather than losing the
  *  admission's link to a bed entirely.
  *
- *  The Discharge Lounge is never a valid manual destination — it's a virtual holding ward
- *  reachable only automatically via moveToDischargeLounge() once Physical Checkout is
- *  complete. allowDischargeLounge is set only by that function's own internal call. */
+ *  The Discharge Lounge is a valid manual destination too — moving a bed there is
+ *  itself the declaration that the patient has physically left. If a discharge has
+ *  already been initiated for this admission, Physical Checkout gets marked complete
+ *  as a side effect (see markPhysicalCheckoutFromTransfer below); if no discharge has
+ *  started yet, physically_left_at is stamped so a later plan/initiate/Discharge
+ *  Immediate picks it up automatically. allowDischargeLounge is kept for
+ *  moveToDischargeLounge's own call below but is otherwise a no-op now. */
 export async function transferBed(opts: {
   fromBedId: number; toWardId: number; toBedId: number; reason: string; userId: number;
   allowDischargeLounge?: boolean;
@@ -55,8 +59,6 @@ export async function transferBed(opts: {
 
   const toBed = await getBedForTransfer(opts.toBedId);
   if (toBed.ward_id !== opts.toWardId) throw new HttpError(400, "Destination bed is not in the selected ward");
-  if (toBed.ward_is_discharge_lounge && !opts.allowDischargeLounge)
-    throw new HttpError(409, "The Discharge Lounge can't be selected as a manual transfer destination — it's only reached automatically once Physical Checkout is complete.");
   if (!toBed.ward_operational) throw new HttpError(409, "Destination ward is currently non-operational");
   if (!toBed.operational_status) throw new HttpError(409, "Destination bed is non-operational");
   if (toBed.physical_status !== "VACANT") throw new HttpError(409, "Destination bed must be Vacant");
@@ -90,6 +92,12 @@ export async function transferBed(opts: {
   await audit(opts.userId, "bed_transfer", String(admission.id), {
     fromBedId: opts.fromBedId, toBedId: opts.toBedId, toWardId: opts.toWardId, reason,
   });
+
+  if (toBed.ward_is_discharge_lounge) {
+    await markPhysicalCheckoutFromTransfer(admission.id, opts.userId);
+  } else if (fromBed.ward_is_discharge_lounge) {
+    await resetPhysicalCheckoutOnReadmit(admission.id, opts.userId);
+  }
 
   const toBedName = await db.prepare("SELECT bed_name FROM bed_details WHERE id=?").get<{ bed_name: string }>(opts.toBedId);
   const toWardName = await db.prepare("SELECT name FROM wards WHERE id=?").get<{ name: string }>(opts.toWardId);
@@ -125,4 +133,33 @@ export async function moveToDischargeLounge(opts: { admissionId: number; fromBed
     userId: opts.userId,
     allowDischargeLounge: true,
   });
+}
+
+/** Moves a patient out of the Discharge Lounge back onto a real bed — the reverse of
+ *  a normal transfer, logged distinctly (is_readmit) so it's identifiable in history
+ *  separately from an ordinary bed-to-bed transfer. */
+export async function readmitFromLounge(opts: {
+  fromBedId: number; toWardId: number; toBedId: number; reason: string; userId: number;
+}) {
+  const fromBed = await getBedForTransfer(opts.fromBedId);
+  if (!fromBed.ward_is_discharge_lounge)
+    throw new HttpError(409, "Readmit is only valid from a Discharge Lounge bed");
+
+  const result = await transferBed({
+    fromBedId: opts.fromBedId, toWardId: opts.toWardId, toBedId: opts.toBedId, reason: opts.reason, userId: opts.userId,
+  });
+
+  await db.prepare(
+    `UPDATE bed_transfer_history SET is_readmit=true WHERE id = (
+       SELECT id FROM bed_transfer_history
+       WHERE admission_id=? AND to_bed_id=? AND transferred_by=?
+       ORDER BY transferred_at DESC LIMIT 1
+     )`
+  ).run(result.admissionId, opts.toBedId, opts.userId);
+
+  await audit(opts.userId, "bed_readmit", String(result.admissionId), {
+    fromBedId: opts.fromBedId, toBedId: opts.toBedId, toWardId: opts.toWardId, reason: opts.reason,
+  });
+
+  return result;
 }

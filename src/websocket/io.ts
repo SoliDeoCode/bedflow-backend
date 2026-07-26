@@ -51,6 +51,18 @@ export function initWebsocket(server: HttpServer) {
       ).all<{ ward_id: number }>(user.id);
       for (const r of rooms) socket.join(`ward:${r.ward_id}`);
     }
+    if (user.role === "CONSULTANT" && user.doctor_master_id) {
+      // Targeted rooms for My Patients real-time updates — a My-Patients event for
+      // an admission owned by this doctor, or by a Consultant Group this doctor is
+      // a member of, reaches only these rooms, never "overview" (My Patients is
+      // ownership-scoped by design; "overview" stays reserved for the hospital-wide
+      // dashboard pages this role also has, which CONSULTANT still joins above).
+      socket.join(`consultant:${user.doctor_master_id}`);
+      const groups = await db.prepare(
+        "SELECT group_id FROM consultant_group_members WHERE doctor_id=?"
+      ).all<{ group_id: number }>(user.doctor_master_id);
+      for (const g of groups) socket.join(`group:${g.group_id}`);
+    }
   });
 
   // Public namespace for patient portal — no JWT required.
@@ -103,4 +115,21 @@ export function emitUpdate(
       patientNs.to(`patient:${aid}`).emit("discharge:refresh", { admissionId: aid });
     }
   }
+}
+
+/** Targeted My Patients real-time update — deliberately separate from emitUpdate:
+ *  this NEVER touches "overview" or any other broadcast room. Only consultants who
+ *  actually own the admission (the individual doctor's `consultant:<id>` room, or
+ *  every member's `group:<id>` room) receive it. Payload carries enough of the
+ *  patient row for the receiving page to patch in place instead of refetching —
+ *  see MyPatientsPage's handling of each `type`. */
+export type ConsultantPatientEventType = "ADMITTED" | "DISCHARGED" | "UPDATED" | "TRANSFERRED" | "OWNERSHIP_CHANGED";
+
+/** `action` is what the receiving page actually does — UPSERT (add-or-replace by
+ *  admission_id) or REMOVE (filter out by admission_id) — kept separate from
+ *  `type`, which is only for display/logging, so MyPatientsPage never has to
+ *  branch on every specific type to decide the list mutation. */
+export function emitConsultantPatientUpdate(consultantRooms: string[], payload: { type: ConsultantPatientEventType; action: "UPSERT" | "REMOVE"; [key: string]: unknown }) {
+  if (!io || consultantRooms.length === 0) return;
+  for (const room of consultantRooms) io.to(room).emit("consultant:patient-update", payload);
 }

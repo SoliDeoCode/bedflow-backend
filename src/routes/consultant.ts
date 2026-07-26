@@ -8,6 +8,15 @@ import { db } from "../db/index.js";
 const router = Router();
 router.use(authRequired, requireRole("CONSULTANT"));
 
+// Every consultant-scoped query below filters by ownership (individual doctor OR
+// Consultant Group membership) instead of matching consultant_name text, same
+// resolution as consultantGroupService.ownsAdmission. -1 is a safe sentinel for a
+// login with no doctor_master_id linked yet — it can never match a real
+// doctors_master id, so such a login simply sees nothing instead of erroring.
+function myDoctorMasterId(req: { user?: { doctor_master_id?: number | null } }): number {
+  return req.user?.doctor_master_id ?? -1;
+}
+
 // ── Dashboard mirrors COO dashboard (read-only, no unit-type restriction) ─────
 
 router.get("/live-wards", asyncH(async (_req, res) => {
@@ -81,7 +90,7 @@ router.get("/overstay", asyncH(async (_req, res) => {
 // ── My Wards: wards where this consultant has active patients ────────────────
 
 router.get("/my-wards", asyncH(async (req, res) => {
-  const consultantName = req.user!.name;
+  const dmi = myDoctorMasterId(req);
 
   const rows = await db.prepare(
     `SELECT
@@ -90,11 +99,14 @@ router.get("/my-wards", asyncH(async (req, res) => {
      FROM wards w
      JOIN bed_details bd ON bd.ward_id = w.id
      JOIN patient_admissions pa ON pa.bed_id = bd.id AND pa.status = 'ACTIVE'
-     WHERE pa.consultant_name = $1
+     WHERE ((pa.owner_type='DOCTOR' AND pa.doctor_id = $1)
+         OR (pa.owner_type='GROUP' AND EXISTS (
+               SELECT 1 FROM consultant_group_members m
+               WHERE m.group_id = pa.consultant_group_id AND m.doctor_id = $1)))
        AND w.operational = true
      GROUP BY w.id, w.name, w.unit_type, w.bed_type, w.total_beds
      ORDER BY w.name`
-  ).all<Record<string, unknown>>(consultantName);
+  ).all<Record<string, unknown>>(dmi);
 
   res.json({ wards: rows });
 }));
@@ -102,7 +114,7 @@ router.get("/my-wards", asyncH(async (req, res) => {
 // ── Beds for a ward: only the consultant's active patient beds ───────────────
 
 router.get("/beds/:wardId", asyncH(async (req, res) => {
-  const consultantName = req.user!.name;
+  const dmi = myDoctorMasterId(req);
   const wardId = Number(req.params.wardId);
 
   const rows = await db.prepare(
@@ -111,17 +123,20 @@ router.get("/beds/:wardId", asyncH(async (req, res) => {
        bd.bed_type, bd.operational_status, bd.payer_type, bd.destination, bd.reservation_note,
        bd.updated_at, row_to_json(dt.*) AS discharge_tracking,
        pa.ip_last6, pa.admission_type, pa.consultant_name, pa.department_name,
-       pa.doctor_id, pa.department_id
+       pa.doctor_id, pa.department_id, pa.owner_type, pa.consultant_group_id
      FROM bed_details bd
      JOIN patient_admissions pa ON pa.bed_id = bd.id AND pa.status = 'ACTIVE'
      LEFT JOIN discharge_tracking dt ON dt.admission_id = pa.id
      WHERE bd.ward_id = $1
-       AND pa.consultant_name = $2
+       AND ((pa.owner_type='DOCTOR' AND pa.doctor_id = $2)
+         OR (pa.owner_type='GROUP' AND EXISTS (
+               SELECT 1 FROM consultant_group_members m
+               WHERE m.group_id = pa.consultant_group_id AND m.doctor_id = $2)))
      ORDER BY
        substring(bd.bed_name from '^[^0-9]*') ASC,
        NULLIF(substring(bd.bed_name from '[0-9]+'), '')::bigint NULLS LAST,
        bd.bed_name ASC`
-  ).all<Record<string, unknown>>(wardId, consultantName);
+  ).all<Record<string, unknown>>(wardId, dmi);
 
   res.json({ beds: rows });
 }));
@@ -129,7 +144,7 @@ router.get("/beds/:wardId", asyncH(async (req, res) => {
 // ── My Patients: active beds where this consultant is attached ────────────────
 
 router.get("/my-patients", asyncH(async (req, res) => {
-  const consultantName = req.user!.name;
+  const dmi = myDoctorMasterId(req);
 
   const rows = await db.prepare(
     `SELECT
@@ -143,8 +158,11 @@ router.get("/my-patients", asyncH(async (req, res) => {
        bd.reservation_note,
        bd.operational_status,
        bd.updated_at,
+       pa.id          AS admission_id,
        pa.consultant_name,
        pa.department_name,
+       pa.owner_type,
+       pa.consultant_group_id,
        pa.ip_last6,
        pa.admission_type,
        bd.payer_type,
@@ -154,13 +172,16 @@ router.get("/my-patients", asyncH(async (req, res) => {
      JOIN wards w ON w.id = bd.ward_id
      JOIN patient_admissions pa ON pa.bed_id = bd.id AND pa.status = 'ACTIVE'
      LEFT JOIN discharge_tracking dt ON dt.admission_id = pa.id
-     WHERE pa.consultant_name = $1
+     WHERE ((pa.owner_type='DOCTOR' AND pa.doctor_id = $1)
+         OR (pa.owner_type='GROUP' AND EXISTS (
+               SELECT 1 FROM consultant_group_members m
+               WHERE m.group_id = pa.consultant_group_id AND m.doctor_id = $1)))
        AND w.operational = true
      ORDER BY w.name,
        substring(bd.bed_name from '^[^0-9]*') ASC,
        NULLIF(substring(bd.bed_name from '[0-9]+'), '')::bigint NULLS LAST,
        bd.bed_name ASC`
-  ).all<Record<string, unknown>>(consultantName);
+  ).all<Record<string, unknown>>(dmi);
 
   res.json({ patients: rows });
 }));
@@ -168,7 +189,7 @@ router.get("/my-patients", asyncH(async (req, res) => {
 // ── My Discharges: completed discharges for this consultant ──────────────────
 
 router.get("/my-discharges", asyncH(async (req, res) => {
-  const consultantName = req.user!.name;
+  const dmi = myDoctorMasterId(req);
   const from  = typeof req.query.from  === "string" ? Number(req.query.from)  : null;
   const to    = typeof req.query.to    === "string" ? Number(req.query.to)    : null;
   const limit = Math.min(Number(req.query.limit) || 100, 200);
@@ -191,14 +212,17 @@ router.get("/my-discharges", asyncH(async (req, res) => {
      JOIN bed_details bd ON bd.id = pa.bed_id
      JOIN wards w ON w.id = bd.ward_id
      LEFT JOIN discharge_tracking dt ON dt.admission_id = pa.id
-     WHERE pa.consultant_name = $1
+     WHERE ((pa.owner_type='DOCTOR' AND pa.doctor_id = $1)
+         OR (pa.owner_type='GROUP' AND EXISTS (
+               SELECT 1 FROM consultant_group_members m
+               WHERE m.group_id = pa.consultant_group_id AND m.doctor_id = $1)))
        AND pa.status = 'DISCHARGED'
        ${from ? "AND pa.updated_at >= $2" : ""}
        ${to   ? `AND pa.updated_at <= ${from ? "$3" : "$2"}` : ""}
      ORDER BY pa.updated_at DESC
      LIMIT ${limit}`
   ).all<Record<string, unknown>>(
-    ...[consultantName, ...(from ? [from] : []), ...(to ? [to] : [])]
+    ...[dmi, ...(from ? [from] : []), ...(to ? [to] : [])]
   );
 
   res.json({ discharges: rows });

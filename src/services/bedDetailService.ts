@@ -138,13 +138,24 @@ export interface BedDetail {
    *  discharge module's progress badge. bed_details itself carries none of this; it stays the
    *  source of truth for physical occupancy exactly as before. */
   discharge_tracking: unknown | null;
-  /** Active admission fields — read-only enrichment, same source as discharge_tracking above. */
+  /** Active admission fields — read-only enrichment, same source as discharge_tracking above.
+   *  admission_id is included directly (not just nested in discharge_tracking) since an
+   *  admission can now exist with no discharge_tracking row at all (e.g. a lounge move with
+   *  no discharge planned/initiated yet) — callers like Readmit/Discharge Immediate need it
+   *  regardless of whether a discharge has started. */
+  admission_id: number | null;
   ip_last6: string | null;
   admission_type: string | null;
   consultant_name: string | null;
   department_name: string | null;
   doctor_id: number | null;
   department_id: number | null;
+  owner_type: "DOCTOR" | "GROUP" | null;
+  consultant_group_id: number | null;
+  /** Only set for a bed in the Discharge Lounge — the real ward/bed the patient
+   *  physically left before landing here. Null for every ordinary bed. */
+  origin_ward_name: string | null;
+  origin_bed_name: string | null;
 }
 
 export async function listBeds(
@@ -156,11 +167,21 @@ export async function listBeds(
   let sql = `SELECT bd.id, bd.ward_id, bd.bed_name, bd.physical_status, bd.reservation_status,
                     bd.bed_type, bd.operational_status, bd.ac_status, bd.payer_type, bd.destination, bd.reservation_note,
                     bd.updated_at, bd.updated_by, row_to_json(dt.*) AS discharge_tracking,
-                    pa.ip_last6, pa.admission_type, pa.consultant_name, pa.department_name,
-                    pa.doctor_id, pa.department_id
+                    pa.id AS admission_id, pa.ip_last6, pa.admission_type, pa.consultant_name, pa.department_name,
+                    pa.doctor_id, pa.department_id, pa.owner_type, pa.consultant_group_id,
+                    w_from.name AS origin_ward_name, bd_from.bed_name AS origin_bed_name
              FROM bed_details bd
+             JOIN wards w ON w.id = bd.ward_id
              LEFT JOIN patient_admissions pa ON pa.bed_id = bd.id AND pa.status = 'ACTIVE'
              LEFT JOIN discharge_tracking dt ON dt.admission_id = pa.id
+             -- Origin ward/bed — lounge beds only, short-circuited for every
+             -- ordinary ward by the ON condition (costs nothing outside the lounge).
+             LEFT JOIN LATERAL (
+               SELECT bth.from_bed_id, bth.from_ward_id FROM bed_transfer_history bth
+               WHERE bth.admission_id = pa.id ORDER BY bth.transferred_at DESC LIMIT 1
+             ) lt ON w.is_discharge_lounge AND pa.id IS NOT NULL
+             LEFT JOIN bed_details bd_from ON bd_from.id = lt.from_bed_id
+             LEFT JOIN wards w_from ON w_from.id = lt.from_ward_id
              WHERE bd.ward_id=?`;
   const params: unknown[] = [wardId];
   if (operationalOnly) sql += " AND bd.operational_status = true";
@@ -303,10 +324,12 @@ export async function updateBedStatus(opts: {
   admissionType?: string;
   /** Optional free-text captured alongside ipLast6 on a fresh admission — same
    *  "V1 manual entry, HIS integration later" pattern. */
-  consultantName?: string | null;
   departmentName?: string | null;
+  /** Exactly one of doctorId/consultantGroupId is required on a fresh admission —
+   *  an admission is owned by either one consultant or a Consultant Group, never both. */
   doctorId?: number | null;
   departmentId?: number | null;
+  consultantGroupId?: number | null;
   /** MANUAL (default) triggers discharge-module side effects (new admission on fresh
    *  occupancy, auto-reset of an in-progress discharge on an unexpected vacate).
    *  TRANSFER / DISCHARGE_CHECKOUT are used by bedTransferService / dischargeService
@@ -478,8 +501,8 @@ export async function updateBedStatus(opts: {
       bedId: opts.bedId, wardId: bed.ward_id,
       oldPhysical: bed.physical_status, newPhysical: opts.physicalStatus,
       ipLast6: opts.ipLast6, admissionType: opts.admissionType,
-      consultantName: opts.consultantName, departmentName: opts.departmentName,
-      doctorId: opts.doctorId, departmentId: opts.departmentId,
+      departmentName: opts.departmentName,
+      doctorId: opts.doctorId, departmentId: opts.departmentId, consultantGroupId: opts.consultantGroupId,
       changeReason, userId: opts.userId,
     });
   });
@@ -500,8 +523,8 @@ export async function updateBedStatus(opts: {
 // driven by bedTransferService/dischargeService, which already manage the admission on their own.
 async function handleDischargeSideEffects(opts: {
   bedId: number; wardId: number; oldPhysical: string; newPhysical: string;
-  ipLast6?: string; admissionType?: string; consultantName?: string | null; departmentName?: string | null;
-  doctorId?: number | null; departmentId?: number | null;
+  ipLast6?: string; admissionType?: string; departmentName?: string | null;
+  doctorId?: number | null; departmentId?: number | null; consultantGroupId?: number | null;
   changeReason: "MANUAL" | "TRANSFER" | "DISCHARGE_CHECKOUT"; userId: number;
 }) {
   if (opts.changeReason !== "MANUAL") return;
@@ -514,8 +537,8 @@ async function handleDischargeSideEffects(opts: {
     // ip_last6 / admission_type were already validated above, before the transaction committed.
     await createAdmission({
       bedId: opts.bedId, wardId: opts.wardId, ipLast6: opts.ipLast6!.trim(), admissionType: opts.admissionType!, userId: opts.userId,
-      consultantName: opts.consultantName, departmentName: opts.departmentName,
-      doctorId: opts.doctorId, departmentId: opts.departmentId,
+      departmentName: opts.departmentName,
+      doctorId: opts.doctorId, departmentId: opts.departmentId, consultantGroupId: opts.consultantGroupId,
     });
     return;
   }

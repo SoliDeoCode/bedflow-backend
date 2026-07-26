@@ -14,7 +14,7 @@ const ROLE_LABEL: Record<string, string> = {
   PRE: "PRE", NURSE: "Nurse", COO: "Admin", DOCTOR: "Doctor", FC: "FC", CONSULTANT: "Consultant",
 };
 
-async function guardUniqueUsername(username: string) {
+export async function guardUniqueUsername(username: string) {
   const existing = await db.prepare("SELECT role FROM users WHERE username=?")
     .get<{ role: string }>(username);
   if (existing) {

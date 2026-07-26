@@ -18,6 +18,10 @@ export interface User {
   remarks: string | null;
   created_at: number;
   updated_at: number;
+  /** Set only for CONSULTANT-role users — links their login to their doctors_master
+   *  identity so ownership (individual or via a Consultant Group) can be resolved
+   *  by a real FK instead of matching on name. */
+  doctor_master_id: number | null;
 }
 
 export interface BuildingBlockRow {
@@ -54,6 +58,9 @@ export interface JwtPayload {
   nursing_station?: string | null;
   /** Nursing station FK id — set for NURSE role only */
   station_id?: number | null;
+  /** doctors_master FK — set for CONSULTANT role only. Powers ownership resolution
+   *  (individual or Consultant Group) without ever matching on name. */
+  doctor_master_id?: number | null;
 }
 
 export interface WardRow {
