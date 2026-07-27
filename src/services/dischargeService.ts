@@ -529,33 +529,69 @@ async function markPhysicallyLeft(admissionId: number): Promise<void> {
   ).run(Date.now(), admissionId);
 }
 
-/** Called from bedTransferService.transferBed when the destination is the Discharge
- *  Lounge and a discharge has already been initiated for this admission — the transfer
- *  itself is the declaration that the patient has physically left, so Physical Checkout
- *  is marked complete as a side effect. Touches only physical_checkout_status/patient_left
- *  — no other checklist step. (For "no discharge started yet," markPhysicallyLeft alone
- *  is enough — planDischarge/dischargeImmediate read it back when tracking is created.) */
-export async function markPhysicalCheckoutFromTransfer(admissionId: number, userId: number): Promise<void> {
+const AUTO_LOUNGE_REASON = "Auto-completed via Discharge Lounge transfer";
+
+/** Called from bedTransferService.transferBed whenever the destination is the
+ *  Discharge Lounge — regardless of who transferred the bed (PRE/Nurse/FC) and
+ *  regardless of whether a discharge had already been planned/initiated on the
+ *  physical bed. The transfer itself is now treated as "this patient is
+ *  administratively ready to leave": every step through Payment is force-
+ *  completed (auto-initiating the discharge first if none existed yet), and
+ *  Physical Checkout completes too (the transfer IS the patient physically
+ *  leaving). Only System Checkout is left for staff to actually verify before
+ *  the bed can vacate. Each forced step is logged with a distinct reason so
+ *  it's never confused with a real manual completion. Mirrors dischargeImmediate's
+ *  "create tracking row if missing, force-complete a list of steps" shape,
+ *  just excluding SYSTEM_CHECKOUT from the forced list and not vacating/closing. */
+export async function autoCompleteDischargeForLoungeTransfer(admissionId: number, userId: number): Promise<void> {
   await markPhysicallyLeft(admissionId);
-  const tracking = await getTrackingByAdmission(admissionId);
-  if (!tracking || ["COMPLETED", "CANCELLED"].includes(tracking.status)) return;
-  if (tracking.physical_checkout_status === "COMPLETED") return;
+
+  let tracking = await getTrackingByAdmission(admissionId);
+  if (tracking?.status === "COMPLETED") return; // already fully discharged — nothing to do
+
+  // Same convention as planDischarge: a CANCELLED tracking row doesn't block
+  // (or get reused by) a new discharge — a fresh row is started, same as if
+  // there had been no discharge at all.
+  const needsFreshRow = !tracking || tracking.status === "CANCELLED";
 
   const now = Date.now();
-  const r = await db.prepare(
-    `UPDATE discharge_tracking SET physical_checkout_status='COMPLETED', patient_left=true,
-       physical_checkout_started_at=COALESCE(physical_checkout_started_at, ?),
-       physical_checkout_completed_at=?, updated_at=? WHERE id=? AND updated_at=?`
-  ).run(now, now, now, tracking.id, tracking.updated_at);
-  if (r.changes === 0) throw new HttpError(409, "This discharge was just updated by someone else. Please refresh and try again.");
+  const nowIst = new Date(now + 5.5 * 60 * 60 * 1000).toISOString().slice(0, 10);
 
-  await logHistory({
-    admissionId, trackingId: tracking.id, field: "PHYSICAL_CHECKOUT",
-    oldValue: tracking.physical_checkout_status, newValue: "COMPLETED", userId,
-    reason: "Marked via Bed Transfer to Discharge Lounge",
+  await db.transaction(async () => {
+    if (needsFreshRow) {
+      const row = await db.prepare(
+        `INSERT INTO discharge_tracking (admission_id, status, planned_date, planned_by, created_by, created_at, updated_at, initiated_at)
+         VALUES (?, 'DISCHARGE_INITIATED', ?, ?, ?, ?, ?, ?) RETURNING id`
+      ).run(admissionId, nowIst, userId, userId, now, now, now);
+      tracking = (await getTrackingById(Number(row.lastInsertRowid)))!;
+      await logHistory({
+        admissionId, trackingId: tracking.id, field: "status",
+        oldValue: null, newValue: "DISCHARGE_INITIATED", userId, reason: AUTO_LOUNGE_REASON,
+      });
+    }
+
+    const forceSteps = (Object.keys(STEP_COLUMN) as StepKey[]).filter((s) => s !== "SYSTEM_CHECKOUT" && s !== "PHYSICAL_CHECKOUT");
+    const setSql = forceSteps.map((s) => `${STEP_COLUMN[s]}='COMPLETED'`).join(", ");
+    const r = await db.prepare(
+      `UPDATE discharge_tracking SET status='IN_PROGRESS', physical_checkout_status='COMPLETED', patient_left=true,
+         physical_checkout_started_at=COALESCE(physical_checkout_started_at, ?), physical_checkout_completed_at=?,
+         ${setSql}, updated_at=? WHERE id=? AND updated_at=?`
+    ).run(now, now, now, tracking!.id, tracking!.updated_at);
+    if (r.changes === 0) throw new HttpError(409, "This discharge was just updated by someone else. Please refresh and try again.");
+
+    for (const s of [...forceSteps, "PHYSICAL_CHECKOUT" as StepKey]) {
+      const col = STEP_COLUMN[s];
+      const oldValue = (tracking as unknown as Record<string, string>)[col];
+      if (oldValue !== "COMPLETED") {
+        await logHistory({
+          admissionId, trackingId: tracking!.id, field: s,
+          oldValue, newValue: "COMPLETED", userId, reason: AUTO_LOUNGE_REASON,
+        });
+      }
+    }
   });
 
-  const updated = (await getTrackingById(tracking.id))!;
+  const updated = (await getTrackingById(tracking!.id))!;
   await completeIfEligible(updated, userId);
 }
 

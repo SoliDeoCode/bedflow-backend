@@ -13,16 +13,42 @@ const PHASE_COLUMNS = ALL_STEPS
   .map(c => `dt.${c}`)
   .join(",\n      ");
 
+// Grace window after full discharge (both checkouts complete) during which the
+// portal can still show the "You're All Set!" goodbye card. Without this, the
+// same event that completes both checkouts also closes the admission
+// (completeIfEligible in dischargeService.ts, same request) — so the very
+// next status fetch (the socket-triggered "discharge:refresh" fires right
+// after) would find pa.status='DISCHARGED' and, under the old ACTIVE-only
+// filter, return found:false — logging the patient out before they ever saw
+// the goodbye message. Matching on a recently-DISCHARGED admission too closes
+// that race, and naturally expires access after a day either way.
+const DISCHARGED_GRACE_MS = 24 * 60 * 60 * 1000;
+
 router.get("/status", asyncH(async (req, res) => {
   const ip = (req.query.ip as string | undefined)?.trim();
   if (!ip || !/^\d{6}$/.test(ip))
     return res.json({ found: false, reason: "Enter your 6-digit patient number." });
 
+  const dischargedSinceMs = Date.now() - DISCHARGED_GRACE_MS;
+
+  // A patient number can have more than one patient_admissions row (a past,
+  // already-DISCHARGED visit plus a new current one) — pick the single most
+  // recent admission FIRST, then decide whether to show/block/grace-window
+  // it. Filtering row-by-row in the WHERE clause (the old approach) let a
+  // blocked *current* admission (e.g. in the Discharge Lounge) silently fall
+  // through to an older, unrelated DISCHARGED admission that happened to
+  // still satisfy the grace window — leaking that old visit's bed/ward info
+  // instead of correctly blocking. Never fall back across admissions.
   const row = await db.prepare(`
+    WITH latest_admission AS (
+      SELECT id FROM patient_admissions WHERE ip_last6 = ? ORDER BY admitted_at DESC LIMIT 1
+    )
     SELECT
       pa.id AS admission_id,
       pa.ip_last6,
       pa.admitted_at,
+      pa.status                        AS admission_status,
+      pa.discharged_at,
       bd.bed_name,
       w.name AS ward_name,
       dt.id                            AS tracking_id,
@@ -33,16 +59,41 @@ router.get("/status", asyncH(async (req, res) => {
       dt.system_checkout_status,
       dt.physical_checkout_status,
       ${PHASE_COLUMNS}
-    FROM patient_admissions pa
+    FROM latest_admission la
+    JOIN patient_admissions pa ON pa.id = la.id
     JOIN bed_details bd ON bd.id = pa.bed_id
     JOIN wards w ON w.id = pa.ward_id
     LEFT JOIN discharge_tracking dt ON dt.admission_id = pa.id
-    WHERE pa.ip_last6 = ? AND pa.status = 'ACTIVE'
-    ORDER BY pa.admitted_at DESC
-    LIMIT 1
   `).get<Record<string, unknown>>(ip);
 
   if (!row) return res.json({ found: false, reason: "No active admission found for this patient number." });
+
+  const scStatus = row.system_checkout_status as string | null;
+  const pcStatus = row.physical_checkout_status as string | null;
+  const admissionStatus = row.admission_status as string;
+  const inLounge = pcStatus === "COMPLETED" && scStatus !== "COMPLETED";
+  const fullyComplete = scStatus === "COMPLETED" && pcStatus === "COMPLETED";
+
+  if (admissionStatus === "ACTIVE" && inLounge) {
+    // code lets the frontend show this in the patient's selected language
+    // (i18n.js's loungeBlockedNotice) — reason is the English fallback for
+    // any client that doesn't know about the code.
+    return res.json({
+      found: false, code: "LOUNGE_BLOCKED",
+      reason: "This page is temporarily paused while your care team finishes up. It'll be back shortly.",
+    });
+  }
+  if (admissionStatus === "DISCHARGED") {
+    // Only a genuine two-checkout completion earns the goodbye-card grace
+    // window — an admission closed some other way (e.g. cancelled/manually
+    // vacated) has nothing to show and must not resurrect old bed/ward info.
+    const dischargedAt = Number(row.discharged_at ?? 0);
+    if (!fullyComplete || !dischargedAt || dischargedAt < dischargedSinceMs) {
+      return res.json({ found: false, reason: "No active admission found for this patient number." });
+    }
+  } else if (admissionStatus !== "ACTIVE") {
+    return res.json({ found: false, reason: "No active admission found for this patient number." });
+  }
 
   const config = await listPhaseConfig();
   const wf = computeWorkflow({ ...row, status: row.discharge_status } as never, config);

@@ -362,11 +362,18 @@ router.get("/hospital/snapshots", asyncH(async (_req, res) => {
 }));
 
 // ── Overstay alerts scoped to this nurse's stations ──────────────────────────
+// Overstay = System Checkout done, Physical Checkout not done, and at least
+// 1 hour since System Checkout completed — same definition as coo.ts's
+// hospital-wide version, just station-scoped. See that route for the full
+// rationale (this used to be "planned_date overdue," a different, narrower
+// thing that also missed Discharge Lounge admissions entirely since the
+// Lounge has no station_id — moot now, since a Lounge admission always has
+// Physical Checkout already completed by the time it's there, so it can
+// never match this definition's physical_checkout_status <> 'COMPLETED' gate).
 router.get("/overstay", asyncH(async (req, res) => {
-  const stations    = await getMyStations(req);
-  const stationIds  = stations.map(s => s.id);
-  const IST         = 5.5 * 3600 * 1000;
-  const todayIST    = new Date(Date.now() + IST).toISOString().slice(0, 10);
+  const stations     = await getMyStations(req);
+  const stationIds   = stations.map(s => s.id);
+  const oneHourAgoMs = Date.now() - 60 * 60 * 1000;
 
   const rows = await db.prepare(`
     SELECT
@@ -378,7 +385,8 @@ router.get("/overstay", asyncH(async (req, res) => {
       bd.bed_name                                                    AS bed,
       dt.planned_date,
       dt.status                                                      AS discharge_status,
-      (CURRENT_DATE - dt.planned_date::date)                        AS days_overdue
+      dt.system_checkout_completed_at,
+      GREATEST(0, CURRENT_DATE - to_timestamp(dt.system_checkout_completed_at / 1000.0)::date) AS days_overdue
     FROM patient_admissions pa
     JOIN discharge_tracking dt ON dt.admission_id = pa.id
     JOIN wards w ON w.id = pa.ward_id
@@ -386,14 +394,17 @@ router.get("/overstay", asyncH(async (req, res) => {
     LEFT JOIN doctors_master dm ON dm.id = pa.doctor_id
     WHERE pa.status = 'ACTIVE'
       AND w.station_id = ANY(?)
-      AND dt.status NOT IN ('COMPLETED', 'CANCELLED')
-      AND dt.planned_date < ?
-    ORDER BY days_overdue DESC, pa.admitted_at ASC
+      AND dt.status IN ('DISCHARGE_INITIATED', 'IN_PROGRESS')
+      AND dt.system_checkout_status = 'COMPLETED'
+      AND dt.physical_checkout_status <> 'COMPLETED'
+      AND dt.system_checkout_completed_at <= ?
+    ORDER BY dt.system_checkout_completed_at ASC
   `).all<{
     admission_id: number; ip_last6: string; admitted_at: number;
     doctor: string; ward: string; bed: string;
-    planned_date: string; discharge_status: string; days_overdue: number;
-  }>(stationIds, todayIST);
+    planned_date: string; discharge_status: string;
+    system_checkout_completed_at: number; days_overdue: number;
+  }>(stationIds, oneHourAgoMs);
 
   const total = rows.length;
   const tier1 = rows.filter(r => Number(r.days_overdue) === 1).length;
