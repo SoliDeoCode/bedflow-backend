@@ -3,7 +3,7 @@ import { HttpError } from "../middleware/error.js";
 import { audit } from "./auditService.js";
 import { listBeds, updateBedStatus } from "./bedDetailService.js";
 import { getActiveAdmissionByBed, moveAdmission } from "./patientAdmissionService.js";
-import { getTrackingByAdmission, markPhysicalCheckoutFromTransfer, resetPhysicalCheckoutOnReadmit } from "./dischargeService.js";
+import { getTrackingByAdmission, autoCompleteDischargeForLoungeTransfer, resetPhysicalCheckoutOnReadmit } from "./dischargeService.js";
 
 /** Beds a patient can be transferred into: operational, Vacant, not reserved.
  *  Mirrors bedDetailService.listBeds — reused rather than re-implemented. */
@@ -37,12 +37,12 @@ async function getBedForTransfer(bedId: number): Promise<BedRow> {
  *  admission's link to a bed entirely.
  *
  *  The Discharge Lounge is a valid manual destination too — moving a bed there is
- *  itself the declaration that the patient has physically left. If a discharge has
- *  already been initiated for this admission, Physical Checkout gets marked complete
- *  as a side effect (see markPhysicalCheckoutFromTransfer below); if no discharge has
- *  started yet, physically_left_at is stamped so a later plan/initiate/Discharge
- *  Immediate picks it up automatically. allowDischargeLounge is kept for
- *  moveToDischargeLounge's own call below but is otherwise a no-op now. */
+ *  itself the declaration that the patient is administratively ready to leave.
+ *  Regardless of whether a discharge had already been started, every step
+ *  through Payment gets auto-completed and Physical Checkout completes too,
+ *  leaving only System Checkout pending (see autoCompleteDischargeForLoungeTransfer
+ *  below). allowDischargeLounge is kept for moveToDischargeLounge's own call
+ *  below but is otherwise a no-op now. */
 export async function transferBed(opts: {
   fromBedId: number; toWardId: number; toBedId: number; reason: string; userId: number;
   allowDischargeLounge?: boolean;
@@ -94,7 +94,7 @@ export async function transferBed(opts: {
   });
 
   if (toBed.ward_is_discharge_lounge) {
-    await markPhysicalCheckoutFromTransfer(admission.id, opts.userId);
+    await autoCompleteDischargeForLoungeTransfer(admission.id, opts.userId);
   } else if (fromBed.ward_is_discharge_lounge) {
     await resetPhysicalCheckoutOnReadmit(admission.id, opts.userId);
   }
@@ -137,13 +137,32 @@ export async function moveToDischargeLounge(opts: { admissionId: number; fromBed
 
 /** Moves a patient out of the Discharge Lounge back onto a real bed — the reverse of
  *  a normal transfer, logged distinctly (is_readmit) so it's identifiable in history
- *  separately from an ordinary bed-to-bed transfer. */
+ *  separately from an ordinary bed-to-bed transfer.
+ *
+ *  Blocked while a discharge is still running (DISCHARGE_INITIATED/IN_PROGRESS) —
+ *  since the lounge transfer now auto-completes every step through Payment,
+ *  readmitting underneath that would leave Billing/Payment/etc. marked COMPLETED
+ *  for a patient who isn't actually being discharged. The caller must cancel the
+ *  discharge first (existing cancelAfterInitiation flow, which already resets
+ *  every step back to PENDING); only then can Readmit proceed. Each cancel is
+ *  its own permanent history entry, and a later re-discharge starts a fresh
+ *  tracking row (same convention as planDischarge), so a full
+ *  cancel → readmit → re-discharge → cancel → readmit cycle stays fully visible
+ *  in history, nothing overwritten. */
 export async function readmitFromLounge(opts: {
   fromBedId: number; toWardId: number; toBedId: number; reason: string; userId: number;
 }) {
   const fromBed = await getBedForTransfer(opts.fromBedId);
   if (!fromBed.ward_is_discharge_lounge)
     throw new HttpError(409, "Readmit is only valid from a Discharge Lounge bed");
+
+  const admission = await getActiveAdmissionByBed(opts.fromBedId);
+  if (!admission) throw new HttpError(404, "No active patient admission on this bed");
+
+  const tracking = await getTrackingByAdmission(admission.id);
+  if (tracking && ["DISCHARGE_INITIATED", "IN_PROGRESS"].includes(tracking.status)) {
+    throw new HttpError(409, "This discharge is still in progress — cancel the discharge process before readmitting this patient.");
+  }
 
   const result = await transferBed({
     fromBedId: opts.fromBedId, toWardId: opts.toWardId, toBedId: opts.toBedId, reason: opts.reason, userId: opts.userId,
