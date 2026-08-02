@@ -979,6 +979,12 @@ export async function snapshotAdminDashboard() {
   }
 }
 
+/** Active patients per consultant, broken down by payer type and department.
+ *  Discharge Lounge is excluded: an admission stays ACTIVE after the lounge move
+ *  (only System Checkout is left pending — see autoCompleteDischargeForLoungeTransfer),
+ *  but the patient has physically left, so counting them against their consultant
+ *  overstates the caseload and disagrees with every other hospital-wide figure on
+ *  the dashboard, all of which already skip the lounge. */
 export async function consultantsLive() {
   const rows = await db.prepare(`
     SELECT
@@ -988,8 +994,10 @@ export async function consultantsLive() {
       COUNT(*)::int AS n
     FROM patient_admissions pa
     JOIN bed_details bd ON bd.id = pa.bed_id
+    JOIN wards w ON w.id = bd.ward_id
     LEFT JOIN doctors_master dm ON dm.id = pa.doctor_id
     WHERE pa.status = 'ACTIVE'
+      AND NOT w.is_discharge_lounge
       AND (pa.doctor_id IS NOT NULL OR pa.consultant_name IS NOT NULL)
     GROUP BY COALESCE(dm.name, pa.consultant_name, 'Unknown'), bd.payer_type, pa.department_name
     ORDER BY name, payer_type
