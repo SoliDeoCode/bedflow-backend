@@ -1,6 +1,8 @@
 import { Router } from "express";
+import { z } from "zod";
 import { asyncH } from "../middleware/error.js";
 import { db } from "../db/index.js";
+import { createComplaint, complaintsForPatient, listCategories } from "../services/complaintService.js";
 import {
   listPhaseConfig, computeWorkflow, ALL_STEPS, STEP_GROUP,
   statusCol, startedCol, completedCol,
@@ -140,6 +142,54 @@ router.get("/status", asyncH(async (req, res) => {
   };
 
   res.json({ found: true, data: row, workflow });
+}));
+
+/* ── Contact Support (complaints) ──────────────────────────────────────────
+   These are UNAUTHENTICATED, exactly like /status above — the portal knows a
+   patient only by their 6-digit IP number. That shapes what's allowed here:
+
+     • create + read-own only. No edit, no delete, no close, no priority, no
+       reassignment — every one of those is PWO-only and lives in routes/pwo.ts.
+     • only ACTIVE admissions can file (enforced in createComplaint), so portal
+       access ends at discharge while the complaints themselves live on in the
+       PWO system forever.
+     • the read path returns only notes a PWO explicitly shared, and never the
+       owning officer's identity.
+
+   Abuse control is the 5-minute-per-admission cooldown in the service plus the
+   shared /api rate limiter — a stricter identity check isn't possible today
+   because BedFlow stores no patient name to verify against.                  */
+
+router.get("/complaints", asyncH(async (req, res) => {
+  const ip = (req.query.ip as string | undefined)?.trim();
+  if (!ip || !/^\d{6}$/.test(ip))
+    return res.json({ found: false, complaints: [] });
+  res.json({ found: true, complaints: await complaintsForPatient(ip) });
+}));
+
+router.get("/complaint-categories", asyncH(async (_req, res) => {
+  res.json({ categories: await listCategories() });
+}));
+
+router.post("/complaints", asyncH(async (req, res) => {
+  const { ip, category, description } = z.object({
+    ip:          z.string().regex(/^\d{6}$/, "Enter your 6-digit patient number."),
+    category:    z.string().min(1).max(40),
+    description: z.string().min(1).max(4000),
+  }).parse(req.body);
+
+  const complaint = await createComplaint({ ipLast6: ip, categoryCode: category, description });
+  // Mirror what the patient may see — never the owning officer.
+  res.status(201).json({
+    complaint: {
+      id: complaint.id,
+      complaintCode: complaint.complaintCode,
+      status: complaint.status,
+      category: complaint.category,
+      description: complaint.description,
+      createdAt: complaint.createdAt,
+    },
+  });
 }));
 
 export default router;

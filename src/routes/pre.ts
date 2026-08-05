@@ -40,6 +40,11 @@ async function myPreBlocks(req: { user?: { id: number } }) {
 // This is a read-only widening. Every *write* path and the ward/bed entry
 // screens below still resolve wards through myPreBlocks(), so a PRE user can
 // see the whole hospital here but can still only act on their own blocks.
+//
+// One deliberate exception: the Discharge Lounge occupancy summary
+// (totalPatients / lounge) is Admin(COO)-only, so /admin-dashboard passes
+// includeLoungeSummary=false here — see adminDashboard()'s doc comment in
+// bedService.ts. Everything else about this endpoint still mirrors COO.
 
 router.get("/live-wards", asyncH(async (_req, res) => {
   res.json(await allWardsLive());
@@ -51,7 +56,7 @@ router.get("/bed-details", asyncH(async (_req, res) => {
 
 router.get("/admin-dashboard", asyncH(async (req, res) => {
   const unit = typeof req.query.unit === "string" ? req.query.unit : null;
-  res.json(await adminDashboard(unit));
+  res.json(await adminDashboard(unit, null, false));
 }));
 
 router.get("/admin-dashboard-history", asyncH(async (req, res) => {

@@ -270,7 +270,9 @@ router.get("/bed-details", asyncH(async (req, res) => {
 
 router.get("/admin-dashboard", asyncH(async (req, res) => {
   const unit = typeof req.query.unit === "string" ? req.query.unit : null;
-  res.json(await adminDashboard(unit, await myWardIds(req)));
+  // includeLoungeSummary=false — Nurse is not Admin/COO; see adminDashboard()'s
+  // doc comment in bedService.ts.
+  res.json(await adminDashboard(unit, await myWardIds(req), false));
 }));
 
 router.get("/payer-types", asyncH(async (_req, res) => {
@@ -341,7 +343,9 @@ router.get("/hospital/bed-details", asyncH(async (_req, res) => {
 
 router.get("/hospital/admin-dashboard", asyncH(async (req, res) => {
   const unit = typeof req.query.unit === "string" ? req.query.unit : null;
-  res.json(await adminDashboard(unit));
+  // includeLoungeSummary=false — Nurse is not Admin/COO, even in this
+  // hospital-wide view; see adminDashboard()'s doc comment in bedService.ts.
+  res.json(await adminDashboard(unit, null, false));
 }));
 
 router.get("/hospital/admin-dashboard-history", asyncH(async (req, res) => {
