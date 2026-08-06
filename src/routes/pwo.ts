@@ -50,7 +50,12 @@ router.get("/complaints", asyncH(async (req, res) => {
   const q = req.query as Record<string, string | undefined>;
   const int = (v: string | undefined) => (v && /^\d+$/.test(v) ? Number(v) : undefined);
 
-  const status = q.status && (COMPLAINT_STATUSES as readonly string[]).includes(q.status) ? q.status : undefined;
+  // "ACTIVE" is the queue's default group filter (OPEN + ACCEPTED +
+  // UNDER_REVIEW) — not a stored status, so it needs whitelisting alongside
+  // the real ones. See listComplaints.
+  const status = q.status
+    && (q.status === "ACTIVE" || (COMPLAINT_STATUSES as readonly string[]).includes(q.status))
+    ? q.status : undefined;
 
   res.json(await listComplaints({
     status,

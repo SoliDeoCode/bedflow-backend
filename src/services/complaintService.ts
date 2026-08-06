@@ -456,7 +456,13 @@ export async function listComplaints(f: QueueFilters) {
   const where: string[] = [];
   const params: unknown[] = [];
 
-  if (f.status)       { where.push("c.status = ?");        params.push(f.status); }
+  // "ACTIVE" is a group, not a stored status: everything still needing work.
+  // It's the queue's default because officers work the live pile — closed and
+  // resolved complaints are history and were pushing real work down the list.
+  // Same set as PENDING_STATUSES so the queue and the dashboard counters can
+  // never drift apart.
+  if (f.status === "ACTIVE") { where.push(`c.status IN ${PENDING_STATUSES}`); }
+  else if (f.status)  { where.push("c.status = ?");        params.push(f.status); }
   if (f.categoryId)   { where.push("c.category_id = ?");   params.push(f.categoryId); }
   if (f.priorityId)   { where.push("c.priority_id = ?");   params.push(f.priorityId); }
   if (f.wardId)       { where.push("c.ward_id = ?");       params.push(f.wardId); }

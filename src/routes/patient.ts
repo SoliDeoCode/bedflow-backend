@@ -60,11 +60,16 @@ router.get("/status", asyncH(async (req, res) => {
       dt.initiated_at,
       dt.system_checkout_status,
       dt.physical_checkout_status,
+      wbed.is_discharge_lounge         AS bed_in_lounge,
       ${PHASE_COLUMNS}
     FROM latest_admission la
     JOIN patient_admissions pa ON pa.id = la.id
     JOIN bed_details bd ON bd.id = pa.bed_id
     JOIN wards w ON w.id = pa.ward_id
+    -- Resolved via the BED's ward, not pa.ward_id: the bed is where the patient
+    -- physically is. moveAdmission keeps the two in sync, so this is belt-and-
+    -- braces, but it's the column the lounge gate below turns on.
+    JOIN wards wbed ON wbed.id = bd.ward_id
     LEFT JOIN discharge_tracking dt ON dt.admission_id = pa.id
   `).get<Record<string, unknown>>(ip);
 
@@ -73,7 +78,23 @@ router.get("/status", asyncH(async (req, res) => {
   const scStatus = row.system_checkout_status as string | null;
   const pcStatus = row.physical_checkout_status as string | null;
   const admissionStatus = row.admission_status as string;
-  const inLounge = pcStatus === "COMPLETED" && scStatus !== "COMPLETED";
+  // The patient is in the lounge iff their bed sits in the ward flagged
+  // is_discharge_lounge. This used to be inferred as
+  // `pc === "COMPLETED" && sc !== "COMPLETED"`, which is a proxy for the
+  // workflow state, not for where the patient actually is — and the two come
+  // apart in both directions:
+  //   • cancelAfterInitiation → resetAndCancelTracking resets BOTH checkout
+  //     columns to PENDING without moving anyone off the lounge bed. Since
+  //     readmitFromLounge refuses to run until the discharge is cancelled,
+  //     every readmit passes through that state — the portal opened for a
+  //     patient sitting in the lounge and showed them ward_name
+  //     "Discharge Lounge".
+  //   • a bed manually flipped Vacant→Occupied on a lounge ward creates an
+  //     admission with no discharge_tracking row at all, so the LEFT JOIN
+  //     above leaves both columns NULL and the proxy reads false.
+  // Truthy rather than === true: the flag arrives as a driver-dependent
+  // boolean, matching how dischargeService reads it.
+  const inLounge = !!row.bed_in_lounge;
   const fullyComplete = scStatus === "COMPLETED" && pcStatus === "COMPLETED";
 
   if (admissionStatus === "ACTIVE" && inLounge) {
