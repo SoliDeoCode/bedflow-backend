@@ -29,7 +29,9 @@ router.get("/bed-details", asyncH(async (_req, res) => {
 
 router.get("/admin-dashboard", asyncH(async (req, res) => {
   const unit = typeof req.query.unit === "string" ? req.query.unit : null;
-  res.json(await adminDashboard(unit));
+  // includeLoungeSummary=false — Admin(COO)-only cards; see adminDashboard()'s
+  // doc comment in bedService.ts.
+  res.json(await adminDashboard(unit, null, false));
 }));
 
 router.get("/payer-types", asyncH(async (_req, res) => {

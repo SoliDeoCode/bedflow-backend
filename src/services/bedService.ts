@@ -775,7 +775,14 @@ async function loungeOriginBreakdown(wardIds: number[] | null) {
  *  already did. */
 /** restrictWardIds — see allWardsLive(). Intersects with the unitType filter
  *  when both are given (e.g. a PRE user filtering their own wards by unit). */
-export async function adminDashboard(unitType?: string | null, restrictWardIds?: number[] | null) {
+// includeLoungeSummary gates two read-only aggregate fields — occupancy.totalPatients
+// and occupancy.lounge — behind the caller's role. It does NOT touch wardIds,
+// bed_details, or any lounge-transfer/admission write path, so bed entry and
+// transferring a patient into the Discharge Lounge are unaffected for every
+// role; this only controls whether these two summary numbers are computed and
+// sent back. Admin/COO (and the scheduler's own snapshot capture, which never
+// passes this arg) always get the default `true`.
+export async function adminDashboard(unitType?: string | null, restrictWardIds?: number[] | null, includeLoungeSummary = true) {
   const scoped = !!normalizeDashboardUnitType(unitType) && normalizeDashboardUnitType(unitType) !== "TOTAL";
   let wardIds = scoped
     ? (await db.prepare("SELECT id, unit_type FROM wards WHERE operational=true").all<{ id: number; unit_type: string | null }>())
@@ -848,7 +855,9 @@ export async function adminDashboard(unitType?: string | null, restrictWardIds?:
       nonCensusBeds: Number(snapshotRow?.non_census_beds || 0),
     },
     occupancy: {
-      totalPatients: onbed + overstay + reserved + loungePatients,
+      // Omitted entirely (not just zeroed) for roles that shouldn't see it —
+      // see includeLoungeSummary above. res.json() drops undefined keys.
+      totalPatients: includeLoungeSummary ? (onbed + overstay + reserved + loungePatients) : undefined,
       // Same as totalPatients minus the Discharge Lounge — on-bed + overstay +
       // reserved beds only, both Census and Non-Census (occStates covers all
       // three; lounge is excluded by definition).
@@ -880,11 +889,12 @@ export async function adminDashboard(unitType?: string | null, restrictWardIds?:
       },
       // total intentionally matches loungePatients above — both are origin-scoped
       // now, so this always equals the sum of its own census/nonCensus split.
-      lounge: {
+      // Omitted for non-admin roles, same reasoning as totalPatients above.
+      lounge: includeLoungeSummary ? {
         total: loungeBy("Census") + loungeBy("Non-Census"),
         census: loungeBy("Census"),
         nonCensus: loungeBy("Non-Census"),
-      },
+      } : undefined,
       vacant: {
         total: sum(r => r.state === "vacant_none" || r.state === "vacant_res") - sum(r => r.bed_type === "Lounge" && (r.state === "vacant_none" || r.state === "vacant_res")),
         census: sum(r => r.bed_type === "Census" && r.state === "vacant_none"),

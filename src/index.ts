@@ -18,6 +18,7 @@ import doctorRoutes from "./routes/doctor.js";
 import dischargeRoutes from "./routes/discharge.js";
 import patientRoutes from "./routes/patient.js";
 import consultantRoutes from "./routes/consultant.js";
+import pwoRoutes from "./routes/pwo.js";
 import pharmacyRoutes from "./routes/pharmacy.js";
 import fcRoutes from "./routes/fc.js";
 
@@ -79,6 +80,7 @@ app.use("/api/coo", cooRoutes);
 app.use("/api/consultant", consultantRoutes);
 app.use("/api/pharmacy", pharmacyRoutes);
 app.use("/api/fc", fcRoutes);
+app.use("/api/pwo", pwoRoutes);
 app.use("/api/push", pushLimiter);
 app.use("/api", metaRoutes);
 

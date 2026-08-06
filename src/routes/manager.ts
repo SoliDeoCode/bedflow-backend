@@ -1058,7 +1058,12 @@ router.delete("/payer-tat/:id", asyncH(async (req, res) => {
 
 // ── FC & Pharmacy Logins ────────────────────────────────────────────────────
 
-const SIMPLE_ROLES = ["FC", "MASTER_FC", "PHARMACY", "MASTER_PHARMACY"] as const;
+// PWO joins this set rather than getting its own CRUD: "simple login" here means
+// a username/password account with no ward/block/station assignment, which is
+// exactly what a Patient Welfare Officer is. Admin gets create / edit / rename /
+// enable-disable / reset-password / active-status for free from the existing
+// routes and the existing SimpleLoginManager screen — no new Admin page.
+const SIMPLE_ROLES = ["FC", "MASTER_FC", "PHARMACY", "MASTER_PHARMACY", "PWO"] as const;
 type SimpleRole = (typeof SIMPLE_ROLES)[number];
 
 router.get("/simple-logins", asyncH(async (req, res) => {

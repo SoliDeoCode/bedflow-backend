@@ -51,6 +51,12 @@ export function initWebsocket(server: HttpServer) {
       ).all<{ ward_id: number }>(user.id);
       for (const r of rooms) socket.join(`ward:${r.ward_id}`);
     }
+    // Patient Welfare Officers get exactly one room. Every complaint event is
+    // relevant to every PWO (the whole OPEN queue is shared and any of them can
+    // accept), so there is nothing finer-grained to scope to — and deliberately
+    // NOT "overview", which is the bed-dashboard broadcast and would flood them
+    // with bed traffic they have no screen for.
+    if (user.role === "PWO") socket.join("pwo");
     if (user.role === "CONSULTANT" && user.doctor_master_id) {
       // Targeted rooms for My Patients real-time updates — a My-Patients event for
       // an admission owned by this doctor, or by a Consultant Group this doctor is
@@ -132,4 +138,36 @@ export type ConsultantPatientEventType = "ADMITTED" | "DISCHARGED" | "UPDATED" |
 export function emitConsultantPatientUpdate(consultantRooms: string[], payload: { type: ConsultantPatientEventType; action: "UPSERT" | "REMOVE"; [key: string]: unknown }) {
   if (!io || consultantRooms.length === 0) return;
   for (const room of consultantRooms) io.to(room).emit("consultant:patient-update", payload);
+}
+
+/** PWO complaint events — deliberately NOT routed through emitUpdate(), which
+ *  broadcasts to "overview" and would push complaint traffic at every bed
+ *  dashboard in the hospital.
+ *
+ *  Each payload is self-describing and carries only what changed, so a client
+ *  patches one row and adjusts its own counters/chart buckets in place. Nothing
+ *  here is a "something changed, go refetch" ping — status events always include
+ *  `fromStatus` alongside `status` precisely so a dashboard can do exact counter
+ *  math (decrement the old bucket, increment the new one) with no follow-up
+ *  request. Emitted events:
+ *    complaint:created          { complaint }                       — full row, new to the queue
+ *    complaint:accepted         { complaintId, fromStatus, status, ownerPwoId, ownerName, … }
+ *    complaint:status_changed   { complaintId, fromStatus, status, updatedBy, … }
+ *    complaint:priority_changed { complaintId, fromPriority, priority, updatedAt }
+ *    complaint:note_added       { complaintId, note }
+ *
+ *  opts.admissionId additionally mirrors the event to that one patient's room on
+ *  the public /patient namespace, so the portal's own complaint list updates
+ *  live. Only pass it for things the patient is allowed to see — an internal
+ *  note must never be mirrored (see addNote in complaintService.ts). */
+export function emitComplaintEvent(
+  event: string,
+  payload: Record<string, unknown>,
+  opts?: { admissionId?: number },
+) {
+  if (!io) return;
+  io.to("pwo").emit(event, payload);
+  if (opts?.admissionId != null && patientNs) {
+    patientNs.to(`patient:${opts.admissionId}`).emit(event, payload);
+  }
 }

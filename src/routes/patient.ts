@@ -1,6 +1,8 @@
 import { Router } from "express";
+import { z } from "zod";
 import { asyncH } from "../middleware/error.js";
 import { db } from "../db/index.js";
+import { createComplaint, complaintsForPatient, listCategories } from "../services/complaintService.js";
 import {
   listPhaseConfig, computeWorkflow, ALL_STEPS, STEP_GROUP,
   statusCol, startedCol, completedCol,
@@ -58,11 +60,16 @@ router.get("/status", asyncH(async (req, res) => {
       dt.initiated_at,
       dt.system_checkout_status,
       dt.physical_checkout_status,
+      wbed.is_discharge_lounge         AS bed_in_lounge,
       ${PHASE_COLUMNS}
     FROM latest_admission la
     JOIN patient_admissions pa ON pa.id = la.id
     JOIN bed_details bd ON bd.id = pa.bed_id
     JOIN wards w ON w.id = pa.ward_id
+    -- Resolved via the BED's ward, not pa.ward_id: the bed is where the patient
+    -- physically is. moveAdmission keeps the two in sync, so this is belt-and-
+    -- braces, but it's the column the lounge gate below turns on.
+    JOIN wards wbed ON wbed.id = bd.ward_id
     LEFT JOIN discharge_tracking dt ON dt.admission_id = pa.id
   `).get<Record<string, unknown>>(ip);
 
@@ -71,7 +78,23 @@ router.get("/status", asyncH(async (req, res) => {
   const scStatus = row.system_checkout_status as string | null;
   const pcStatus = row.physical_checkout_status as string | null;
   const admissionStatus = row.admission_status as string;
-  const inLounge = pcStatus === "COMPLETED" && scStatus !== "COMPLETED";
+  // The patient is in the lounge iff their bed sits in the ward flagged
+  // is_discharge_lounge. This used to be inferred as
+  // `pc === "COMPLETED" && sc !== "COMPLETED"`, which is a proxy for the
+  // workflow state, not for where the patient actually is — and the two come
+  // apart in both directions:
+  //   • cancelAfterInitiation → resetAndCancelTracking resets BOTH checkout
+  //     columns to PENDING without moving anyone off the lounge bed. Since
+  //     readmitFromLounge refuses to run until the discharge is cancelled,
+  //     every readmit passes through that state — the portal opened for a
+  //     patient sitting in the lounge and showed them ward_name
+  //     "Discharge Lounge".
+  //   • a bed manually flipped Vacant→Occupied on a lounge ward creates an
+  //     admission with no discharge_tracking row at all, so the LEFT JOIN
+  //     above leaves both columns NULL and the proxy reads false.
+  // Truthy rather than === true: the flag arrives as a driver-dependent
+  // boolean, matching how dischargeService reads it.
+  const inLounge = !!row.bed_in_lounge;
   const fullyComplete = scStatus === "COMPLETED" && pcStatus === "COMPLETED";
 
   if (admissionStatus === "ACTIVE" && inLounge) {
@@ -140,6 +163,54 @@ router.get("/status", asyncH(async (req, res) => {
   };
 
   res.json({ found: true, data: row, workflow });
+}));
+
+/* ── Contact Support (complaints) ──────────────────────────────────────────
+   These are UNAUTHENTICATED, exactly like /status above — the portal knows a
+   patient only by their 6-digit IP number. That shapes what's allowed here:
+
+     • create + read-own only. No edit, no delete, no close, no priority, no
+       reassignment — every one of those is PWO-only and lives in routes/pwo.ts.
+     • only ACTIVE admissions can file (enforced in createComplaint), so portal
+       access ends at discharge while the complaints themselves live on in the
+       PWO system forever.
+     • the read path returns only notes a PWO explicitly shared, and never the
+       owning officer's identity.
+
+   Abuse control is the 5-minute-per-admission cooldown in the service plus the
+   shared /api rate limiter — a stricter identity check isn't possible today
+   because BedFlow stores no patient name to verify against.                  */
+
+router.get("/complaints", asyncH(async (req, res) => {
+  const ip = (req.query.ip as string | undefined)?.trim();
+  if (!ip || !/^\d{6}$/.test(ip))
+    return res.json({ found: false, complaints: [] });
+  res.json({ found: true, complaints: await complaintsForPatient(ip) });
+}));
+
+router.get("/complaint-categories", asyncH(async (_req, res) => {
+  res.json({ categories: await listCategories() });
+}));
+
+router.post("/complaints", asyncH(async (req, res) => {
+  const { ip, category, description } = z.object({
+    ip:          z.string().regex(/^\d{6}$/, "Enter your 6-digit patient number."),
+    category:    z.string().min(1).max(40),
+    description: z.string().min(1).max(4000),
+  }).parse(req.body);
+
+  const complaint = await createComplaint({ ipLast6: ip, categoryCode: category, description });
+  // Mirror what the patient may see — never the owning officer.
+  res.status(201).json({
+    complaint: {
+      id: complaint.id,
+      complaintCode: complaint.complaintCode,
+      status: complaint.status,
+      category: complaint.category,
+      description: complaint.description,
+      createdAt: complaint.createdAt,
+    },
+  });
 }));
 
 export default router;

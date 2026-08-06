@@ -180,6 +180,22 @@ export async function updateActiveAdmission(opts: {
   if (!admission) throw new HttpError(404, "No active admission on this bed.");
 
   const ipLast6 = opts.ipLast6 !== undefined ? validateIpLast6(opts.ipLast6) : admission.ip_last6;
+
+  // Same invariant createAdmission() enforces on a fresh Vacant→Occupied admit
+  // (one ACTIVE admission per IP number) — re-checked here because Edit Patient
+  // Information can change ip_last6 on an already-Occupied bed without ever
+  // going through createAdmission. Excludes this admission's own id so
+  // re-saving the same IP (or editing an unrelated field) never self-conflicts.
+  if (opts.ipLast6 !== undefined && ipLast6 !== admission.ip_last6) {
+    const dupIp = await db.prepare(
+      "SELECT bed_id FROM patient_admissions WHERE ip_last6=? AND status='ACTIVE' AND id<>? LIMIT 1"
+    ).get<{ bed_id: number }>(ipLast6, admission.id);
+    if (dupIp) {
+      const dupBed = await db.prepare("SELECT bed_name FROM bed_details WHERE id=?").get<{ bed_name: string }>(dupIp.bed_id);
+      throw new HttpError(409, `IP ${ipLast6} is already admitted on bed ${dupBed?.bed_name ?? dupIp.bed_id}. Discharge or transfer the existing admission first.`);
+    }
+  }
+
   const admissionType = opts.admissionType !== undefined ? validateAdmissionType(opts.admissionType) : admission.admission_type;
   const departmentId = opts.departmentId !== undefined ? opts.departmentId : admission.department_id;
   const departmentName = opts.departmentName !== undefined ? (opts.departmentName?.toString().trim() || null) : admission.department_name;
