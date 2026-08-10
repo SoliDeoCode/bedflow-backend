@@ -2,7 +2,7 @@ import { Router } from "express";
 import { z } from "zod";
 import { authRequired, requireRole } from "../middleware/auth.js";
 import { asyncH, HttpError } from "../middleware/error.js";
-import { listBeds, updateBedStatus } from "../services/bedDetailService.js";
+import { listBeds, updateBedStatus, getBedDetail } from "../services/bedDetailService.js";
 import { listPayerTypes } from "../services/payerTypeService.js";
 import { listDestinations } from "../services/destinationService.js";
 import { allWardsLive, allBedDetailsLive, adminDashboard, adminDashboardHistory, consultantsLive } from "../services/bedService.js";
@@ -182,7 +182,7 @@ router.get("/wards/:id/beds", asyncH(async (req, res) => {
     const asgn = assignments.find(a => a.ward_id === wardId);
     if (!asgn) throw new HttpError(403, "Ward not in your assignments");
 
-    const allBeds = await listBeds(wardId, physicalStatus, reservationStatus, false);
+    const allBeds = await listBeds(wardId, physicalStatus, reservationStatus, false, true);
     if (asgn.access_type === "BEDS") {
       let allowed: string[] = [];
       try { allowed = JSON.parse(asgn.bed_names || "[]"); } catch { /* ignore */ }
@@ -192,7 +192,7 @@ router.get("/wards/:id/beds", asyncH(async (req, res) => {
     return res.json({ beds: allBeds });
   }
 
-  res.json({ beds: await listBeds(wardId, physicalStatus, reservationStatus, false) });
+  res.json({ beds: await listBeds(wardId, physicalStatus, reservationStatus, false, true) });
 }));
 
 // ── Review-confirm (manual "reviewed, nothing to update" stamp on one ward) ──
@@ -321,10 +321,15 @@ router.patch("/beds/:id/status", asyncH(async (req, res) => {
     .get<{ station_id: number | null }>(result.ward_id);
   const broadcastStationId = wardStation?.station_id ?? stationIds[0];
 
+  // Full current row alongside the existing summary fields — lets every
+  // connected client patch just this bed locally instead of refetching the
+  // whole ward. Purely additive: existing fields, rooms, and triggers unchanged.
+  const bedDetail = await getBedDetail(bedId);
   emitUpdate("bed:update", {
     bedId, wardId: result.ward_id, stationId: broadcastStationId,
     physicalStatus: physical_status, reservationStatus: reservation_status,
     payerType: result.payer_type, destination: result.destination, reservationNote: result.reservation_note,
+    bed: bedDetail,
   }, {
     stationId: broadcastStationId,
     pre: preBlockRow ? String(preBlockRow.pre_block_id) : undefined,

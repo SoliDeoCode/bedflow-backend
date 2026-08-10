@@ -111,8 +111,11 @@ export async function transferBed(opts: {
  *  go Vacant (paperwork isn't done), so the admission moves here and the real bed frees up
  *  immediately for a new patient. Reuses transferBed — same admission-move + history trail,
  *  just with the destination picked automatically instead of by the caller.
- *  PRE or Nurse (enforced in the route) — matches whoever can complete Physical Checkout. */
-export async function moveToDischargeLounge(opts: { admissionId: number; fromBedId: number; userId: number }) {
+ *  PRE or Nurse (enforced in the route) — matches whoever can complete Physical Checkout.
+ *  reason is mandatory — same rule as an ordinary manual transfer, enforced by
+ *  transferBed() below (it already rejects an empty reason); the route validates
+ *  it up front too so a missing note fails cleanly with a 400, not a crash. */
+export async function moveToDischargeLounge(opts: { admissionId: number; fromBedId: number; userId: number; reason: string }) {
   const tracking = await getTrackingByAdmission(opts.admissionId);
   if (!tracking) throw new HttpError(404, "No discharge found for this admission");
   if (tracking.physical_checkout_status !== "COMPLETED")
@@ -129,7 +132,7 @@ export async function moveToDischargeLounge(opts: { admissionId: number; fromBed
 
   return transferBed({
     fromBedId: opts.fromBedId, toWardId: lounge.id, toBedId: toBed.id,
-    reason: "Physical checkout complete — moved to Discharge Lounge pending System Checkout",
+    reason: opts.reason,
     userId: opts.userId,
     allowDischargeLounge: true,
   });

@@ -156,6 +156,9 @@ export interface BedDetail {
    *  physically left before landing here. Null for every ordinary bed. */
   origin_ward_name: string | null;
   origin_bed_name: string | null;
+  /** The (mandatory) reason typed on the transfer that landed this admission
+   *  in the Lounge. Same lounge-only scoping as origin_ward_name/origin_bed_name. */
+  origin_note: string | null;
 }
 
 export async function listBeds(
@@ -163,21 +166,36 @@ export async function listBeds(
   physicalStatus?: string,
   reservationStatus?: string,
   operationalOnly = false,
+  /** Distinct from operationalOnly: that one strips non-operational beds from
+   *  EVERY ward (used for transfer-destination candidates, where offering a
+   *  disabled bed is never correct). This one only does it for the Discharge
+   *  Lounge specifically — an ordinary ward's non-operational beds still need
+   *  to stay visible (dimmed) to whoever manages it, so they can see a bed is
+   *  out of service, not wonder where it went. The Lounge is different: it's
+   *  virtual capacity an admin provisions in bulk and expects to shrink back
+   *  down without deleting anything (deletion is blocked once a bed has any
+   *  admission/transfer history — see deleteBed). Left false for the Discharge
+   *  Lounge admin's own management screen (getDischargeLounge), which still
+   *  needs to see every bed, disabled or not, to re-enable them later. */
+  hideDisabledLoungeBeds = false,
 ): Promise<BedDetail[]> {
   let sql = `SELECT bd.id, bd.ward_id, bd.bed_name, bd.physical_status, bd.reservation_status,
                     bd.bed_type, bd.operational_status, bd.ac_status, bd.payer_type, bd.destination, bd.reservation_note,
                     bd.updated_at, bd.updated_by, row_to_json(dt.*) AS discharge_tracking,
                     pa.id AS admission_id, pa.ip_last6, pa.admission_type, pa.consultant_name, pa.department_name,
                     pa.doctor_id, pa.department_id, pa.owner_type, pa.consultant_group_id,
-                    w_from.name AS origin_ward_name, bd_from.bed_name AS origin_bed_name
+                    w_from.name AS origin_ward_name, bd_from.bed_name AS origin_bed_name, lt.reason AS origin_note
              FROM bed_details bd
              JOIN wards w ON w.id = bd.ward_id
              LEFT JOIN patient_admissions pa ON pa.bed_id = bd.id AND pa.status = 'ACTIVE'
              LEFT JOIN discharge_tracking dt ON dt.admission_id = pa.id
-             -- Origin ward/bed — lounge beds only, short-circuited for every
+             -- Origin ward/bed/note — lounge beds only, short-circuited for every
              -- ordinary ward by the ON condition (costs nothing outside the lounge).
+             -- origin_note is the reason typed on the transfer that landed this
+             -- admission here (mandatory on every transfer — see transferBed) —
+             -- shown in Patient Information so it's not just captured and buried.
              LEFT JOIN LATERAL (
-               SELECT bth.from_bed_id, bth.from_ward_id FROM bed_transfer_history bth
+               SELECT bth.from_bed_id, bth.from_ward_id, bth.reason FROM bed_transfer_history bth
                WHERE bth.admission_id = pa.id ORDER BY bth.transferred_at DESC LIMIT 1
              ) lt ON w.is_discharge_lounge AND pa.id IS NOT NULL
              LEFT JOIN bed_details bd_from ON bd_from.id = lt.from_bed_id
@@ -185,6 +203,7 @@ export async function listBeds(
              WHERE bd.ward_id=?`;
   const params: unknown[] = [wardId];
   if (operationalOnly) sql += " AND bd.operational_status = true";
+  if (hideDisabledLoungeBeds) sql += " AND (bd.operational_status = true OR NOT w.is_discharge_lounge)";
   if (physicalStatus) {
     if (!["VACANT", "OCCUPIED"].includes(physicalStatus.toUpperCase()))
       throw new HttpError(400, "Invalid physical_status filter");
@@ -202,6 +221,33 @@ export async function listBeds(
     bd.bed_name ASC`;
 
   return db.prepare(sql).all<BedDetail>(...params);
+}
+
+/** Single-bed counterpart to listBeds — same columns/joins, scoped to one id.
+ *  Lets a write endpoint broadcast the bed's full current row alongside its
+ *  "bed:update" event, so every connected client (including the one that made
+ *  the change) can patch just that one row locally instead of refetching the
+ *  whole ward. Read-only; doesn't affect what listBeds or updateBedStatus do. */
+export async function getBedDetail(bedId: number): Promise<BedDetail | undefined> {
+  return db.prepare(
+    `SELECT bd.id, bd.ward_id, bd.bed_name, bd.physical_status, bd.reservation_status,
+            bd.bed_type, bd.operational_status, bd.ac_status, bd.payer_type, bd.destination, bd.reservation_note,
+            bd.updated_at, bd.updated_by, row_to_json(dt.*) AS discharge_tracking,
+            pa.id AS admission_id, pa.ip_last6, pa.admission_type, pa.consultant_name, pa.department_name,
+            pa.doctor_id, pa.department_id, pa.owner_type, pa.consultant_group_id,
+            w_from.name AS origin_ward_name, bd_from.bed_name AS origin_bed_name, lt.reason AS origin_note
+     FROM bed_details bd
+     JOIN wards w ON w.id = bd.ward_id
+     LEFT JOIN patient_admissions pa ON pa.bed_id = bd.id AND pa.status = 'ACTIVE'
+     LEFT JOIN discharge_tracking dt ON dt.admission_id = pa.id
+     LEFT JOIN LATERAL (
+       SELECT bth.from_bed_id, bth.from_ward_id, bth.reason FROM bed_transfer_history bth
+       WHERE bth.admission_id = pa.id ORDER BY bth.transferred_at DESC LIMIT 1
+     ) lt ON w.is_discharge_lounge AND pa.id IS NOT NULL
+     LEFT JOIN bed_details bd_from ON bd_from.id = lt.from_bed_id
+     LEFT JOIN wards w_from ON w_from.id = lt.from_ward_id
+     WHERE bd.id = ?`
+  ).get<BedDetail>(bedId);
 }
 
 // nurse_access_assignments.bed_names stores bed NAMES (JSON array), not ids —
@@ -252,12 +298,21 @@ export async function updateBedMaster(opts: {
   bedId: number; operationalStatus?: boolean; acStatus?: boolean; userId: number;
 }) {
   const bed = await db.prepare(
-    "SELECT id, ward_id, operational_status FROM bed_details WHERE id=?"
-  ).get<{ id: number; ward_id: number; operational_status: boolean }>(opts.bedId);
+    `SELECT bd.id, bd.ward_id, bd.operational_status, bd.physical_status, w.is_discharge_lounge
+     FROM bed_details bd JOIN wards w ON w.id = bd.ward_id WHERE bd.id=?`
+  ).get<{ id: number; ward_id: number; operational_status: boolean; physical_status: string; is_discharge_lounge: boolean }>(opts.bedId);
   if (!bed) throw new HttpError(404, "Bed not found");
 
   const now = Date.now();
   if (opts.operationalStatus !== undefined) {
+    // Discharge Lounge beds specifically can't be toggled while occupied, in
+    // either direction — same rule as the bulk range tool (see
+    // bulkSetBedOperational's doc comment). Scoped to just this ward on
+    // purpose: other wards' bed-master screen (Hospital Matrix) has no such
+    // restriction and isn't part of this rule.
+    if (opts.operationalStatus !== bed.operational_status && bed.physical_status === "OCCUPIED" && bed.is_discharge_lounge) {
+      throw new HttpError(409, "This bed is occupied — free it up before changing its operational status.");
+    }
     await db.prepare("UPDATE bed_details SET operational_status=?, updated_at=? WHERE id=?")
       .run(opts.operationalStatus, now, opts.bedId);
     await db.prepare(
@@ -276,6 +331,64 @@ export async function updateBedMaster(opts: {
   await audit(opts.userId, "bed_master_edit", String(opts.bedId),
     { operationalStatus: opts.operationalStatus, acStatus: opts.acStatus });
   return { ok: true };
+}
+
+/** Sets operational_status for every bed in `wardId` whose bed_name is purely
+ *  numeric and falls within [fromNum, toNum] — the Discharge Lounge bulk
+ *  disable/enable use case ("take beds 51-300 out of service without deleting
+ *  them, since already-used beds can never be deleted — see deleteBed's
+ *  ON DELETE RESTRICT FK"). Beds already at the target status are left alone
+ *  (no-op write, no log row) regardless of occupancy — nothing is actually
+ *  being blocked if there was never a change to make (so a redundant Enable
+ *  on an already-enabled occupied bed correctly reads as "no change needed",
+ *  not "occupied"). Non-numeric bed names (if any were ever renamed to
+ *  something else) are simply outside the match and untouched.
+ *
+ *  Occupied beds can never have their operational_status changed in EITHER
+ *  direction, full stop — this is a holding-bay capacity control, not a way
+ *  to touch a bed that still has a patient in it. */
+export async function bulkSetBedOperational(opts: {
+  wardId: number; fromNum: number; toNum: number; operationalStatus: boolean; userId: number;
+}): Promise<{ ok: true; updated: number; skippedOccupied: number; totalInRange: number }> {
+  const { wardId, fromNum, toNum, operationalStatus, userId } = opts;
+  if (fromNum > toNum) throw new HttpError(400, "'From' bed number must be less than or equal to 'To'.");
+
+  const rows = await db.prepare(
+    `SELECT id, operational_status, physical_status FROM bed_details
+     WHERE ward_id = ? AND bed_name ~ '^[0-9]+$' AND bed_name::int BETWEEN ? AND ?`
+  ).all<{ id: number; operational_status: boolean; physical_status: string }>(wardId, fromNum, toNum);
+
+  const totalInRange = rows.length;
+  const needsChange = rows.filter((r) => r.operational_status !== operationalStatus);
+  const changeable = needsChange.filter((r) => r.physical_status !== "OCCUPIED");
+  let skippedOccupied = needsChange.length - changeable.length;
+  if (!changeable.length) return { ok: true, updated: 0, skippedOccupied, totalInRange };
+
+  const now = Date.now();
+  // physical_status is re-checked here, at write time, not just in the SELECT
+  // above — a bed can be admitted into in the gap between that read and this
+  // write (e.g. a nurse admits a patient into bed #47 the instant an admin
+  // bulk-disables a range containing it). Each UPDATE only takes effect if the
+  // bed is still non-occupied at that exact moment; if not, r.changes is 0 and
+  // it's counted as skipped rather than silently disabling an occupied bed.
+  let updated = 0;
+  await db.transaction(async () => {
+    for (const row of changeable) {
+      const r = await db.prepare(
+        "UPDATE bed_details SET operational_status=?, updated_at=? WHERE id=? AND physical_status != 'OCCUPIED'"
+      ).run(operationalStatus, now, row.id);
+      if (r.changes === 0) { skippedOccupied++; continue; }
+      updated++;
+      await db.prepare(
+        `INSERT INTO bed_operational_log (bed_id, ward_id, changed_by, changed_at, old_value, new_value, forced_vacant) VALUES (?,?,?,?,?,?,?)`
+      ).run(row.id, wardId, userId, now, row.operational_status, operationalStatus, false);
+    }
+    await _recalcWardTotals(wardId, userId);
+  });
+
+  await audit(userId, "bed_master_bulk_edit", `ward:${wardId}`,
+    { fromNum, toNum, operationalStatus, updated, skippedOccupied });
+  return { ok: true, updated, skippedOccupied, totalInRange };
 }
 
 export async function deleteBed(opts: { bedId: number; userId: number }) {

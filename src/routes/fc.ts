@@ -10,7 +10,7 @@ import { emitUpdate } from "../websocket/io.js";
 import { allWardsLive, allBedDetailsLive, adminDashboard, adminDashboardHistory, consultantsLive, wardsOperationalHospitalWide, summarize } from "../services/bedService.js";
 import { listPayerTypes } from "../services/payerTypeService.js";
 import { listDestinations } from "../services/destinationService.js";
-import { listBeds, updateBedStatus } from "../services/bedDetailService.js";
+import { listBeds, updateBedStatus, getBedDetail } from "../services/bedDetailService.js";
 import { updateActiveAdmission } from "../services/patientAdmissionService.js";
 import { db } from "../db/index.js";
 
@@ -166,7 +166,7 @@ router.get("/wards/:id/beds", asyncH(async (req, res) => {
   await assertWardOperational(wardId);
   const physicalStatus    = req.query.physical_status    as string | undefined;
   const reservationStatus = req.query.reservation_status as string | undefined;
-  res.json({ beds: await listBeds(wardId, physicalStatus, reservationStatus, false) });
+  res.json({ beds: await listBeds(wardId, physicalStatus, reservationStatus, false, true) });
 }));
 
 
@@ -197,10 +197,15 @@ router.patch("/beds/:id/status", asyncH(async (req, res) => {
     doctorId: doctor_id, departmentId: department_id, consultantGroupId: consultant_group_id,
   });
 
+  // Full current row alongside the existing summary fields — lets every
+  // connected client patch just this bed locally instead of refetching the
+  // whole ward. Purely additive: existing fields, rooms, and triggers unchanged.
+  const bedDetail = await getBedDetail(bedId);
   emitUpdate("bed:update", {
     bedId, wardId: result.ward_id,
     physicalStatus: physical_status, reservationStatus: reservation_status,
     payerType: result.payer_type, destination: result.destination, reservationNote: result.reservation_note,
+    bed: bedDetail,
   }, { wardId: result.ward_id });
   res.json(result);
 }));
