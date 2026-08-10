@@ -123,8 +123,8 @@ const STEP_VALUES: Record<StepKey, string[]> = {
 // upstream in discharge.ts (consultantOwnsBed / consultantOwnsAdmission).
 const PLAN_ROLES: Role[] = ["PRE", "DOCTOR", "CONSULTANT"];
 const RESCHEDULE_ROLES: Role[] = ["PRE", "DOCTOR", "CONSULTANT"];
-const CANCEL_ROLES: Role[] = ["PRE", "DOCTOR"];
-const INITIATE_ROLES: Role[] = ["PRE", "CONSULTANT"];
+const CANCEL_ROLES: Role[] = ["PRE", "DOCTOR", "CONSULTANT"];
+const INITIATE_ROLES: Role[] = ["PRE", "DOCTOR", "CONSULTANT"];
 
 function requireRoleIn(role: Role, allowed: Role[], action: string) {
   if (!allowed.includes(role))
@@ -276,11 +276,20 @@ export async function listBillingPipeline(wardIds: number[] | null, extraAdmissi
   };
   for (const r of rows) {
     const row = r as Record<string, unknown>;
-    if (row.billing_started_status === "PENDING") buckets.BILLING_STARTED.push(r);
-    else if (row.audit_status === "PENDING") buckets.AUDIT.push(r);
-    else if (row.bill_ready_status === "PENDING") buckets.BILL_READY.push(r);
-    else if (row.payment_status === "PENDING") buckets.PAYMENT.push(r);
-    else if (row.system_checkout_status === "PENDING") buckets.SYSTEM_CHECKOUT.push(r);
+    // Every step's *_status column defaults to 'PENDING' the moment a discharge is
+    // created — for every future step, not just whichever one is actually next in
+    // line. So "status is PENDING" alone doesn't mean this phase is FC's problem
+    // yet; it also has to have actually been unlocked (its own *_started_at
+    // stamped) — the same signal computeWorkflow() uses for the per-admission
+    // Discharge Details view. Without the started_at check, a discharge still
+    // stuck on Drug Return/Pharmacy Clearance would show up under Bill Prep
+    // Pending before Bill Prep has even opened (its prerequisites gate its start,
+    // same as every step here — see nextPhasesToStart in dischargeSlaService.ts).
+    if (row.billing_started_status === "PENDING" && row.billing_started_started_at != null) buckets.BILLING_STARTED.push(r);
+    else if (row.audit_status === "PENDING" && row.audit_started_at != null) buckets.AUDIT.push(r);
+    else if (row.bill_ready_status === "PENDING" && row.bill_ready_started_at != null) buckets.BILL_READY.push(r);
+    else if (row.payment_status === "PENDING" && row.payment_started_at != null) buckets.PAYMENT.push(r);
+    else if (row.system_checkout_status === "PENDING" && row.system_checkout_started_at != null) buckets.SYSTEM_CHECKOUT.push(r);
   }
   return buckets;
 }
@@ -991,9 +1000,27 @@ export async function listPatientLeft(wardIds: number[] | null, extraAdmissionId
   ).all(...params);
 }
 
+/** Who most recently finished each step (COMPLETED or NOT_APPLICABLE), keyed by
+ *  step key — powers the "Completed by <name> (<role>)" line on each phase card.
+ *  DISTINCT ON picks the latest such row per field, so a step that was reopened
+ *  and redone shows its current completer, not the first one. */
+export async function stepActorsForAdmission(admissionId: number) {
+  const rows = await db.prepare(
+    `SELECT DISTINCT ON (dh.field) dh.field, dh.changed_by, dh.changed_at,
+            u.name AS changed_by_name, u.role AS changed_by_role
+     FROM discharge_history dh
+     LEFT JOIN users u ON u.id = dh.changed_by
+     WHERE dh.admission_id=? AND dh.field != 'status' AND dh.new_value IN ('COMPLETED', 'NOT_APPLICABLE')
+     ORDER BY dh.field, dh.changed_at DESC`
+  ).all<{ field: string; changed_by: number | null; changed_at: number; changed_by_name: string | null; changed_by_role: string | null }>(admissionId);
+  const byStep: Record<string, { name: string | null; role: string | null; at: number }> = {};
+  for (const r of rows) byStep[r.field] = { name: r.changed_by_name, role: r.changed_by_role, at: r.changed_at };
+  return byStep;
+}
+
 export async function historyForAdmission(admissionId: number) {
   const discharge = await db.prepare(
-    `SELECT dh.*, u.name AS changed_by_name
+    `SELECT dh.*, u.name AS changed_by_name, u.role AS changed_by_role
      FROM discharge_history dh LEFT JOIN users u ON u.id = dh.changed_by
      WHERE dh.admission_id=? ORDER BY dh.changed_at DESC`
   ).all(admissionId);

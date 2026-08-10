@@ -4,7 +4,7 @@ import { authRequired, requireRole } from "../middleware/auth.js";
 import { asyncH, HttpError } from "../middleware/error.js";
 import { wardsGroupedByBlock, summarize, updateWard, allWardsLive, allBedDetailsLive, adminDashboard, adminDashboardHistory, consultantsLive, type WardView } from "../services/bedService.js";
 import { alarmState, submitRounds } from "../services/roundService.js";
-import { listBeds, updateBedStatus } from "../services/bedDetailService.js";
+import { listBeds, updateBedStatus, getBedDetail } from "../services/bedDetailService.js";
 import { updateActiveAdmission } from "../services/patientAdmissionService.js";
 import { listPayerTypes } from "../services/payerTypeService.js";
 import { listDestinations } from "../services/destinationService.js";
@@ -149,7 +149,7 @@ router.get("/wards/:id/beds", asyncH(async (req, res) => {
     throw new HttpError(403, "Ward not in your PRE Block");
   const physicalStatus    = req.query.physical_status    as string | undefined;
   const reservationStatus = req.query.reservation_status as string | undefined;
-  res.json({ beds: await listBeds(wardId, physicalStatus, reservationStatus, false) });
+  res.json({ beds: await listBeds(wardId, physicalStatus, reservationStatus, false, true) });
 }));
 
 // ── Review-confirm (manual "reviewed, nothing to update" stamp on one ward) ──
@@ -244,11 +244,17 @@ router.patch("/beds/:id/status", asyncH(async (req, res) => {
   ).get<{ station_id: number | null }>(result.ward_id);
 
   const blockName = blocks.find(b => b.id === owns.pre_block_id)?.name ?? "";
+  // Full current row alongside the existing summary fields — every connected
+  // client (this one included) can patch just this bed locally instead of
+  // refetching the whole ward. Purely additive: existing fields, rooms, and
+  // triggers are unchanged.
+  const bedDetail = await getBedDetail(bedId);
   emitUpdate("bed:update", {
     bedId, wardId: result.ward_id,
     physicalStatus: physical_status, reservationStatus: reservation_status,
     payerType: result.payer_type, destination: result.destination, reservationNote: result.reservation_note,
     floor: blockName,
+    bed: bedDetail,
   }, {
     pre: String(owns.pre_block_id),
     stationId: stationRow?.station_id ?? undefined,

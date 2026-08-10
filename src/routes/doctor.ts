@@ -2,7 +2,7 @@ import { Router } from "express";
 import { z } from "zod";
 import { authRequired, requireRole } from "../middleware/auth.js";
 import { asyncH, HttpError } from "../middleware/error.js";
-import { listBeds, updateBedStatus } from "../services/bedDetailService.js";
+import { listBeds, updateBedStatus, getBedDetail } from "../services/bedDetailService.js";
 import { allWardsLive, allBedDetailsLive, adminDashboard, adminDashboardHistory, consultantsLive } from "../services/bedService.js";
 import { listPayerTypes } from "../services/payerTypeService.js";
 import { listDestinations } from "../services/destinationService.js";
@@ -60,6 +60,16 @@ router.get("/bed-details", asyncH(async (_req, res) => {
   res.json(await allBedDetailsLive());
 }));
 
+/** Bed rows restricted to the wards this doctor can actually open.
+ *  Deliberately separate from /bed-details above: that one stays hospital-wide
+ *  because the read-only Admin dashboard (Bed Explorer) mirrors PRE/COO. The
+ *  Entry tab's ward/IP search reads THIS one instead, so an IP match can never
+ *  resolve to a ward that /wards/:id/beds will then 403 on. */
+router.get("/my-bed-details", asyncH(async (req, res) => {
+  const wardIds = [...new Set((await accessibleWards(req.user!.id)).map((w) => Number(w.ward_id)))];
+  res.json(wardIds.length ? await allBedDetailsLive(wardIds) : []);
+}));
+
 router.get("/admin-dashboard", asyncH(async (req, res) => {
   const unit = typeof req.query.unit === "string" ? req.query.unit : null;
   // includeLoungeSummary=false — Admin(COO)-only cards; see adminDashboard()'s
@@ -101,6 +111,34 @@ router.get("/me", asyncH(async (req, res) => {
      ORDER BY db.name`
   ).all(doctorId);
 
+  // Ward roster per block, same columns the ward cards already render. Sent up
+  // front so the Entry tab can search wards across every block without a
+  // round-trip per block (and so a match is always a ward the doctor can open).
+  const wardRows = await db.prepare(
+    `SELECT dbw.doctor_block_id, w.id, w.name, w.total_beds, w.unit_type, w.operational,
+            b.vacant, b.reserved, b.occupied, b.occupied_reserved,
+            f.name AS floor_name, bb.name AS block_name
+     FROM doctor_block_users dbu
+     JOIN doctor_blocks db        ON db.id = dbu.doctor_block_id AND db.status = 'active'
+     JOIN doctor_block_wards dbw  ON dbw.doctor_block_id = db.id
+     JOIN wards w                 ON w.id = dbw.ward_id
+     LEFT JOIN beds b             ON b.ward_id = w.id
+     LEFT JOIN floors f           ON f.id = w.floor_id
+     LEFT JOIN building_blocks bb ON bb.id = f.building_block_id
+     WHERE dbu.user_id = ?
+     ORDER BY bb.name NULLS LAST, f.name NULLS LAST, w.name`
+  ).all<Record<string, unknown>>(doctorId);
+
+  const wardsByBlock = new Map<number, Record<string, unknown>[]>();
+  for (const { doctor_block_id, ...ward } of wardRows) {
+    const key = Number(doctor_block_id);
+    if (!wardsByBlock.has(key)) wardsByBlock.set(key, []);
+    wardsByBlock.get(key)!.push(ward);
+  }
+  const blocksWithWards = (blocks as Record<string, unknown>[]).map((b) => ({
+    ...b, wards: wardsByBlock.get(Number(b.id)) ?? [],
+  }));
+
   // Aggregate live bed summary across every accessible ward.
   const wards = await accessibleWards(doctorId);
   const wardIds = [...new Set(wards.map((w) => Number(w.ward_id)))];
@@ -117,7 +155,7 @@ router.get("/me", asyncH(async (req, res) => {
     if (s) summary = s;
   }
 
-  res.json({ blocks, wardCount: wardIds.length, summary });
+  res.json({ blocks: blocksWithWards, wardCount: wardIds.length, summary });
 }));
 
 router.get("/blocks/:id", asyncH(async (req, res) => {
@@ -186,7 +224,7 @@ router.get("/wards/:id/beds", asyncH(async (req, res) => {
 
   const physicalStatus    = req.query.physical_status    as string | undefined;
   const reservationStatus = req.query.reservation_status as string | undefined;
-  res.json({ beds: await listBeds(wardId, physicalStatus, reservationStatus, false) });
+  res.json({ beds: await listBeds(wardId, physicalStatus, reservationStatus, false, true) });
 }));
 
 router.get("/payer-types", asyncH(async (_req, res) => {
@@ -247,10 +285,15 @@ router.patch("/beds/:id/status", asyncH(async (req, res) => {
 
   // Fan out: Admin overview + PRE dashboard + Nurse dashboard + other doctors.
   const rooms = await fanoutRooms(result.ward_id);
+  // Full current row alongside the existing summary fields — lets every
+  // connected client patch just this bed locally instead of refetching the
+  // whole ward. Purely additive: existing fields, rooms, and triggers unchanged.
+  const bedDetail = await getBedDetail(bedId);
   emitUpdate("bed:update", {
     bedId, wardId: result.ward_id,
     physicalStatus: physical_status, reservationStatus: reservation_status,
     payerType: result.payer_type, destination: result.destination, reservationNote: result.reservation_note,
+    bed: bedDetail,
   }, rooms);
 
   res.json(result);

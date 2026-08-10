@@ -7,7 +7,7 @@ import { emitUpdate } from "../websocket/io.js";
 import type { Role } from "../types/index.js";
 import {
   planDischarge, reschedule, cancelPlan, initiateDischarge, cancelAfterInitiation,
-  updateStep, dashboardCounts, historyForAdmission, getDischargeForBed, dischargesForWard, listPendingByStep, listBillingPipeline, listActiveDischarges, listInitiatedToday, listCancelledToday, listPatientLeft, listCompletedToday, listAdmittedToday,
+  updateStep, dashboardCounts, historyForAdmission, stepActorsForAdmission, getDischargeForBed, dischargesForWard, listPendingByStep, listBillingPipeline, listActiveDischarges, listInitiatedToday, listCancelledToday, listPatientLeft, listCompletedToday, listAdmittedToday,
   dischargeImmediate,
   type StepKey,
 } from "../services/dischargeService.js";
@@ -269,7 +269,8 @@ router.get("/bed/:bedId", asyncH(async (req, res) => {
   await assertBedAccess(req.user!, bedId);
   const r = await getDischargeForBed(bedId);
   const config = await listPhaseConfig();
-  res.json({ ...r, workflow: computeWorkflow(r.tracking as never, config) });
+  const stepActors = r.tracking ? await stepActorsForAdmission(r.admission!.id) : {};
+  res.json({ ...r, workflow: computeWorkflow(r.tracking as never, config), stepActors });
 }));
 
 router.get("/dashboard", asyncH(async (req, res) => {
@@ -391,7 +392,7 @@ router.post("/transfer", asyncH(async (req, res) => {
     fromBedId: z.number().int(),
     toWardId: z.number().int(),
     toBedId: z.number().int(),
-    reason: z.string().min(1).max(500),
+    reason: z.string().trim().min(1).max(50),
   }).parse(req.body);
 
   const fromWardId = await bedWard(fromBedId);
@@ -421,7 +422,7 @@ router.post("/:admissionId/readmit", asyncH(async (req, res) => {
   const { toWardId, toBedId, reason } = z.object({
     toWardId: z.number().int(),
     toBedId: z.number().int(),
-    reason: z.string().min(1).max(500),
+    reason: z.string().trim().min(1).max(50),
   }).parse(req.body);
 
   const { wardId: fromWardId, bedId: fromBedId } = await admissionWard(admissionId);
@@ -457,11 +458,14 @@ router.post("/:admissionId/force-complete", asyncH(async (req, res) => {
 // and frees the real bed immediately, instead of leaving it Occupied with nobody in it.
 router.post("/:admissionId/move-to-lounge", asyncH(async (req, res) => {
   if (!["PRE", "NURSE"].includes(req.user!.role)) throw new HttpError(403, "Only PRE or Nurse can move a bed to the Discharge Lounge");
+  const { reason } = z.object({
+    reason: z.string().trim().min(1, "A note is required to move this bed to the Discharge Lounge").max(50),
+  }).parse(req.body);
   const admissionId = Number(req.params.admissionId);
   const fromWardId = await assertAdmissionAccess(req.user!, admissionId);
   const { bedId: fromBedId } = await admissionWard(admissionId);
 
-  const result = await moveToDischargeLounge({ admissionId, fromBedId, userId: req.user!.id });
+  const result = await moveToDischargeLounge({ admissionId, fromBedId, userId: req.user!.id, reason });
   emitUpdate("discharge:update", { type: "lounge_move", ...result, fromWardId }, await fanout(fromWardId));
   res.json(result);
 }));

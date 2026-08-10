@@ -25,7 +25,7 @@ import {
   setDoctorBlockStatus, deleteDoctorBlock, wardIdsForDoctorBlock,
 } from "../services/doctorBlockService.js";
 import {
-  generateBeds, addSingleBed, listBeds, renameBed, deleteBed, updateBedMaster,
+  generateBeds, addSingleBed, listBeds, renameBed, deleteBed, updateBedMaster, bulkSetBedOperational,
 } from "../services/bedDetailService.js";
 import { midnightCensusFor } from "../services/bedService.js";
 import { listPhaseConfig, updatePhaseConfig, reorderPhaseConfig, listPayerTatConfig, invalidatePayerTatCache } from "../services/dischargeSlaService.js";
@@ -47,7 +47,7 @@ import {
   listConsultantUsers, createConsultantUser, updateConsultantUser, deleteConsultantUser,
 } from "../services/consultantUserService.js";
 import {
-  getDischargeLounge, setupDischargeLounge, renameDischargeLounge,
+  getDischargeLounge, setupDischargeLounge, renameDischargeLounge, getDischargeLoungeWard,
 } from "../services/dischargeLoungeService.js";
 
 const router = Router();
@@ -939,6 +939,27 @@ router.post("/discharge-lounge", asyncH(async (req, res) => {
 router.put("/discharge-lounge", asyncH(async (req, res) => {
   const { name } = z.object({ name: z.string().min(1).max(150) }).parse(req.body);
   res.json(await renameDischargeLounge({ name, managerId: req.user!.id }));
+}));
+
+// Bulk range disable/enable, e.g. "beds 51 to 300 are no longer in service" —
+// far cheaper than editing 250 beds one at a time, and those beds can't be
+// deleted anyway once they've ever held a patient (bed_details is referenced
+// ON DELETE RESTRICT by patient_admissions/bed_transfer_history).
+router.patch("/discharge-lounge/beds/bulk-operational", asyncH(async (req, res) => {
+  const { fromNum, toNum, operationalStatus } = z.object({
+    fromNum: z.number().int().min(0),
+    toNum: z.number().int().min(0),
+    operationalStatus: z.boolean(),
+  }).refine((v) => v.fromNum <= v.toNum, { message: "'From' bed number must be less than or equal to 'To'." }).parse(req.body);
+
+  const ward = await getDischargeLoungeWard();
+  if (!ward) throw new HttpError(404, "Discharge Lounge is not configured yet");
+
+  const result = await bulkSetBedOperational({
+    wardId: ward.id, fromNum, toNum, operationalStatus, userId: req.user!.id,
+  });
+  emitUpdate("bed:update", { wardId: ward.id });
+  res.json(result);
 }));
 
 // ── Consultant Users — created as one unit (login + doctors_master identity),
